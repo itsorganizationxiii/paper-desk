@@ -12,6 +12,7 @@ KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
 SERIES={'BTC':'KXBTC15M','ETH':'KXETH15M'}
 PYTH={'GOLD':'765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2','SILVER':'f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e','OIL':'f2464139c45f26097e0173b03207c4a490dbd8bf1b72dfbf064eeb832c7c2933'}
+WHALE_MIN=float(os.environ.get('WHALE_MIN_USD','250000')); WHALE_WIN=60; WHALE_STRONG=float(os.environ.get('WHALE_STRONG_USD','250000')); WHALE_MAX_GIVEUP=0.10
 MIN_EDGE=0.03; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
@@ -40,11 +41,11 @@ class PaperTrader:
     def close(s,t,win,how,val=None):
         payout=t['contracts'] if win else 0
         t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(payout-t['stake'],2),closedAt=time.time()); s.balance+=payout
-        for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree'): t.pop(k,None)
+        for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
     def exit(s,t,bid,reason):
         proceeds=t['contracts']*bid
         t.update(status='exited',exitPrice=round(bid,4),exitReason=reason,settledBy='early-exit@bid',pnl=round(proceeds-t['stake'],2),closedAt=time.time())
-        for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree'): t.pop(k,None)
+        for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
         s.balance+=proceeds; s.save(); print('EXIT',t['id'],reason,bid,flush=True)
     def settle(s,spot):
         now=time.time(); ch=False
@@ -70,13 +71,24 @@ class PaperTrader:
             closed=len(c),open=len(o),trades=s.trades[::-1])
 pt=PaperTrader(); lock=threading.Lock()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
- 'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
+ 'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
 def coinbase(a):
     c=get(f'{CB}/products/{a}-USD/candles?granularity=900')
     spot=c[0][4]; mom=(c[0][4]-c[1][3])/c[1][3]
     tr=get(f'{CB}/products/{a}-USD/trades?limit=1000')
     cvd=sum(float(x['size'])*(1 if x['side']=='sell' else -1) for x in tr); vol=sum(float(x['size']) for x in tr)  # side=maker side
-    return dict(spot=spot,momentum=round(mom,5),cvd=round(cvd,4),cvdRatio=round(cvd/vol,3) if vol else 0)
+    # whale detection: taker trades far above recent distribution within last WHALE_WIN sec
+    usd=sorted(float(x['size'])*float(x['price']) for x in tr); p99=usd[int(0.99*(len(usd)-1))] if usd else 0
+    thr=max(WHALE_MIN,p99); now=time.time(); wh=[]
+    for x in tr:
+        u=float(x['size'])*float(x['price'])
+        if u>=thr:
+            ts=iso(x['time'])
+            if now-ts<=WHALE_WIN: wh.append(dict(side='buy' if x['side']=='sell' else 'sell',usd=round(u),price=float(x['price']),ago=round(now-ts)))
+    net=sum(w['usd'] if w['side']=='buy' else -w['usd'] for w in wh)
+    wdir='YES' if net>=WHALE_STRONG else 'NO' if net<=-WHALE_STRONG else None
+    return dict(spot=spot,momentum=round(mom,5),cvd=round(cvd,4),cvdRatio=round(cvd/vol,3) if vol else 0,
+        whale=dict(thresholdUsd=round(thr),p99Usd=round(p99),count=len(wh),netFlowUsd=round(net),strongDir=wdir,alerts=wh[:10]))
 def mk(m): return dict(ticker=m['ticker'],strike=m.get('floor_strike'),close=iso(m['close_time']),yesAsk=fnum(m,'yes_ask_dollars'),yesBid=fnum(m,'yes_bid_dollars'),noAsk=fnum(m,'no_ask_dollars'),noBid=fnum(m,'no_bid_dollars'),result=m.get('result') or '')
 def kalshi(a):
     ms=[m for m in get(f"{KALSHI}/markets?series_ticker={SERIES[a]}&status=open&limit=5")['markets'] if iso(m['close_time'])>time.time()]
@@ -128,7 +140,12 @@ def tick_once():
             with lock:
                 t.update(markPrice=round(bid,4),unrealizedPnl=round(t['contracts']*bid-t['stake'],2),signalsAgree=bool(agree),
                          flipWarning=bool(sig_against or (mp is not None and (mp>0.5)!=(t['side']=='YES'))),currentModelP=q)
+                wnet=cb['whale']['netFlowUsd']*(1 if t['side']=='YES' else -1); left_t=t['closesAt']-time.time()
+                whale_against=cb['whale']['strongDir'] not in (None,t['side'])
+                t.update(whaleFlowUsd=wnet,whaleAgainst=whale_against,whaleCount=cb['whale']['count'])
                 if bid>0 and bid<=STOP*t['price']: pt.exit(t,bid,f'stop: mark {bid:.3f} <= {STOP:.0%} of entry {t["price"]}')
+                elif whale_against and bid>0 and not (left_t<90 and bid>=0.85) and (q is None or bid>=q-WHALE_MAX_GIVEUP):
+                    pt.exit(t,bid,f'whale: net whale flow ${wnet:,.0f} against {t["side"]}, sold at bid {bid:.3f}')
                 elif sig_against and elo_against and q is not None and bid-q>=EXIT_EDGE:
                     pt.exit(t,bid,f'flip: momentum/CVD {dirn} + {"EloEdge" if est=="live" else "fallback"} p={q:.3f} vs bid {bid:.3f}')
         if not k: sg['action']='skip: no real Kalshi market'; sigs[a]=sg; continue
@@ -137,17 +154,19 @@ def tick_once():
         if not dirn: sg['action']='skip: momentum/CVD disagree'
         elif est=='live' and mp is None: sg['action']='skip: no fresh EloEdge model_p'
         elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
+        elif cb['whale']['strongDir'] not in (None,dirn): sg['action']=f"skip: strong whale flow against (${cb['whale']['netFlowUsd']:,.0f})"
         elif left<60: sg['action']='skip: <60s to close'
         elif any(t.get('ticker')==k['ticker'] for t in pt.trades): sg['action']='holding/traded this window'
         else:
             used='coinbase+eloedge'
             if mp is None: mp=heur(cb); used='coinbase-fallback (EloEdge unavailable)'
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
-            with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],dict(priceSource='kalshi',signalSource=used,mom=mom,cvd=cvd,eloedge=est))
+            with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est))
             q=mp if dirn=='YES' else 1-mp
             sg['action']=f'OPENED #{t["id"]}' if t else f'skip: edge {q-ask:+.3f} < {MIN_EDGE}'
         sigs[a]=sg
     with lock: pt.settle(spot)
+    status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
     fb=src.get('eloedge')!='live'
     status.update(sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
         signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
