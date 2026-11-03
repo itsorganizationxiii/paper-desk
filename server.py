@@ -12,7 +12,7 @@ KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
 SERIES={'BTC':'KXBTC15M','ETH':'KXETH15M'}
 PYTH={'GOLD':'765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2','SILVER':'f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e','OIL':'f2464139c45f26097e0173b03207c4a490dbd8bf1b72dfbf064eeb832c7c2933'}
-WHALE_MIN=float(os.environ.get('WHALE_MIN_USD','250000')); WHALE_WIN=60; WHALE_STRONG=float(os.environ.get('WHALE_STRONG_USD','250000')); WHALE_MAX_GIVEUP=0.10
+WHALE_MIN=float(os.environ.get('WHALE_MIN_USD','150000')); WHALE_WIN=60; WHALE_STRONG=float(os.environ.get('WHALE_STRONG_USD','150000')); WHALE_MAX_GIVEUP=0.10
 MIN_EDGE=0.03; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
