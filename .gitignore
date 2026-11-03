@@ -1,0 +1,6 @@
+.env
+*.log
+__pycache__/
+trades.json
+trades.json.tmp
+data/

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: paper-desk
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python3 server.py"
+    healthCheckPath: /healthz
+    envVars:
+      - key: ELOEDGE_API_KEY
+        sync: false
+      - key: DATA_DIR
+        value: /tmp/paper-desk
+      - key: START_BALANCE
+        value: "10"
+      - key: PYTHON_VERSION
+        value: "3.11.9"

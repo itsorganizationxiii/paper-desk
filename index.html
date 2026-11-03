@@ -1,0 +1,42 @@
+<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name=apple-mobile-web-app-capable content=yes><meta name=apple-mobile-web-app-status-bar-style content=black-translucent><meta name=theme-color content="#0b0d12">
+<link rel=manifest href=manifest.json><title>Paper Desk</title>
+<style>
+*{box-sizing:border-box}body{background:#0b0d12;color:#e6e8ee;font-family:-apple-system,system-ui,sans-serif;margin:0;padding:16px;padding-top:max(16px,env(safe-area-inset-top))}
+.sub{color:#8a90a0;font-size:13px}.bal{font-size:52px;font-weight:700;letter-spacing:-1px}.pos{color:#3ddc84}.neg{color:#ff5c5c}.warn{color:#ffb020}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:14px 0}.stats div{background:#151922;border-radius:12px;padding:10px 4px;text-align:center;font-size:13px}.stats b{font-size:17px;display:block}
+.card{background:#151922;border-radius:14px;padding:14px;margin-top:10px}.new{border:2px solid #2f6bff;animation:p 1.2s 3}@keyframes p{50%{box-shadow:0 0 0 6px #2f6bff55}}
+.tk{font-family:ui-monospace,Menlo,monospace;font-size:14px;background:#0b0d12;padding:6px 8px;border-radius:8px;display:inline-block;margin:6px 0;user-select:all}
+.big{font-size:22px;font-weight:700}.row{display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px;margin-top:6px}
+.tabs{display:flex;gap:8px;margin-top:18px}.tabs button{flex:1;padding:11px;border:0;border-radius:10px;background:#151922;color:#e6e8ee;font-size:15px}.tabs .on{background:#2f6bff}
+.pill{font-size:12px;padding:2px 8px;border-radius:99px;background:#222836}h3{margin:18px 0 4px;font-size:15px;color:#8a90a0;font-weight:600}
+</style></head><body>
+<div class=sub>PAPER BALANCE · paper only, no real orders</div><div class=bal id=bal>$—</div><div class=sub id=chg></div>
+<div class=stats><div><b id=wr>—</b>Win</div><div><b id=ex>—</b>Exp.</div><div><b id=cl>—</b>Closed</div><div><b id=up>—</b>Unreal.</div></div>
+<div class=sub id=src></div>
+<h3>Open positions</h3><div id=open></div>
+<div class=tabs><button id=bh class=on onclick="tab='hist';r()">History</button><button id=bs onclick="tab='sig';r()">Signals</button></div><div id=list></div>
+<div class=sub id=upd style="margin-top:14px"></div>
+<script>
+let tab='hist',d,seen=new Set(JSON.parse(localStorage.seen||'[]')),first=!localStorage.seen;
+const tm=s=>new Date(s*1000).toLocaleTimeString([],{hour:'numeric',minute:'2-digit',second:'2-digit'});
+const m=(v,p=2)=>(v>=0?'+':'−')+'$'+Math.abs(v).toFixed(p);
+async function f(){try{d=await(await fetch('/api/status',{cache:'no-store'})).json();r()}catch(e){upd.textContent='Connection lost, retrying…'}}
+function r(){if(!d)return;bal.textContent='$'+d.balance.toFixed(2);let p=d.balance-d.startBalance;chg.innerHTML=`<span class=${p>=0?'pos':'neg'}>${m(p)}</span> vs $${d.startBalance} start · equity $${(d.equity??d.balance).toFixed(2)}`;
+wr.textContent=(d.winRate*100).toFixed(0)+'%';ex.textContent=m(d.expectancy);cl.textContent=d.closed;up.innerHTML=`<span class=${d.unrealizedPnl>=0?'pos':'neg'}>${m(d.unrealizedPnl||0)}</span>`;
+let s=d.signalStatus||{},so=s.sources||{};src.innerHTML=['coinbase','kalshi','eloedge'].map(k=>`${k}: <span class=${so[k]=='live'?'pos':'warn'}>${so[k]||'?'}</span>`).join(' · ')+(s.fallbackInUse?' · <span class=warn>FALLBACK (Coinbase only)</span>':'');
+let o=d.trades.filter(t=>t.status=='open');
+open.innerHTML=o.map(t=>{let isNew=!seen.has(t.id)&&!first;return `<div class="card ${isNew?'new':''}">
+<div class=row><span class=big>${t.asset} ${t.side}</span><span class=sub>opened ${tm(t.openedAt)}</span></div>
+<div class=tk>${t.ticker||'—'}</div>
+<div class=row><span>Entry <b>${t.price}</b></span><span>Stake <b>$${t.stake}</b> (${t.stakePct??'?'}% bal)</span><span>Edge ${(t.edge*100).toFixed(1)}%</span></div>
+<div class=row><span>Mark <b>${t.markPrice??'—'}</b></span><span>P&L <b class=${(t.unrealizedPnl||0)>=0?'pos':'neg'}>${t.unrealizedPnl!=null?m(t.unrealizedPnl):'—'}</b></span><span class=sub>closes ${tm(t.closesAt)}</span></div>
+<div class=row>${t.flipWarning?'<span class="pill warn">⚠ signals flipping against</span>':t.signalsAgree?'<span class="pill pos">signals agree</span>':'<span class=pill>mixed</span>'}<span class=sub>${t.signalSource||''}</span></div></div>`}).join('')||'<p class=sub>No open positions. Watching for setups.</p>';
+o.forEach(t=>seen.add(t.id));first=false;localStorage.seen=JSON.stringify([...seen]);
+bh.className=tab=='hist'?'on':'';bs.className=tab=='sig'?'on':'';
+if(tab=='hist')list.innerHTML=d.trades.filter(t=>t.status!='open').map(t=>`<div class=card><div class=row><b>${t.asset} ${t.side} @ ${t.price}</b><b class=${t.pnl>=0?'pos':'neg'}>${m(t.pnl)}</b></div>
+<div class=sub>${t.ticker||'demo'} · $${t.stake} · ${t.status.toUpperCase()}${t.exitReason?' · '+t.exitReason:''} · ${t.settledBy||''} · ${t.closedAt?tm(t.closedAt):''}</div></div>`).join('')||'<p class=sub>No closed trades yet.</p>';
+else list.innerHTML=Object.entries(s.signals||{}).map(([a,g])=>`<div class=card><b>${a}</b> · mom ${((g.momentum||0)*100).toFixed(2)}% · CVD ${g.cvd} · ${g.direction||''} · p ${g.modelP??'–'}<br><span class=sub>${g.kalshi?g.kalshi.ticker+' · YES '+g.kalshi.yesBid+'/'+g.kalshi.yesAsk+' · NO '+g.kalshi.noBid+'/'+g.kalshi.noAsk:''}<br>${g.action||''}</span></div>`).join('')+`<p class=sub>${s.signalMode||''}<br>${s.rules||''}</p>`;
+upd.textContent='Updated '+new Date().toLocaleTimeString()+' · tick '+(s.lastTick?tm(s.lastTick):'—')}
+f();setInterval(f,3000)
+</script></body></html>
