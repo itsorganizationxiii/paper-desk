@@ -29,13 +29,35 @@ def iso(s): return datetime.fromisoformat(s.replace('Z','+00:00')).timestamp()
 def fnum(m,k):
     try: return float(m.get(k) or 0)
     except Exception: return 0.0
+# ---- optional MongoDB persistence (state only; db 'paper_desk' by default, separate from XIII Trades Pro) ----
+MURI=os.environ.get('MONGODB_URI',''); MDB=os.environ.get('MONGODB_DB','paper_desk'); MCOL=None; PERSIST='file'; _dirty=threading.Event()
+if MURI:
+    try:
+        from pymongo import MongoClient
+        _mc=MongoClient(MURI,serverSelectionTimeoutMS=8000); _mc.admin.command('ping')
+        MCOL=_mc[MDB]['paper_desk_state']; PERSIST='mongo'; print('persistence: mongo db',MDB,flush=True)
+    except Exception as e: print('mongo unavailable, using file:',e,flush=True)
+def _mongo_writer():
+    while True:
+        _dirty.wait(); time.sleep(2); _dirty.clear()
+        try:
+            with lock: doc={'balance':round(pt.balance,4),'startBalance':pt.start,'trades':json.loads(json.dumps(pt.trades)),'updatedAt':time.time()}
+            MCOL.replace_one({'_id':'state'},doc,upsert=True)
+        except Exception as e: print('mongo write err',e,flush=True); _dirty.set(); time.sleep(10)
 class PaperTrader:
     def __init__(s):
+        if MCOL is not None:
+            try:
+                doc=MCOL.find_one({'_id':'state'})
+                if doc: json.dump({k:doc[k] for k in('balance','startBalance','trades')},open(TF,'w'),indent=1); print('loaded state from mongo:',len(doc['trades']),'trades',flush=True)
+                elif os.path.exists(SEED): shutil.copy(SEED,TF); _dirty.set(); print('mongo empty; seeding from seed_trades.json',flush=True)
+            except Exception as e: print('mongo load err',e,flush=True)
         if not os.path.exists(TF) and os.path.exists(SEED): shutil.copy(SEED,TF)
         if os.path.exists(TF): d=json.load(open(TF)); s.balance=d['balance']; s.start=d.get('startBalance',START); s.trades=d['trades']
         else: s.balance=START; s.start=START; s.trades=[]; s.save()
     def save(s):
         tmp=TF+'.tmp'; json.dump({'balance':round(s.balance,4),'startBalance':s.start,'trades':s.trades},open(tmp,'w'),indent=1); os.replace(tmp,TF)
+        if MCOL is not None: _dirty.set()
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
         q=p_yes if side=='YES' else 1-p_yes; edge=q-ask
         if edge<MIN_EDGE or not (0<ask<1): return None
@@ -96,7 +118,8 @@ class PaperTrader:
             unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2),
             winRate=round(len(w)/len(c),3) if c else 0,expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,
             closed=len(c),open=len(o),earlyExits=s.exitSummary(),trades=s.trades[::-1])
-pt=PaperTrader(); lock=threading.Lock()
+lock=threading.Lock(); pt=PaperTrader()
+if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
  'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
 def coinbase(a):
@@ -211,7 +234,7 @@ class H(SimpleHTTPRequestHandler):
     def do_GET(s):
         p=s.path.split('?')[0]
         if p=='/api/status':
-            with lock: d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); b=json.dumps(d).encode()
+            with lock: d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); d['persistence']=PERSIST; b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/trades.csv':
             cols=['id','opened ET','closed ET','asset','ticker','side','entry','stake','stakePct','edge','signalSource','status','exitPrice','exitReason','settle','pnl']
@@ -221,7 +244,7 @@ class H(SimpleHTTPRequestHandler):
             for t in tr: w.writerow([t.get('id'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl','')])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')
             s.send_header('Content-Disposition',f'attachment; filename="paper-desk-trades-{datetime.now(ET).strftime("%Y%m%d-%H%M")}.csv"'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
-        elif p=='/healthz': s.send_response(200); s.end_headers(); s.wfile.write(b'ok')
+        elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p in('/','/index.html','/manifest.json'): super().do_GET()
         else: s.send_error(404)
 threading.Thread(target=loop,daemon=True).start()
