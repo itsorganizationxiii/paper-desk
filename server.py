@@ -61,6 +61,7 @@ class PaperTrader:
         # boot MERGES seed + file/mongo state (never replaces): union by (ticker,openedAt), newest/closed record wins
         cur=json.load(open(TF)) if os.path.exists(TF) else {}
         seed=json.load(open(SEED)) if os.path.exists(SEED) else []
+        if isinstance(cur,list): cur={'trades':cur}
         if isinstance(seed,dict): seed=seed.get('trades',[])
         s.start=cur.get('startBalance',START); s.trades=[]; s.balance=s.start
         n=s.merge(seed+cur.get('trades',[])); print('boot merge:',n,'trades, balance',round(s.balance,2),flush=True)
