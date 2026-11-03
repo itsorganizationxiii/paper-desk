@@ -1,6 +1,6 @@
 # PAPER ONLY - simulated trades against real public data. NEVER places real orders.
 # No order endpoints are ever called; Kalshi is used read-only for prices/results.
-import json, os, time, math, threading, urllib.request, urllib.error, shutil, csv, io
+import json, os, time, math, threading, urllib.request, shutil, csv, io
 from datetime import timezone, timedelta
 try:
     from zoneinfo import ZoneInfo; ET=ZoneInfo('America/New_York')
@@ -146,44 +146,9 @@ def mk(m): return dict(ticker=m['ticker'],strike=m.get('floor_strike'),close=iso
 def kalshi(a):
     ms=[m for m in get(f"{KALSHI}/markets?series_ticker={SERIES[a]}&status=open&limit=5")['markets'] if iso(m['close_time'])>time.time()]
     return mk(sorted(ms,key=lambda m:m['close_time'])[0]) if ms else None
-# EloEdge: ONE call (all assets) cached ELO_TTL s; backoff on 429 / low daily quota (plus plan: 50k/day)
-ELO_TTL=int(os.environ.get('ELO_TTL_SEC','30')); ELO_MIN_REMAIN=2000
-elo_cache=dict(at=0,wins={},err=None,backoffUntil=0,backoffSec=0,usage={})
-_elo_lock=threading.Lock()
-def _elo_fetch():
-    c=elo_cache; now=time.time()
-    if now<c['backoffUntil']: raise RuntimeError(f"backoff {round(c['backoffUntil']-now)}s")
-    req=urllib.request.Request(ELO,headers={'User-Agent':'paper-desk/1.2','Accept':'application/json','Authorization':'Bearer '+KEY})
-    try:
-        r=urllib.request.urlopen(req,timeout=8); hd=r.headers; d=json.load(r)
-    except urllib.error.HTTPError as e:
-        hd=e.headers
-        if e.code==429:
-            ra=hd.get('Retry-After'); c['backoffSec']=min(300,max(30,c['backoffSec']*2 or 30))
-            try: c['backoffSec']=max(c['backoffSec'],int(ra))
-            except Exception: pass
-            c['backoffUntil']=now+c['backoffSec']
-        raise
-    def hi(k):
-        try: return int(hd.get(k))
-        except Exception: return None
-    u=dict(dayUsed=hi('x-usage-day-used'),dayLimit=hi('x-usage-day-limit'),dayRemaining=hi('x-usage-day-remaining'),dayReset=hd.get('x-usage-day-reset'),rateLimit=hi('x-ratelimit-limit'),rateRemaining=hi('x-ratelimit-remaining'),plan=hd.get('x-eloedge-plan'),at=now)
-    c['usage']=u; c['backoffSec']=0
-    print('eloedge usage day_used',u['dayUsed'],'remaining',u['dayRemaining'],flush=True)
-    if u['dayRemaining'] is not None and u['dayRemaining']<ELO_MIN_REMAIN:
-        c['backoffUntil']=now+300
-    return {w['market']['ticker']:w for w in d.get('windows',[])}
-def eloedge(a=None):
+def eloedge(a):
     if not KEY: return 'unavailable',{}
-    c=elo_cache
-    with _elo_lock:
-        if time.time()-c['at']>=ELO_TTL:
-            try: c['wins']=_elo_fetch(); c['err']=None
-            except Exception as e: c['wins']={}; c['err']=str(e)
-            c['at']=time.time()
-        if c['err']: raise RuntimeError(c['err'])
-        age=time.time()-c['at']
-        return 'live',{k:dict(w,age_sec=(w.get('age_sec') or 0)+age if w.get('age_sec') is not None else None) for k,w in c['wins'].items()}
+    d=get(f'{ELO}?asset={a}',auth=True); return 'live',{w['market']['ticker']:w for w in d.get('windows',[])}
 def pyth():
     q='&'.join('ids[]='+i for i in PYTH.values()); now=time.time()
     cur=get(f'{HERMES}/v2/updates/price/latest?{q}&parsed=true')['parsed']; out={}
@@ -256,7 +221,7 @@ def tick_once():
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
     fb=src.get('eloedge')!='live'
-    status.update(sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,eloedgeUsage=dict(elo_cache['usage'],cacheTtlSec=ELO_TTL,backoffUntil=elo_cache['backoffUntil'] or None,lastError=elo_cache['err']),
+    status.update(sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
         signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
 def loop():
     while True:
