@@ -16,8 +16,10 @@ KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
 SERIES={'BTC':'KXBTC15M','ETH':'KXETH15M'}
 PYTH={'GOLD':'765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2','SILVER':'f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e','OIL':'f2464139c45f26097e0173b03207c4a490dbd8bf1b72dfbf064eeb832c7c2933'}
-WHALE_FLOOR=float(os.environ.get('WHALE_FLOOR_USD','50000')); WHALE_CAP=float(os.environ.get('WHALE_CAP_USD','150000')); WHALE_WIN=60;
-WHALE_P99_MULT=float(os.environ.get('WHALE_P99_MULT','20')); WHALE_VOL_FRAC=float(os.environ.get('WHALE_VOL_FRAC','0.5')); WHALE_MAX_GIVEUP=0.10
+WHALE_WIN=60; WHALE_MAX_GIVEUP=0.10
+# per-asset whale cutoff, calibrated to 6h of Coinbase trades (Nov 2-3 2026): BTC max $200k, p99.99 $101k; ETH max $125k (outlier), p99.99 $38k
+WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),cap=float(os.environ.get('WHALE_CAP_BTC','150000')),p99mult=10,volfrac=0.5),
+           'ETH':dict(floor=float(os.environ.get('WHALE_FLOOR_ETH','35000')),cap=float(os.environ.get('WHALE_CAP_ETH','60000')),p99mult=4,volfrac=0.5)}
 MIN_EDGE=0.03; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
@@ -65,7 +67,27 @@ class PaperTrader:
                 if now<t['closesAt']+600: continue
             if t['asset'] in spot:
                 s.close(t,(spot[t['asset']]>=t['strike'])==(t['side']=='YES'),'coinbase-spot',spot[t['asset']]); ch=True
+            # counterfactual for early exits: what holding to settlement would have paid
+        for t in s.trades:
+            if t['status']=='exited' and t.get('ticker') and 'wouldHaveWon' not in t and now>=t['closesAt']:
+                try:
+                    m=get(f"{KALSHI}/markets/{t['ticker']}")['market']
+                    if m.get('result') in('yes','no'):
+                        win=(m['result']=='yes')==(t['side']=='YES'); hold=round((t['contracts'] if win else 0)-t['stake'],2)
+                        t.update(finalResult=m['result'],wouldHaveWon=win,counterfactualPnl=hold,exitSavedPnl=round(t['pnl']-hold,2)); ch=True
+                except Exception as e: print('cf err',e,flush=True)
         if ch: s.save()
+    def exitSummary(s):
+        ex=[t for t in s.trades if t['status']=='exited']; done=[t for t in ex if 'wouldHaveWon' in t]
+        def agg(ts):
+            return dict(count=len(ts),resolved=len([t for t in ts if 'wouldHaveWon' in t]),wouldHaveWon=len([t for t in ts if t.get('wouldHaveWon')]),
+                exitPnl=round(sum(t['pnl'] for t in ts),2),holdPnl=round(sum(t.get('counterfactualPnl',0) for t in ts if 'wouldHaveWon' in t),2),
+                netSaved=round(sum(t.get('exitSavedPnl',0) for t in ts),2),
+                savedOnLosers=round(sum(t['exitSavedPnl'] for t in ts if 'wouldHaveWon' in t and not t['wouldHaveWon']),2),
+                lostOnWinners=round(-sum(t['exitSavedPnl'] for t in ts if t.get('wouldHaveWon')),2))
+        by={}
+        for t in ex: by.setdefault((t.get('exitReason') or 'other').split(':')[0],[]).append(t)
+        return dict(all=agg(ex),byReason={k:agg(v) for k,v in by.items()},pending=len(ex)-len(done))
     def getStats(s):
         c=[t for t in s.trades if t['status']!='open']; w=[t for t in c if t.get('pnl',0)>0]
         o=[t for t in s.trades if t['status']=='open']
@@ -73,7 +95,7 @@ class PaperTrader:
             equity=round(s.balance+sum(t.get('markPrice',t['price'])*t['contracts'] for t in o),2),
             unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2),
             winRate=round(len(w)/len(c),3) if c else 0,expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,
-            closed=len(c),open=len(o),trades=s.trades[::-1])
+            closed=len(c),open=len(o),earlyExits=s.exitSummary(),trades=s.trades[::-1])
 pt=PaperTrader(); lock=threading.Lock()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
  'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
@@ -87,7 +109,7 @@ def coinbase(a):
     ts_all=[iso(x['time']) for x in tr]; span_min=max((max(ts_all)-min(ts_all))/60,1/60) if ts_all else 1
     usd_per_min=sum(usd)/span_min
     # adaptive: quiet market -> floor, busy -> cap
-    thr=min(WHALE_CAP,max(WHALE_FLOOR,WHALE_P99_MULT*p99,WHALE_VOL_FRAC*usd_per_min)); strong=thr; now=time.time(); wh=[]
+    wc=WHALE_CFG[a]; thr=min(wc['cap'],max(wc['floor'],wc['p99mult']*p99,wc['volfrac']*usd_per_min)); strong=thr; now=time.time(); wh=[]
     for x in tr:
         u=float(x['size'])*float(x['price'])
         if u>=thr:
@@ -96,7 +118,7 @@ def coinbase(a):
     net=sum(w['usd'] if w['side']=='buy' else -w['usd'] for w in wh)
     wdir='YES' if net>=strong else 'NO' if net<=-strong else None
     return dict(spot=spot,momentum=round(mom,5),cvd=round(cvd,4),cvdRatio=round(cvd/vol,3) if vol else 0,
-        whale=dict(thresholdUsd=round(thr),strongUsd=round(strong),usdPerMin=round(usd_per_min),floorUsd=WHALE_FLOOR,capUsd=WHALE_CAP,p99Usd=round(p99),count=len(wh),netFlowUsd=round(net),strongDir=wdir,alerts=wh[:10]))
+        whale=dict(thresholdUsd=round(thr),strongUsd=round(strong),usdPerMin=round(usd_per_min),floorUsd=wc['floor'],capUsd=wc['cap'],p99Usd=round(p99),count=len(wh),netFlowUsd=round(net),strongDir=wdir,alerts=wh[:10]))
 def mk(m): return dict(ticker=m['ticker'],strike=m.get('floor_strike'),close=iso(m['close_time']),yesAsk=fnum(m,'yes_ask_dollars'),yesBid=fnum(m,'yes_bid_dollars'),noAsk=fnum(m,'no_ask_dollars'),noBid=fnum(m,'no_bid_dollars'),result=m.get('result') or '')
 def kalshi(a):
     ms=[m for m in get(f"{KALSHI}/markets?series_ticker={SERIES[a]}&status=open&limit=5")['markets'] if iso(m['close_time'])>time.time()]
