@@ -26,7 +26,7 @@ WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),ca
 # take-profit: sell at bid (minus Kalshi taker fee) once our side's bid >= TP_BID, unless very confident it won't flip
 TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
 def kalshi_fee(c,p): return math.ceil(7*c*p*(1-p))/100  # Kalshi taker fee: ceil(0.07*C*P*(1-P)) in $
-MIN_EDGE=0.03; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10'))
+MIN_EDGE=0.03; NIGHT_EDGE=0.05; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
     if auth: h['Authorization']='Bearer '+KEY
@@ -82,8 +82,9 @@ class PaperTrader:
         if MCOL is not None: _dirty.set()
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
         q=p_yes if side=='YES' else 1-p_yes; edge=q-ask
-        if edge<MIN_EDGE or not (0<ask<1): return None
-        f=min(KELLY*edge/(1-ask),CAP); bal=s.balance; stake=round(bal*f,2)
+        nt=night()
+        if edge<(NIGHT_EDGE if nt else MIN_EDGE) or not (0<ask<1): return None
+        f=min(KELLY*edge/(1-ask),CAP)*(0.5 if nt else 1); bal=s.balance; stake=round(bal*f,2)
         if stake<0.05: return None
         s.balance-=stake
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
@@ -203,6 +204,9 @@ def eloedge_all():
         except Exception as e: elo_com['err']=str(e); print('eloedge commodity err',e,flush=True)
     w.update(elo_com['wins']); return 'live',w
 elo_com=dict(at=0,wins={},err=None)
+def night(ts=None):
+    h=datetime.fromtimestamp(ts or time.time(),ET).hour
+    return h>=17 or h<9
 def metals_closed(ts=None):
     # Kalshi GOLD/SILVER closed: daily 17:00-18:00 ET, and Fri 17:00 ET -> Sun 18:00 ET (DST-aware)
     d=datetime.fromtimestamp(ts if ts is not None else time.time(),ET); wd,h=d.weekday(),d.hour
@@ -279,6 +283,7 @@ def tick_once():
                 elif sig_against and elo_against and q is not None and bid-q>=EXIT_EDGE:
                     pt.exit(t,bid,f'flip: momentum/CVD {dirn} + {"EloEdge" if est=="live" else "fallback"} p={q:.3f} vs bid {bid:.3f}')
         if not k: sg['action']='skip: no real Kalshi market'; sigs[a]=sg; continue
+        if a=='SOL' and night(): sg['action']='skip: SOL paused at night (5 PM-9 AM ET, thin volume)'; sigs[a]=sg; continue
         if a in METALS and (metals_closed() or metals_closed(k['close']-1)): sg['action']='skip: metals session closed (Kalshi 5-6 PM ET daily, Fri 5 PM-Sun 6 PM ET)'; sigs[a]=sg; continue
         mp=fresh(k['ticker']); sg['modelP']=mp
         left=k['close']-time.time(); sg['secsToClose']=round(left)
@@ -294,12 +299,12 @@ def tick_once():
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
             with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est))
             q=mp if dirn=='YES' else 1-mp
-            sg['action']=f'OPENED #{t["id"]}' if t else f'skip: edge {q-ask:+.3f} < {MIN_EDGE}'
+            sg['action']=f'OPENED #{t["id"]}' if t else f'skip: edge {q-ask:+.3f} < {NIGHT_EDGE if night() else MIN_EDGE}'
         sigs[a]=sg
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
     fb=src.get('eloedge')!='live'
-    status.update(metalsClosed=metals_closed(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
+    status.update(metalsClosed=metals_closed(),nightMode=night(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
         signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
 def loop():
     while True:
