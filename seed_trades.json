@@ -1,5 +1,5 @@
 {
- "balance": 13.23,
+ "balance": 15.15,
  "startBalance": 10.0,
  "trades": [
   {
@@ -565,12 +565,38 @@
    "ticker": "KXBTC15M-26NOV030030-30",
    "openedAt": 1793683099.2293158,
    "closesAt": 1793683800.0,
-   "status": "open",
+   "status": "won",
    "priceSource": "kalshi",
    "signalSource": "coinbase+eloedge",
    "whaleFlowAtEntry": 0,
    "mom": -0.00168,
    "cvd": -4.308,
+   "eloedge": "live",
+   "settle": "76601.66",
+   "settledBy": "kalshi",
+   "pnl": 1.31,
+   "closedAt": 1793683810.3589637
+  },
+  {
+   "id": 25,
+   "asset": "BTC",
+   "side": "NO",
+   "price": 0.49,
+   "stake": 0.34,
+   "stakePct": 2.19,
+   "contracts": 0.694,
+   "edge": 0.045,
+   "modelP": 0.5348,
+   "strike": 76601.66,
+   "ticker": "KXBTC15M-26NOV030045-45",
+   "openedAt": 1793683847.332668,
+   "closesAt": 1793684700.0,
+   "status": "open",
+   "priceSource": "kalshi",
+   "signalSource": "coinbase+eloedge",
+   "whaleFlowAtEntry": 0,
+   "mom": -0.00266,
+   "cvd": -1.6099,
    "eloedge": "live"
   }
  ]

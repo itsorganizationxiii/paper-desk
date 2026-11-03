@@ -1,6 +1,10 @@
 # PAPER ONLY - simulated trades against real public data. NEVER places real orders.
 # No order endpoints are ever called; Kalshi is used read-only for prices/results.
-import json, os, time, math, threading, urllib.request, shutil
+import json, os, time, math, threading, urllib.request, shutil, csv, io
+from datetime import timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo; ET=ZoneInfo('America/New_York')
+except Exception: ET=timezone(timedelta(hours=-5))
 from datetime import datetime
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 APP=os.path.dirname(os.path.abspath(__file__))
@@ -187,6 +191,14 @@ class H(SimpleHTTPRequestHandler):
         if p=='/api/status':
             with lock: d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/trades.csv':
+            cols=['id','opened ET','closed ET','asset','ticker','side','entry','stake','stakePct','edge','signalSource','status','exitPrice','exitReason','settle','pnl']
+            et=lambda x:datetime.fromtimestamp(x,ET).strftime('%Y-%m-%d %H:%M:%S') if x else ''
+            buf=io.StringIO(); w=csv.writer(buf); w.writerow(cols)
+            with lock: tr=list(pt.trades)
+            for t in tr: w.writerow([t.get('id'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl','')])
+            b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')
+            s.send_header('Content-Disposition',f'attachment; filename="paper-desk-trades-{datetime.now(ET).strftime("%Y%m%d-%H%M")}.csv"'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/healthz': s.send_response(200); s.end_headers(); s.wfile.write(b'ok')
         elif p in('/','/index.html','/manifest.json'): super().do_GET()
         else: s.send_error(404)
