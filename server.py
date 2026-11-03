@@ -14,12 +14,13 @@ PORT=int(os.environ.get('PORT','8080')); START=float(os.environ.get('START_BALAN
 KEY=os.environ.get('ELOEDGE_API_KEY','')
 KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange.coinbase.com'
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
-SERIES={'BTC':'KXBTC15M','ETH':'KXETH15M'}
+SERIES={'BTC':'KXBTC15M','ETH':'KXETH15M','SOL':'KXSOL15M'}
 PYTH={'GOLD':'765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2','SILVER':'f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e','OIL':'f2464139c45f26097e0173b03207c4a490dbd8bf1b72dfbf064eeb832c7c2933'}
 WHALE_WIN=60; WHALE_MAX_GIVEUP=0.10
 # per-asset whale cutoff, calibrated to 6h of Coinbase trades (Nov 2-3 2026): BTC max $200k, p99.99 $101k; ETH max $125k (outlier), p99.99 $38k
 WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),cap=float(os.environ.get('WHALE_CAP_BTC','150000')),p99mult=10,volfrac=0.5),
-           'ETH':dict(floor=float(os.environ.get('WHALE_FLOOR_ETH','35000')),cap=float(os.environ.get('WHALE_CAP_ETH','60000')),p99mult=4,volfrac=0.5)}
+           'ETH':dict(floor=float(os.environ.get('WHALE_FLOOR_ETH','35000')),cap=float(os.environ.get('WHALE_CAP_ETH','60000')),p99mult=4,volfrac=0.5),
+           'SOL':dict(floor=float(os.environ.get('WHALE_FLOOR_SOL','25000')),cap=float(os.environ.get('WHALE_CAP_SOL','45000')),p99mult=4,volfrac=0.5)}
 # take-profit: sell at bid (minus Kalshi taker fee) once our side's bid >= TP_BID, unless very confident it won't flip
 TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
 def kalshi_fee(c,p): return math.ceil(7*c*p*(1-p))/100  # Kalshi taker fee: ceil(0.07*C*P*(1-P)) in $
@@ -156,9 +157,10 @@ def mk(m): return dict(ticker=m['ticker'],strike=m.get('floor_strike'),close=iso
 def kalshi(a):
     ms=[m for m in get(f"{KALSHI}/markets?series_ticker={SERIES[a]}&status=open&limit=5")['markets'] if iso(m['close_time'])>time.time()]
     return mk(sorted(ms,key=lambda m:m['close_time'])[0]) if ms else None
-def eloedge(a):
+def eloedge_all():
+    # ONE unscoped call per tick covers BTC/ETH/SOL (same interval as before; was one call per asset)
     if not KEY: return 'unavailable',{}
-    d=get(f'{ELO}?asset={a}',auth=True); return 'live',{w['market']['ticker']:w for w in d.get('windows',[])}
+    d=get(ELO,auth=True); return 'live',{w['market']['ticker']:w for w in d.get('windows',[])}
 def pyth():
     q='&'.join('ids[]='+i for i in PYTH.values()); now=time.time()
     cur=get(f'{HERMES}/v2/updates/price/latest?{q}&parsed=true')['parsed']; out={}
@@ -175,14 +177,15 @@ def tick_once():
         try: status['commodities']=pyth(); src['pyth']='live'
         except Exception as e: src['pyth']=f'error: {e}'
     else: src['pyth']=status['sources'].get('pyth','unknown')
+    try: elo_est,elo_wins=eloedge_all()
+    except Exception as e: elo_est,elo_wins='unavailable',{}; print('eloedge err',e,flush=True)
     for a in SERIES:
         sg={}
         try: cb=coinbase(a); sg.update(cb); spot[a]=cb['spot']; src['coinbase']='live'
         except Exception as e: src['coinbase']=f'error: {e}'; sigs[a]=dict(action='skip: coinbase down'); continue
         try: k=kalshi(a); src['kalshi']='live' if k else 'no open market'; sg['kalshi']=k
         except Exception as e: k=None; src['kalshi']=f'error: {e}'
-        try: est,wins=eloedge(a)
-        except Exception as e: est,wins='unavailable',{}; print('eloedge err',e,flush=True)
+        est,wins=elo_est,elo_wins
         src['eloedge']=est
         mom,cvd=cb['momentum'],cb['cvd']
         dirn='YES' if mom>0 and cvd>0 else 'NO' if mom<0 and cvd<0 else None
