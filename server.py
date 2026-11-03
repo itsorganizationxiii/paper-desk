@@ -58,9 +58,24 @@ class PaperTrader:
                 if doc: json.dump({k:doc[k] for k in('balance','startBalance','trades')},open(TF,'w'),indent=1); print('loaded state from mongo:',len(doc['trades']),'trades',flush=True)
                 elif os.path.exists(SEED): shutil.copy(SEED,TF); _dirty.set(); print('mongo empty; seeding from seed_trades.json',flush=True)
             except Exception as e: print('mongo load err',e,flush=True)
-        if not os.path.exists(TF) and os.path.exists(SEED): shutil.copy(SEED,TF)
-        if os.path.exists(TF): d=json.load(open(TF)); s.balance=d['balance']; s.start=d.get('startBalance',START); s.trades=d['trades']
-        else: s.balance=START; s.start=START; s.trades=[]; s.save()
+        # boot MERGES seed + file/mongo state (never replaces): union by (ticker,openedAt), newest/closed record wins
+        cur=json.load(open(TF)) if os.path.exists(TF) else {}
+        seed=json.load(open(SEED)) if os.path.exists(SEED) else []
+        if isinstance(seed,dict): seed=seed.get('trades',[])
+        s.start=cur.get('startBalance',START); s.trades=[]; s.balance=s.start
+        n=s.merge(seed+cur.get('trades',[])); print('boot merge:',n,'trades, balance',round(s.balance,2),flush=True)
+    @staticmethod
+    def _key(t): return (t.get('ticker'),round(float(t.get('openedAt') or 0),3))
+    def merge(s,incoming):
+        m={s._key(t):t for t in s.trades}
+        for t in incoming:
+            k=s._key(t); o=m.get(k)
+            if o is None or (o.get('status')=='open' and t.get('status')!='open') or (o.get('status')==t.get('status') and (t.get('closedAt') or 0)>(o.get('closedAt') or 0)): m[k]=t
+        tr=sorted(m.values(),key=lambda t:(t.get('openedAt') or 0))
+        for i,t in enumerate(tr,1): t['id']=i
+        s.trades=tr
+        s.balance=s.start+sum(t.get('pnl') or 0 for t in tr if t.get('status')!='open')-sum(t.get('stake') or 0 for t in tr if t.get('status')=='open')
+        s.save(); return len(tr)
     def save(s):
         tmp=TF+'.tmp'; json.dump({'balance':round(s.balance,4),'startBalance':s.start,'trades':s.trades},open(tmp,'w'),indent=1); os.replace(tmp,TF)
         if MCOL is not None: _dirty.set()
@@ -70,7 +85,7 @@ class PaperTrader:
         f=min(KELLY*edge/(1-ask),CAP); bal=s.balance; stake=round(bal*f,2)
         if stake<0.05: return None
         s.balance-=stake
-        t=dict(id=len(s.trades)+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
+        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
         s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True); return t
     def close(s,t,win,how,val=None):
@@ -309,6 +324,18 @@ class H(SimpleHTTPRequestHandler):
         elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p in('/','/index.html','/manifest.json'): super().do_GET()
         else: s.send_error(404)
+    def do_POST(s):
+        # merge-only restore; requires RESTORE_KEY env + matching X-Restore-Key header. Never deletes trades.
+        if s.path.split('?')[0]!='/api/restore-trades': return s.send_error(404)
+        rk=os.environ.get('RESTORE_KEY','')
+        if not rk or s.headers.get('X-Restore-Key')!=rk: return s.send_error(403)
+        try:
+            body=json.loads(s.rfile.read(int(s.headers.get('Content-Length','0'))))
+            inc=body.get('trades',body) if isinstance(body,dict) else body
+            with lock: before=len(pt.trades); n=pt.merge(inc)
+            b=json.dumps({'before':before,'after':n,'balance':round(pt.balance,2)}).encode(); s.send_response(200)
+        except Exception as e: b=json.dumps({'error':str(e)}).encode(); s.send_response(400)
+        s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
 threading.Thread(target=loop,daemon=True).start()
 print('Paper Desk (PAPER ONLY) on port',PORT,'data',TF,flush=True)
 ThreadingHTTPServer(('0.0.0.0',PORT),H).serve_forever()
