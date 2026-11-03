@@ -25,7 +25,8 @@ async function f(){try{d=await(await fetch('/api/status',{cache:'no-store'})).js
 function r(){if(!d)return;bal.textContent='$'+d.balance.toFixed(2);let p=d.balance-d.startBalance;chg.innerHTML=`<span class=${p>=0?'pos':'neg'}>${m(p)}</span> vs $${d.startBalance} start · equity $${(d.equity??d.balance).toFixed(2)}`;
 wr.textContent=(d.winRate*100).toFixed(0)+'%';ex.textContent=m(d.expectancy);cl.textContent=d.closed;up.innerHTML=`<span class=${d.unrealizedPnl>=0?'pos':'neg'}>${m(d.unrealizedPnl||0)}</span>`;
 let s=d.signalStatus||{},so=s.sources||{};src.innerHTML=['coinbase','kalshi','eloedge'].map(k=>`${k}: <span class=${so[k]=='live'?'pos':'warn'}>${so[k]||'?'}</span>`).join(' · ')+(s.fallbackInUse?' · <span class=warn>FALLBACK (Coinbase only)</span>':'');
-let al=s.whaleAlerts||[];wa.innerHTML=al.length?'<div class=card><b>🐋 Whale alerts (60s)</b>'+al.slice(0,5).map(w=>`<div class=row><span>${w.asset} <b class=${w.side=='buy'?'pos':'neg'}>${w.side.toUpperCase()}</b> $${Math.round(w.usd/1000)}k @ ${w.price}</span><span class=sub>${w.ago}s ago</span></div>`).join('')+'</div>':'';
+let al=s.whaleAlerts||[];let cut=Object.entries(s.signals||{}).filter(([a,g])=>g.whale).map(([a,g])=>`${a} $${Math.round(g.whale.thresholdUsd/1000)}k`).join(' · ');
+wa.innerHTML='<div class=card><b>🐋 Whale alerts (60s)</b><div class=sub>Cutoff (adapts to volume, $50k–$150k): '+(cut||'—')+'</div>'+al.slice(0,5).map(w=>`<div class=row><span>${w.asset} <b class=${w.side=='buy'?'pos':'neg'}>${w.side.toUpperCase()}</b> $${Math.round(w.usd/1000)}k @ ${w.price}</span><span class=sub>${w.ago}s ago</span></div>`).join('')+(al.length?'':'<div class=sub>No whale trades in the last 60s.</div>')+'</div>';
 let o=d.trades.filter(t=>t.status=='open');
 open.innerHTML=o.map(t=>{let isNew=!seen.has(t.id)&&!first;return `<div class="card ${isNew?'new':''}">
 <div class=row><span class=big>${t.asset} ${t.side}</span><span class=sub>opened ${tm(t.openedAt)}</span></div>

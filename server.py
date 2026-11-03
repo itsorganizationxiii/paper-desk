@@ -12,7 +12,8 @@ KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
 SERIES={'BTC':'KXBTC15M','ETH':'KXETH15M'}
 PYTH={'GOLD':'765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2','SILVER':'f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e','OIL':'f2464139c45f26097e0173b03207c4a490dbd8bf1b72dfbf064eeb832c7c2933'}
-WHALE_MIN=float(os.environ.get('WHALE_MIN_USD','150000')); WHALE_WIN=60; WHALE_STRONG=float(os.environ.get('WHALE_STRONG_USD','150000')); WHALE_MAX_GIVEUP=0.10
+WHALE_FLOOR=float(os.environ.get('WHALE_FLOOR_USD','50000')); WHALE_CAP=float(os.environ.get('WHALE_CAP_USD','150000')); WHALE_WIN=60;
+WHALE_P99_MULT=float(os.environ.get('WHALE_P99_MULT','20')); WHALE_VOL_FRAC=float(os.environ.get('WHALE_VOL_FRAC','0.5')); WHALE_MAX_GIVEUP=0.10
 MIN_EDGE=0.03; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
@@ -79,16 +80,19 @@ def coinbase(a):
     cvd=sum(float(x['size'])*(1 if x['side']=='sell' else -1) for x in tr); vol=sum(float(x['size']) for x in tr)  # side=maker side
     # whale detection: taker trades far above recent distribution within last WHALE_WIN sec
     usd=sorted(float(x['size'])*float(x['price']) for x in tr); p99=usd[int(0.99*(len(usd)-1))] if usd else 0
-    thr=max(WHALE_MIN,p99); now=time.time(); wh=[]
+    ts_all=[iso(x['time']) for x in tr]; span_min=max((max(ts_all)-min(ts_all))/60,1/60) if ts_all else 1
+    usd_per_min=sum(usd)/span_min
+    # adaptive: quiet market -> floor, busy -> cap
+    thr=min(WHALE_CAP,max(WHALE_FLOOR,WHALE_P99_MULT*p99,WHALE_VOL_FRAC*usd_per_min)); strong=thr; now=time.time(); wh=[]
     for x in tr:
         u=float(x['size'])*float(x['price'])
         if u>=thr:
             ts=iso(x['time'])
             if now-ts<=WHALE_WIN: wh.append(dict(side='buy' if x['side']=='sell' else 'sell',usd=round(u),price=float(x['price']),ago=round(now-ts)))
     net=sum(w['usd'] if w['side']=='buy' else -w['usd'] for w in wh)
-    wdir='YES' if net>=WHALE_STRONG else 'NO' if net<=-WHALE_STRONG else None
+    wdir='YES' if net>=strong else 'NO' if net<=-strong else None
     return dict(spot=spot,momentum=round(mom,5),cvd=round(cvd,4),cvdRatio=round(cvd/vol,3) if vol else 0,
-        whale=dict(thresholdUsd=round(thr),p99Usd=round(p99),count=len(wh),netFlowUsd=round(net),strongDir=wdir,alerts=wh[:10]))
+        whale=dict(thresholdUsd=round(thr),strongUsd=round(strong),usdPerMin=round(usd_per_min),floorUsd=WHALE_FLOOR,capUsd=WHALE_CAP,p99Usd=round(p99),count=len(wh),netFlowUsd=round(net),strongDir=wdir,alerts=wh[:10]))
 def mk(m): return dict(ticker=m['ticker'],strike=m.get('floor_strike'),close=iso(m['close_time']),yesAsk=fnum(m,'yes_ask_dollars'),yesBid=fnum(m,'yes_bid_dollars'),noAsk=fnum(m,'no_ask_dollars'),noBid=fnum(m,'no_bid_dollars'),result=m.get('result') or '')
 def kalshi(a):
     ms=[m for m in get(f"{KALSHI}/markets?series_ticker={SERIES[a]}&status=open&limit=5")['markets'] if iso(m['close_time'])>time.time()]
