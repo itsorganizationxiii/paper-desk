@@ -180,12 +180,21 @@ def eloedge_all():
     if not KEY: return 'unavailable',{}
     d=get(ELO,auth=True); w={x['market']['ticker']:x for x in d.get('windows',[])}
     # commodities (GOLD/SILVER) are a separate EloEdge feed; one batched call cached ELO_COM_TTL s
-    if time.time()-elo_com['at']>=ELO_COM_TTL:
+    if metals_closed(): elo_com['wins']={}; elo_com['err']='skipped: metals session closed'
+    elif time.time()-elo_com['at']>=ELO_COM_TTL:
         elo_com['at']=time.time()
         try: elo_com['wins']={x['market']['ticker']:x for x in get(ELO_COM,auth=True).get('windows',[])}; elo_com['err']=None
         except Exception as e: elo_com['err']=str(e); print('eloedge commodity err',e,flush=True)
     w.update(elo_com['wins']); return 'live',w
 elo_com=dict(at=0,wins={},err=None)
+def metals_closed(ts=None):
+    # Kalshi GOLD/SILVER closed: daily 17:00-18:00 ET, and Fri 17:00 ET -> Sun 18:00 ET (DST-aware)
+    d=datetime.fromtimestamp(ts if ts is not None else time.time(),ET); wd,h=d.weekday(),d.hour
+    if h==17: return True
+    if wd==4 and h>=17: return True
+    if wd==5: return True
+    if wd==6 and h<18: return True
+    return False
 def pyth():
     q='&'.join('ids[]='+i for i in PYTH.values()); now=time.time()
     cur=get(f'{HERMES}/v2/updates/price/latest?{q}&parsed=true')['parsed']; out={}
@@ -254,6 +263,7 @@ def tick_once():
                 elif sig_against and elo_against and q is not None and bid-q>=EXIT_EDGE:
                     pt.exit(t,bid,f'flip: momentum/CVD {dirn} + {"EloEdge" if est=="live" else "fallback"} p={q:.3f} vs bid {bid:.3f}')
         if not k: sg['action']='skip: no real Kalshi market'; sigs[a]=sg; continue
+        if a in METALS and (metals_closed() or metals_closed(k['close']-1)): sg['action']='skip: metals session closed (Kalshi 5-6 PM ET daily, Fri 5 PM-Sun 6 PM ET)'; sigs[a]=sg; continue
         mp=fresh(k['ticker']); sg['modelP']=mp
         left=k['close']-time.time(); sg['secsToClose']=round(left)
         if not dirn: sg['action']='skip: momentum/CVD disagree'
@@ -273,7 +283,7 @@ def tick_once():
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
     fb=src.get('eloedge')!='live'
-    status.update(sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
+    status.update(metalsClosed=metals_closed(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
         signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
 def loop():
     while True:
