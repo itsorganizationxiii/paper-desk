@@ -1,5 +1,5 @@
 {
- "balance": 15.15,
+ "balance": 14.4,
  "startBalance": 10.0,
  "trades": [
   {
@@ -598,6 +598,33 @@
    "mom": -0.00266,
    "cvd": -1.6099,
    "eloedge": "live"
+  },
+  {
+   "id": 26,
+   "asset": "ETH",
+   "side": "NO",
+   "price": 0.8,
+   "stake": 1.16,
+   "stakePct": 7.66,
+   "contracts": 1.45,
+   "edge": 0.061,
+   "modelP": 0.8611,
+   "strike": 2248.51,
+   "ticker": "KXETH15M-26NOV030045-45",
+   "openedAt": 1793683972.1444533,
+   "closesAt": 1793684700.0,
+   "status": "exited",
+   "priceSource": "kalshi",
+   "signalSource": "coinbase+eloedge",
+   "whaleFlowAtEntry": 0,
+   "mom": -0.00048,
+   "cvd": -5.6617,
+   "eloedge": "live",
+   "exitPrice": 0.28,
+   "exitReason": "stop: mark 0.280 <= 40% of entry 0.8",
+   "settledBy": "early-exit@bid",
+   "pnl": -0.75,
+   "closedAt": 1793684578.6750228
   }
  ]
 }
