@@ -24,6 +24,7 @@ WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),ca
            'ETH':dict(floor=float(os.environ.get('WHALE_FLOOR_ETH','35000')),cap=float(os.environ.get('WHALE_CAP_ETH','60000')),p99mult=4,volfrac=0.5),
            'SOL':dict(floor=float(os.environ.get('WHALE_FLOOR_SOL','25000')),cap=float(os.environ.get('WHALE_CAP_SOL','45000')),p99mult=4,volfrac=0.5)}
 # take-profit: sell at bid (minus Kalshi taker fee) once our side's bid >= TP_BID, unless very confident it won't flip
+LOCK_PEAK=0.80; LOCK_DROP=0.10; LOCK_HOLD_P=0.90
 TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
 def kalshi_fee(c,p): return math.ceil(7*c*p*(1-p))/100  # Kalshi taker fee: ceil(0.07*C*P*(1-P)) in $
 MIN_EDGE=0.03; NIGHT_EDGE=0.05; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10'))
@@ -263,6 +264,7 @@ def tick_once():
                 wnet=cb['whale']['netFlowUsd']*(1 if t['side']=='YES' else -1); left_t=t['closesAt']-time.time()
                 whale_against=cb['whale']['strongDir'] not in (None,t['side'])
                 t.update(whaleFlowUsd=wnet,whaleAgainst=whale_against,whaleCount=cb['whale']['count'])
+                t['peakBid']=round(max(t.get('peakBid') or 0,bid),4)
                 tp=None
                 if bid>=TP_BID:
                     sd=cb.get('sd15'); strike=t.get('strike'); z=None
@@ -277,6 +279,8 @@ def tick_once():
                         t.update(tpHeld=True,tpHoldReason=why,tpSellPnl=sellpnl if 'tpSellPnl' not in t else t['tpSellPnl'])
                     else: tp=(fee,why)
                 if tp: pt.exit(t,bid,f'takeprofit: {tp[1]}; fee ${tp[0]:.2f}',fee=tp[0])
+                elif night() and t['peakBid']>=LOCK_PEAK and bid<=t['peakBid']-LOCK_DROP and bid>t['price'] and not (q is not None and q>=LOCK_HOLD_P):
+                    f2=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'profitlock: night, peak {t["peakBid"]:.3f} -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
                 elif bid>0 and bid<=STOP*t['price']: pt.exit(t,bid,f'stop: mark {bid:.3f} <= {STOP:.0%} of entry {t["price"]}')
                 elif whale_against and bid>0 and not (left_t<90 and bid>=0.85) and (q is None or bid>=q-WHALE_MAX_GIVEUP):
                     pt.exit(t,bid,f'whale: net whale flow ${wnet:,.0f} against {t["side"]}, sold at bid {bid:.3f}')
