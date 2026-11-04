@@ -24,7 +24,10 @@ WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),ca
            'ETH':dict(floor=float(os.environ.get('WHALE_FLOOR_ETH','35000')),cap=float(os.environ.get('WHALE_CAP_ETH','60000')),p99mult=4,volfrac=0.5),
            'SOL':dict(floor=float(os.environ.get('WHALE_FLOOR_SOL','25000')),cap=float(os.environ.get('WHALE_CAP_SOL','45000')),p99mult=4,volfrac=0.5)}
 # take-profit: sell at bid (minus Kalshi taker fee) once our side's bid >= TP_BID, unless very confident it won't flip
+# profit lock arms once the bid is LOCK_ARM_C above ENTRY (so mid-range peaks 55c->76c->12c get protected),
+# or at the old fixed peaks, whichever comes first. LOCK_ARM_C=0 disables the entry-relative arm.
 LOCK_PEAK=0.80; LOCK_DROP=0.10; LOCK_HOLD_P=0.90
+LOCK_ARM_C=float(os.environ.get('LOCK_ARM_C','0.10'))
 # metals flip harder off their peaks (thin book), so they lock in lower: 65c peak instead of 80c
 LOCK_PEAK_BY_ASSET={'GOLD':float(os.environ.get('LOCK_PEAK_GOLD','0.65')),'SILVER':float(os.environ.get('LOCK_PEAK_SILVER','0.65'))}
 TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
@@ -283,8 +286,8 @@ def tick_once():
                         t.update(tpHeld=True,tpHoldReason=why,tpSellPnl=sellpnl if 'tpSellPnl' not in t else t['tpSellPnl'])
                     else: tp=(fee,why)
                 if tp: pt.exit(t,bid,f'takeprofit: {tp[1]}; fee ${tp[0]:.2f}',fee=tp[0])
-                elif night() and t['peakBid']>=LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK) and bid<=t['peakBid']-LOCK_DROP and bid>t['price'] and not (q is not None and q>=LOCK_HOLD_P):
-                    f2=kalshi_fee(t['contracts'],bid); _lp=LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK); pt.exit(t,bid,f'profitlock: night, peak {t["peakBid"]:.3f} (>{_lp:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
+                elif night() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK), t['price']+LOCK_ARM_C) and bid<=t['peakBid']-LOCK_DROP and bid>t['price'] and not (q is not None and q>=LOCK_HOLD_P):
+                    f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+LOCK_ARM_C); pt.exit(t,bid,f'profitlock: night, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
                 elif t['asset'] in GUARD_ASSETS and t['peakBid']>=t['price']+0.10 and bid>0 and bid<=t['price']-GUARD_GIVEBACK and not (q is not None and q>=LOCK_HOLD_P):
                     f3=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'breakeven: {t["asset"]} peaked {t["peakBid"]:.3f} (>=entry+0.10), fell to bid {bid:.3f} vs entry {t["price"]:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f3:.2f}',fee=f3)
                 elif bid>0 and bid<=STOP*t['price']: pt.exit(t,bid,f'stop: mark {bid:.3f} <= {STOP:.0%} of entry {t["price"]}')
