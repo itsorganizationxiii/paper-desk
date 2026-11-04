@@ -28,6 +28,10 @@ WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),ca
 # or at the old fixed peaks, whichever comes first. LOCK_ARM_C=0 disables the entry-relative arm.
 LOCK_PEAK=0.80; LOCK_DROP=0.10; LOCK_HOLD_P=0.90
 LOCK_ARM_C=float(os.environ.get('LOCK_ARM_C','0.10'))
+# lock used to be night-only; replay of 153 peak-recorded trades showed arming entry+10c all day
+# improves 64 exits by +$31.18 with no offsetting cost, so it now runs around the clock (LOCK_ALL_DAY=0 reverts)
+LOCK_ALL_DAY=os.environ.get('LOCK_ALL_DAY','1')!='0'
+def lock_active(ts=None): return LOCK_ALL_DAY or night(ts)
 # metals flip harder off their peaks (thin book), so they lock in lower: 65c peak instead of 80c
 LOCK_PEAK_BY_ASSET={'GOLD':float(os.environ.get('LOCK_PEAK_GOLD','0.65')),'SILVER':float(os.environ.get('LOCK_PEAK_SILVER','0.65'))}
 TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
@@ -156,7 +160,7 @@ class PaperTrader:
 lock=threading.Lock(); pt=PaperTrader()
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
- 'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
+ 'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
 def coinbase(a):
     c=get(f'{CB}/products/{a}-USD/candles?granularity=900')
     spot=c[0][4]; mom=(c[0][4]-c[1][3])/c[1][3]
@@ -286,8 +290,8 @@ def tick_once():
                         t.update(tpHeld=True,tpHoldReason=why,tpSellPnl=sellpnl if 'tpSellPnl' not in t else t['tpSellPnl'])
                     else: tp=(fee,why)
                 if tp: pt.exit(t,bid,f'takeprofit: {tp[1]}; fee ${tp[0]:.2f}',fee=tp[0])
-                elif night() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK), t['price']+LOCK_ARM_C) and bid<=t['peakBid']-LOCK_DROP and bid>t['price'] and not (q is not None and q>=LOCK_HOLD_P):
-                    f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+LOCK_ARM_C); pt.exit(t,bid,f'profitlock: night, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
+                elif lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK), t['price']+LOCK_ARM_C) and bid<=t['peakBid']-LOCK_DROP and bid>t['price'] and not (q is not None and q>=LOCK_HOLD_P):
+                    f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+LOCK_ARM_C); pt.exit(t,bid,f'profitlock: {"night" if night() else "day"}, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
                 elif t['asset'] in GUARD_ASSETS and t['peakBid']>=t['price']+0.10 and bid>0 and bid<=t['price']-GUARD_GIVEBACK and not (q is not None and q>=LOCK_HOLD_P):
                     f3=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'breakeven: {t["asset"]} peaked {t["peakBid"]:.3f} (>=entry+0.10), fell to bid {bid:.3f} vs entry {t["price"]:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f3:.2f}',fee=f3)
                 elif bid>0 and bid<=STOP*t['price']: pt.exit(t,bid,f'stop: mark {bid:.3f} <= {STOP:.0%} of entry {t["price"]}')
