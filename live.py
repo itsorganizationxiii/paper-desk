@@ -106,6 +106,12 @@ class Live:
     def log(s,**kw):
         with s.lock: s.orders.append(dict(at=time.time(),**kw)); s.orders=s.orders[-200:]; s.persist()
     def balance(s):
+        # Kalshi balance endpoint: 1 call/sec, no burst. Space calls >=2s apart and reuse the last value in between.
+        with s.lock:
+            w=2.0-(time.time()-getattr(s,'_balAt',0))
+            if w>0 and s.cash is not None: return s.cash
+            if w>0: time.sleep(w)
+            s._balAt=time.time()
         c,d=api('GET','/portfolio/balance')
         if c!=200: raise RuntimeError(f'balance HTTP {c}')
         v=float(d['balance_dollars']) if d.get('balance_dollars') is not None else d['balance']/100
@@ -314,7 +320,7 @@ class Live:
             try:
                 s.balance()
                 if (s.lastError or '').startswith('balance'): s.lastError=None
-            except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'; s.cashAt=time.time()  # back off 60s on errors (avoid 429 storms)
+            except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'; s.cashAt=time.time()-55  # retry in ~5s
         return dict(enabled=s.enabled(),envAllow=ENV_ALLOW,keysPresent=keys_present(),paused=s.paused,baseUrl=BASE,cash=s.cash,
             todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=DAILY_LOSS),
             maxTradeUsd=MAX_USD,maxChase=MAX_CHASE,assets=sorted(ASSETS) if ASSETS else 'all',fractional=s.fracOK,ws=(s.ws.status() if s.ws else None),lastError=s.lastError,recentOrders=s.orders[-20:][::-1])
