@@ -68,7 +68,21 @@ class Live:
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
         s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None
-        s.cash=None; s.cashAt=None; s.lastError=None
+        s.cash=None; s.cashAt=None; s.lastError=None; s.ws=None
+        if s.allowed():
+            try:
+                import kws
+                url=BASE.replace('https://','wss://').replace('http://','ws://').rsplit('/trade-api',1)[0]+'/trade-api/ws/v2'
+                def _hdr():
+                    ts=str(int(time.time()*1000))
+                    return {'KALSHI-ACCESS-KEY':_key_id(),'KALSHI-ACCESS-TIMESTAMP':ts,'KALSHI-ACCESS-SIGNATURE':sign(private_key(),ts,'GET','/trade-api/ws/v2')}
+                s.ws=kws.Feed(url,_hdr)
+            except Exception as e: s.lastError=f'ws init: {e}'
+    def wsq(s,ticker):
+        try:
+            if s.ws: s.ws.watch(ticker); return s.ws.quote(ticker)
+        except Exception: pass
+        return None
     def allowed(s): return ENV_ALLOW and keys_present()
     def enabled(s): return s.allowed() and not s.paused
     def state(s): return dict(paused=s.paused,day=s.day,dayPnl=s.dayPnl,killed=s.killed,killReason=s.killReason,orders=s.orders[-200:],totalPnl=s.totalPnl)
@@ -99,6 +113,10 @@ class Live:
     def market(s,ticker):
         c,d=api('GET',f'/markets/{ticker}'); return (d or {}).get('market') or {}
     def _quote(s,ticker,side,kind):
+        w=s.wsq(ticker)
+        if w and w.get('yesBid') is not None and w.get('yesAsk') is not None:
+            v=(w['yesAsk'] if kind=='ask' else w['yesBid']) if side=='YES' else (1-w['yesBid'] if kind=='ask' else 1-w['yesAsk'])
+            if 0<v<1: return round(v,4)
         try:
             m=s.market(ticker); k=f"{side.lower()}_{kind}"; v=m.get(k+'_dollars'); v=float(v) if v not in (None,'') else (m[k]/100 if m.get(k) is not None else None)
             return v if v and v>0 else None
@@ -274,4 +292,4 @@ class Live:
             except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'; s.cashAt=time.time()  # back off 60s on errors (avoid 429 storms)
         return dict(enabled=s.enabled(),envAllow=ENV_ALLOW,keysPresent=keys_present(),paused=s.paused,baseUrl=BASE,cash=s.cash,
             todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=DAILY_LOSS),
-            maxTradeUsd=MAX_USD,maxChase=MAX_CHASE,assets=sorted(ASSETS) if ASSETS else 'all',fractional=s.fracOK,lastError=s.lastError,recentOrders=s.orders[-20:][::-1])
+            maxTradeUsd=MAX_USD,maxChase=MAX_CHASE,assets=sorted(ASSETS) if ASSETS else 'all',fractional=s.fracOK,ws=(s.ws.status() if s.ws else None),lastError=s.lastError,recentOrders=s.orders[-20:][::-1])

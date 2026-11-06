@@ -310,7 +310,9 @@ def tick_once():
         sg={}
         try: cb=metal(a) if a in METALS else coinbase(a); sg.update(cb); spot[a]=cb['spot']; src['kraken-futures' if a in METALS else 'coinbase']='live'
         except Exception as e: src['kraken-futures' if a in METALS else 'coinbase']=f'error: {e}'; sigs[a]=dict(action='skip: coinbase down'); continue
-        try: k=kalshi(a); src['kalshi']='live' if k else 'no open market'; sg['kalshi']=k
+        try:
+            k=kalshi(a); src['kalshi']='live' if k else 'no open market'; sg['kalshi']=k
+            if k and LV and LV.enabled(): LV.wsq(k['ticker'])
         except Exception as e: k=None; src['kalshi']=f'error: {e}'
         est,wins=elo_est,elo_wins
         src['eloedge']=est
@@ -322,8 +324,11 @@ def tick_once():
             return w['model_p'] if w and w.get('model_p') is not None and (w.get('age_sec') or 99)<60 and w.get('state')=='open' else None
         # ---- monitor open positions for this asset ----
         for t in [t for t in pt.trades if t['status']=='open' and t['asset']==a and t.get('ticker') and time.time()<t['closesAt'] and not t.get('exiting')]:
-            try: m=k if (k and k['ticker']==t['ticker'] and t.get('mode')!='live') else mk(get(f"{KALSHI}/markets/{t['ticker']}")['market'])  # live: always the fresh single-market quote
-            except Exception as e: print('mark err',e,flush=True); continue
+            w=LV.wsq(t['ticker']) if (LV and t.get('mode')=='live') else None
+            if w and w.get('yesBid') is not None and w.get('yesAsk') is not None: m=dict(yesBid=w['yesBid'],noBid=round(1-w['yesAsk'],4))  # live: pushed WS quote
+            else:
+              try: m=k if (k and k['ticker']==t['ticker'] and t.get('mode')!='live') else mk(get(f"{KALSHI}/markets/{t['ticker']}")['market'])  # live: always the fresh single-market quote
+              except Exception as e: print('mark err',e,flush=True); continue
             bid=m['yesBid'] if t['side']=='YES' else m['noBid']
             mp=fresh(t['ticker']); p_yes=mp if mp is not None else (heur(cb) if est!='live' else None)
             q=None if p_yes is None else (p_yes if t['side']=='YES' else 1-p_yes)
