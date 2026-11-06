@@ -13,11 +13,22 @@ def _key_id(): return os.environ.get('KALSHI_API_KEY_ID','').strip()
 def load_pem():
     b=os.environ.get('KALSHI_PRIVATE_KEY_B64','').strip()
     if b:
-        try: return base64.b64decode(b).decode()
+        try: return normalize_pem(base64.b64decode(b).decode())
         except Exception: return None
     k=os.environ.get('KALSHI_PRIVATE_KEY','').strip()
     if len(k)>1 and k[0]==k[-1] and k[0] in '"\'': k=k[1:-1]
-    return k.replace('\\n','\n') or None
+    return normalize_pem(k.replace('\\n','\n')) or None
+def normalize_pem(k):
+    # Render/UI pastes often collapse newlines to spaces or drop them; rebuild canonical PEM framing.
+    import re
+    if not k: return k
+    m=re.search(r'-----BEGIN ([A-Z ]+)-----(.*?)-----END \1-----',k,re.S)
+    if not m: 
+        body=re.sub(r'[^A-Za-z0-9+/=]','',k); label='PRIVATE KEY' if body.startswith('MIIE') and 'MIIEv' in body[:6] else 'RSA PRIVATE KEY'
+    else:
+        label=m.group(1).strip(); body=re.sub(r'[^A-Za-z0-9+/=]','',m.group(2))
+    if not body: return None
+    return '-----BEGIN %s-----\n%s\n-----END %s-----\n'%(label,'\n'.join(body[i:i+64] for i in range(0,len(body),64)),label)
 _pk=[None,None]
 def private_key(pem=None):
     from cryptography.hazmat.primitives import serialization
