@@ -165,8 +165,10 @@ class Live:
     def status(s):
         with s.lock: s._rollday()
         if ENV_ALLOW and keys_present() and (s.cashAt is None or time.time()-s.cashAt>60):
-            try: s.balance()
-            except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'
+            try:
+                s.balance()
+                if (s.lastError or '').startswith('balance:'): s.lastError=None
+            except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'; s.cashAt=time.time()  # back off 60s on errors (avoid 429 storms)
         return dict(enabled=s.enabled(),envAllow=ENV_ALLOW,keysPresent=keys_present(),paused=s.paused,baseUrl=BASE,cash=s.cash,
             todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=DAILY_LOSS),
             maxTradeUsd=MAX_USD,assets=sorted(ASSETS) if ASSETS else 'all',openPositions=s.positions,lastError=s.lastError,recentOrders=s.orders[-20:][::-1])
