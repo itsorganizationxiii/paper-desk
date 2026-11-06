@@ -66,7 +66,7 @@ class Live:
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set()
+        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set()
         s.cash=None; s.cashAt=None; s.lastError=None
     def allowed(s): return ENV_ALLOW and keys_present()
     def enabled(s): return s.allowed() and not s.paused
@@ -135,7 +135,7 @@ class Live:
                 if side!='YES' and abs(a-px)<abs(fpx-px): fpx=a
         fee=float(o['average_fee_paid'])*fc if o.get('average_fee_paid') not in (None,'') else float(o.get('taker_fees_dollars') or o.get('fees_dollars') or 0)
         return c,fc,fpx,round(fee,4),o.get('order_id') or oid0,(None if c in (200,201) else json.dumps(d)[:200])
-    def buy(s,asset,ticker,side,frac,ref):
+    def buy(s,asset,ticker,side,frac,ref,sizer=None):
         """Synchronous real buy. Returns dict(contracts,price,fee,cost,orderId,cash) when anything filled, else None (logged)."""
         a=dict(asset=asset,ticker=ticker,side=side)
         with s.lock: s._rollday()
@@ -145,13 +145,21 @@ class Live:
         if s.killed: s.log(action='buy-skip',error=f'kill switch: {s.killReason}',**a); return None
         try: cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
         except Exception as e: s.lastError=f'balance: {e}'; s.log(action='buy-skip',error=s.lastError,**a); return None
-        maxpx=min(0.99,round(ref+MAX_CHASE,2))
+        maxpx=min(0.99,round(ref+MAX_CHASE,2)) if sizer is None else 0.99
         usd=frac*cash
         if MAX_USD>0: usd=min(usd,MAX_USD)
         c=fc=0; fee=0.0; oid=None; err=None; px=None; n=0; cost=0.0
         for attempt in range(2):
             ask=s._quote(ticker,side,'ask')
             px=round(ask,2) if ask else min(0.99,round(ref+BUY_SLIP,2))
+            if sizer is not None:
+                f2=sizer(px)
+                if f2 is None:
+                    if fc: break
+                    s.tried.discard(ticker)  # edge gone at the live price; re-check next tick
+                    if ticker not in s.edgeLogged: s.edgeLogged.add(ticker); s.log(action='buy-skip',error=f'edge gone at live ask {px} (signal {ref}); will keep checking',**a)
+                    return None
+                if not fc: frac=f2; usd=f2*cash; usd=min(usd,MAX_USD) if MAX_USD>0 else usd
             if px>maxpx:
                 err=f'ask {px} above max {maxpx} (signal {ref})'
                 if not fc: s.log(action='buy-skip',error=err,**a); return None

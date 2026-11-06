@@ -380,10 +380,10 @@ def tick_once():
                 sz=pt.size(dirn,ask,mp); t=None
                 if sz:
                     if k['ticker'] in LV.tried: sg['action']='live: already tried this window'; sigs[a]=sg; continue
-                    fill=LV.buy(a,k['ticker'],dirn,sz[0],ask)  # real order, off the lock
+                    fill=LV.buy(a,k['ticker'],dirn,sz[0],ask,sizer=lambda px,d=dirn,m=mp:(pt.size(d,px,m) or [None])[0])  # real order; edge re-checked at the live ask
                     if fill:
                         with lock: t=pt.openLive(a,dirn,fill,k['strike'],k['close'],k['ticker'],meta,sz[1],sz[2])
-                sg['action']=f'OPENED LIVE #{t["id"]}' if t else ('live: no fill/skipped (see live order log)' if sz else f'skip: edge {q-ask:+.3f} < {NIGHT_EDGE if night() else MIN_EDGE}')
+                sg['action']=f'OPENED LIVE #{t["id"]}' if t else ('live: no fill / edge gone at live price (see live order log)' if sz else f'skip: edge {q-ask:+.3f} < {NIGHT_EDGE if night() else MIN_EDGE}')
             else:
                 with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],meta)
                 sg['action']=f'OPENED #{t["id"]}' if t else f'skip: edge {q-ask:+.3f} < {NIGHT_EDGE if night() else MIN_EDGE}'
