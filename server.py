@@ -39,7 +39,7 @@ TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
 # metals only: once the bid is 10c above entry, never give back past entry (thin books gap through the 40% stop)
 GUARD_ASSETS={'GOLD','SILVER'}; GUARD_GIVEBACK=float(os.environ.get('GUARD_GIVEBACK','0.0'))
 def kalshi_fee(c,p): return math.ceil(7*c*p*(1-p))/100  # Kalshi taker fee: ceil(0.07*C*P*(1-P)) in $
-MIN_EDGE=0.03; NIGHT_EDGE=0.05; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10'))
+MIN_EDGE=0.03; NIGHT_EDGE=0.05; EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10')); REST_SEC=int(os.environ.get('LIVE_REST_SEC','30'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
     if auth: h['Authorization']='Bearer '+KEY
@@ -380,10 +380,19 @@ def tick_once():
             if LV and LV.enabled():
                 sz=pt.size(dirn,ask,mp); t=None
                 if sz:
-                    if k['ticker'] in LV.tried: sg['action']='live: already tried this window'; sigs[a]=sg; continue
-                    fill=LV.buy(a,k['ticker'],dirn,sz[0],ask,sizer=lambda px,d=dirn,m=mp:(pt.size(d,px,m) or [None])[0])  # real order; edge re-checked at the live ask
+                    if k['ticker'] in LV.tried or k['ticker'] in LV.resting: sg['action']='live: order working / already tried this window'; sigs[a]=sg; continue
+                    _sz=lambda px,d=dirn,m=mp:(pt.size(d,px,m) or [None])[0]
+                    LV.lastBuy=None
+                    fill=LV.buy(a,k['ticker'],dirn,sz[0],ask,sizer=_sz)  # real order; edge re-checked at the live ask
                     if fill:
                         with lock: t=pt.openLive(a,dirn,fill,k['strike'],k['close'],k['ticker'],meta,sz[1],sz[2])
+                    elif LV.lastBuy in ('edge','nofill') and REST_SEC>0 and left>REST_SEC+60:
+                        # missed at the live price: rest a limit at the signal price for REST_SEC, like XIII did
+                        def _rest(a=a,tk=k['ticker'],d=dirn,ref=ask,szf=_sz,st=k['strike'],cl=k['close'],meta=meta,e=sz[1],q2=sz[2]):
+                            f=LV.rest_buy(a,tk,d,ref,szf,wait=REST_SEC)
+                            if f:
+                                with lock: pt.openLive(a,d,f,st,cl,tk,meta,e,q2)
+                        threading.Thread(target=_rest,daemon=True).start(); sg['action']=f'live: resting limit @{ask:.2f} for {REST_SEC}s'; sigs[a]=sg; continue
                 sg['action']=f'OPENED LIVE #{t["id"]}' if t else ('live: no fill / edge gone at live price (see live order log)' if sz else f'skip: edge {q-ask:+.3f} < {NIGHT_EDGE if night() else MIN_EDGE}')
             else:
                 with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],meta)
