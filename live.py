@@ -129,8 +129,24 @@ class Live:
                   time_in_force='immediate_or_cancel',self_trade_prevention_type='taker_at_cross')
         if action=='sell': body['reduce_only']=True
         c,d=api('POST','/portfolio/events/orders',body); o=d.get('order',d) if isinstance(d,dict) else {}
-        fc=float(o.get('fill_count') or o.get('fill_count_fp') or 0)
-        avg=o.get('average_fill_price') or o.get('average_fill_price_dollars')
+        def _fc(o):
+            for k in ('fill_count','fill_count_fp','taker_fill_count','taker_fill_count_fp','filled_count'):
+                v=o.get(k)
+                if v not in (None,''):
+                    try: return float(v)
+                    except Exception: pass
+            return 0.0
+        fc=_fc(o); oid0=o.get('order_id') or o.get('id')
+        if c in (200,201) and fc==0 and oid0:
+            # IOC responses can return before fills are reported; confirm from the order itself
+            for _ in range(3):
+                time.sleep(0.6)
+                try:
+                    c2,d2=api('GET',f'/portfolio/orders/{oid0}'); o2=(d2 or {}).get('order') or {}
+                    if o2: o={**o,**o2}; fc=_fc(o)
+                    if fc>0 or str(o2.get('status','')) in ('canceled','cancelled','executed'): break
+                except Exception: pass
+        avg=o.get('average_fill_price') or o.get('average_fill_price_dollars') or o.get('taker_fill_cost_dollars') and fc and float(o['taker_fill_cost_dollars'])/fc
         fpx=None
         if fc>0: fpx=(float(avg) if side=='YES' else 1-float(avg)) if avg not in (None,'') else px
         fee=float(o.get('taker_fees_dollars') or o.get('fees_dollars') or 0)
