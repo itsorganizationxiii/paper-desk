@@ -137,7 +137,8 @@ class PaperTrader:
         if not (LV and LV.allowed()): t['liveSellError']='live disabled (env/keys); holding to settlement'; return
         t['exiting']=reason; threading.Thread(target=s._sellLive,args=(t,bid,reason),daemon=True).start()
     def _sellLive(s,t,bid,reason):
-        try: fc,fpx,fee,oid,err=LV.sell(t['ticker'],t['side'],t['contracts'],bid)
+        floor=round(t['price']+0.01,2) if str(reason).lower().startswith(('profitlock','take','tp','breakeven')) is True and not str(reason).lower().startswith('breakeven') else None  # profit exits never sell below entry
+        try: fc,fpx,fee,oid,err=LV.sell(t['ticker'],t['side'],t['contracts'],bid,floor=floor)
         except Exception as e: fc,fpx,fee,oid,err=0,None,0.0,None,f'{type(e).__name__}: {e}'
         with lock:
             t.pop('exiting',None)
@@ -321,7 +322,7 @@ def tick_once():
             return w['model_p'] if w and w.get('model_p') is not None and (w.get('age_sec') or 99)<60 and w.get('state')=='open' else None
         # ---- monitor open positions for this asset ----
         for t in [t for t in pt.trades if t['status']=='open' and t['asset']==a and t.get('ticker') and time.time()<t['closesAt'] and not t.get('exiting')]:
-            try: m=k if k and k['ticker']==t['ticker'] else mk(get(f"{KALSHI}/markets/{t['ticker']}")['market'])
+            try: m=k if (k and k['ticker']==t['ticker'] and t.get('mode')!='live') else mk(get(f"{KALSHI}/markets/{t['ticker']}")['market'])  # live: always the fresh single-market quote
             except Exception as e: print('mark err',e,flush=True); continue
             bid=m['yesBid'] if t['side']=='YES' else m['noBid']
             mp=fresh(t['ticker']); p_yes=mp if mp is not None else (heur(cb) if est!='live' else None)

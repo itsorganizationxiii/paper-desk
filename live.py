@@ -186,7 +186,7 @@ class Live:
         if not fc: return None
         s.cashAt=None
         return dict(contracts=fc,price=round(cost/fc,4),fee=round(fee,4),cost=round(cost,4),orderId=oid,cash=cash,frac=frac)
-    def sell(s,ticker,side,count,bid):
+    def sell(s,ticker,side,count,bid,floor=None):
         """Synchronous real sell of up to count. Returns (filled, avg price, fee, orderId, error)."""
         c=fc=0; fee=0.0; oid=None; err=None; px=None; proceeds=0.0
         for attempt in range(3):
@@ -194,6 +194,9 @@ class Live:
             if left<=0: break
             q=s._quote(ticker,side,'bid') or bid
             px=max(0.01,round(q-SELL_BUF*(attempt+1),2))
+            if floor is not None and px<floor:
+                if attempt==0 and q<floor: err=f'live bid {q} below floor {floor} (entry+1c); holding instead of selling at a loss'; break
+                px=floor
             c,f1,p1,fe1,oid,err=s._order(ticker,side,'sell',left,px)
             if f1>0: proceeds+=f1*(p1 if p1 is not None else px); fc+=f1; fee+=fe1
             if err: break
