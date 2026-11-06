@@ -67,7 +67,7 @@ class Live:
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=None; s.resting=set(); s.lastBuy=None
+        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None
         s.cash=None; s.cashAt=None; s.lastError=None
     def allowed(s): return ENV_ALLOW and keys_present()
     def enabled(s): return s.allowed() and not s.paused
@@ -172,7 +172,7 @@ class Live:
                 break
             c,f1,p1,fe1,oid,err=s._order(ticker,side,'buy',n,px)
             if s.fracOK is None and n!=int(n):
-                if err and c not in (200,201) and not f1:
+                if err and c not in (200,201) and not f1 and 'insufficient' not in str(err):
                     s.fracOK=False; s.log(action='frac-test',error=f'Kalshi rejected fractional count {n}: {err}; using whole contracts',**a)
                     err=None; n2=int(usd//px)
                     if n2<1: s.log(action='buy-skip',error=f'<1 whole contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
