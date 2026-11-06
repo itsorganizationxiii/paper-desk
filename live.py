@@ -186,7 +186,7 @@ class Live:
         if not fc: s.lastBuy='nofill' if (c in (200,201) or not err) else 'error'; return None
         s.cashAt=None
         return dict(contracts=fc,price=round(cost/fc,4),fee=round(fee,4),cost=round(cost,4),orderId=oid,cash=cash,frac=frac)
-    def rest_buy(s,asset,ticker,side,ref,sizer,wait=30):
+    def rest_buy(s,asset,ticker,side,ref,sizer,wait=30,close_at=None):
         """Resting limit buy at the signal price: waits up to `wait`s for Kalshi to fill, then cancels the rest."""
         a=dict(asset=asset,ticker=ticker,side=side)
         if ticker in s.resting or s.killed: return None
@@ -200,7 +200,7 @@ class Live:
             if n<(0.01 if s.fracOK is not False else 1): return None
             book='bid' if side=='YES' else 'ask'; yes=px if side=='YES' else 1-px
             body=dict(ticker=ticker,client_order_id=f'pd-{uuid.uuid4().hex[:20]}',side=book,count=f'{n:.2f}',price=f'{max(0.01,min(0.99,yes)):.4f}',
-                      time_in_force='good_till_canceled',self_trade_prevention_type='taker_at_cross')
+                      time_in_force='good_till_canceled',self_trade_prevention_type='taker_at_cross',expiration_ts=int(time.time()+wait+2))
             c,d=api('POST','/portfolio/events/orders',body); o=(d or {}).get('order',d) if isinstance(d,dict) else {}
             oid=o.get('order_id') or o.get('id')
             if c not in (200,201) or not oid:
@@ -214,23 +214,32 @@ class Live:
                     fc=max([fc]+[float(o2.get(k) or 0) for k in ('fill_count','fill_count_fp','filled_count')])
                     if fc>=n-1e-9 or str(o2.get('status','')) in ('executed','canceled','cancelled'): break
                 except Exception: pass
+            cancel=[]
             if fc<n-1e-9:
                 for p in (f'/portfolio/orders/{oid}',f'/portfolio/events/orders/{oid}'):
                     try:
-                        cc,_=api('DELETE',p)
+                        cc,dd=api('DELETE',p); cancel.append(f'{p.split("/")[2]}:{cc}')
                         if cc in (200,201,204): break
+                    except Exception as e: cancel.append(f'err {e}')
+                # never lose track of an order: if it is still resting, keep watching until it fills/cancels/expires or the window ends
+                end=time.time()+max(0,close_at-time.time()) if close_at else time.time()+5
+                while True:
+                    time.sleep(0.5 if not cancel or time.time()<t0+wait+3 else 5)
+                    try:
+                        c2,d2=api('GET',f'/portfolio/orders/{oid}'); o2=(d2 or {}).get('order') or o2
+                        fc=max([fc]+[float(o2.get(k) or 0) for k in ('fill_count','fill_count_fp','filled_count')])
                     except Exception: pass
-                time.sleep(0.5)
-                try:
-                    c2,d2=api('GET',f'/portfolio/orders/{oid}'); o2=(d2 or {}).get('order') or o2
-                    fc=max([fc]+[float(o2.get(k) or 0) for k in ('fill_count','fill_count_fp','filled_count')])
-                except Exception: pass
+                    stt=str(o2.get('status',''))
+                    if stt!='resting' or fc>=n-1e-9 or time.time()>end: break
+                    if time.time()>t0+wait+3:
+                        try: api('DELETE',f'/portfolio/orders/{oid}')
+                        except Exception: pass
             avg=o2.get('average_fill_price') or o2.get('average_fill_price_dollars'); fpx=px
             if fc and avg not in (None,''):
                 v=float(avg); fpx=v if side=='YES' else 1-v
                 if side!='YES' and abs(v-px)<abs(fpx-px): fpx=v
             fee=float(o2['average_fee_paid'])*fc if o2.get('average_fee_paid') not in (None,'') else float(o2.get('taker_fees_dollars') or o2.get('maker_fees_dollars') or o2.get('fees_dollars') or 0)
-            s.log(action='rest-buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=fpx if fc else None,fee=round(fee,4),http=c,error=None if fc else f'no fill in {wait}s; canceled',**a)
+            s.log(action='rest-buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=fpx if fc else None,fee=round(fee,4),http=c,error=((f'no fill in {wait}s' if not fc else 'filled while resting')+(f'; cancel {cancel} status {o2.get("status")}' if cancel else '')) if (not fc or cancel) else None,**a)
             if not fc: return None
             s.tried.add(ticker); s.cashAt=None
             return dict(contracts=fc,price=round(fpx,4),fee=round(fee,4),cost=round(fc*fpx,4),orderId=oid,cash=cash,frac=f)

@@ -389,7 +389,7 @@ def tick_once():
                     elif LV.lastBuy in ('edge','nofill') and REST_SEC>0 and left>REST_SEC+60:
                         # missed at the live price: rest a limit at the signal price for REST_SEC, like XIII did
                         def _rest(a=a,tk=k['ticker'],d=dirn,ref=ask,szf=_sz,st=k['strike'],cl=k['close'],meta=meta,e=sz[1],q2=sz[2]):
-                            f=LV.rest_buy(a,tk,d,ref,szf,wait=REST_SEC)
+                            f=LV.rest_buy(a,tk,d,ref,szf,wait=REST_SEC,close_at=cl-30)
                             if f:
                                 with lock: pt.openLive(a,d,f,st,cl,tk,meta,e,q2)
                         threading.Thread(target=_rest,daemon=True).start(); sg['action']=f'live: resting limit @{ask:.2f} for {REST_SEC}s'; sigs[a]=sg; continue
