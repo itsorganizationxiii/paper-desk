@@ -1,5 +1,5 @@
-# PAPER ONLY - simulated trades against real public data. NEVER places real orders.
-# No order endpoints are ever called; Kalshi is used read-only for prices/results.
+# Paper trading against real public data. Paper balance/history are never touched by live mode.
+# OPTIONAL live mirroring (live.py): only when LIVE_TRADING=1 + Kalshi keys + dashboard toggle on. Default OFF.
 import json, os, time, math, threading, urllib.request, shutil, csv, io
 from datetime import timezone, timedelta
 try:
@@ -101,7 +101,9 @@ class PaperTrader:
         s.balance-=stake
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
-        s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True); return t
+        s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True)
+        if LV: LV.on_open(t,bal)
+        return t
     def close(s,t,win,how,val=None):
         payout=t['contracts'] if win else 0
         t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(payout-t['stake'],2),closedAt=time.time()); s.balance+=payout
@@ -111,6 +113,7 @@ class PaperTrader:
         t.update(status='exited',exitPrice=round(bid,4),exitReason=reason,exitFee=round(fee,2),settledBy='early-exit@bid',pnl=round(proceeds-t['stake'],2),closedAt=time.time())
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
         s.balance+=proceeds; s.save(); print('EXIT',t['id'],reason,bid,flush=True)
+        if LV: LV.on_exit(t,bid,reason)
     def settle(s,spot):
         now=time.time(); ch=False
         for t in s.trades:
@@ -119,11 +122,14 @@ class PaperTrader:
                 try:
                     m=get(f"{KALSHI}/markets/{t['ticker']}")['market']
                     if m.get('result') in('yes','no'):
-                        s.close(t,(m['result']=='yes')==(t['side']=='YES'),'kalshi',m.get('expiration_value')); ch=True; continue
+                        s.close(t,(m['result']=='yes')==(t['side']=='YES'),'kalshi',m.get('expiration_value')); ch=True
+                        if LV: LV.on_settle(t,m['result']=='yes')
+                        continue
                 except Exception as e: print('kalshi settle err',e,flush=True)
                 if now<t['closesAt']+600: continue
             if t['asset'] in spot:
                 s.close(t,(spot[t['asset']]>=t['strike'])==(t['side']=='YES'),'coinbase-spot',spot[t['asset']]); ch=True
+                if LV: LV.on_settle(t,spot[t['asset']]>=t['strike'])
             # counterfactual for early exits: what holding to settlement would have paid
         for t in s.trades:
             if t['status']=='exited' and t.get('ticker') and 'wouldHaveWon' not in t and now>=t['closesAt']:
@@ -157,7 +163,27 @@ class PaperTrader:
             unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2),
             winRate=round(len(w)/len(c),3) if c else 0,expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,
             closed=len(c),open=len(o),earlyExits=s.exitSummary(),trades=s.trades[::-1])
+LV=None
 lock=threading.Lock(); pt=PaperTrader()
+# ---- live mirror: separate state doc ('live' in mongo / live.json), never mixed with paper state ----
+LF=os.path.join(DATA,'live.json')
+def _live_load():
+    if MCOL is not None:
+        try: return MCOL.find_one({'_id':'live'})
+        except Exception as e: print('live load err',e,flush=True)
+    try: return json.load(open(LF))
+    except Exception: return None
+def _live_save(st):
+    json.dump(st,open(LF,'w'))
+    if MCOL is not None: MCOL.replace_one({'_id':'live'},dict(st,_id='live'),upsert=True)
+def _live_tag(pid,d):
+    with lock:
+        for t in pt.trades:
+            if t.get('id')==pid: t['live']=dict(t.get('live') or {},**d); pt.save(); break
+try:
+    import live as _live; LV=_live.Live(_live_load,_live_save); LV.tag_cb=_live_tag
+    print('live mirror:', 'ENABLED' if LV.enabled() else 'off',flush=True)
+except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print('live init err',LIVE_INIT_ERR,flush=True)
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
  'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
@@ -334,7 +360,9 @@ class H(SimpleHTTPRequestHandler):
     def do_GET(s):
         p=s.path.split('?')[0]
         if p=='/api/status':
-            with lock: d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); d['persistence']=PERSIST; b=json.dumps(d).encode()
+            try: lv=LV.status() if LV else dict(enabled=False,keysPresent=False,lastError=globals().get('LIVE_INIT_ERR','live module unavailable'))
+            except Exception as e: lv=dict(enabled=False,error=str(e))
+            with lock: d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); d['persistence']=PERSIST; d['live']=lv; b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/trades.csv':
             cols=['id','opened ET','closed ET','asset','ticker','side','entry','stake','stakePct','edge','signalSource','status','exitPrice','exitReason','settle','pnl']
@@ -349,7 +377,19 @@ class H(SimpleHTTPRequestHandler):
         else: s.send_error(404)
     def do_POST(s):
         # merge-only restore; requires RESTORE_KEY env + matching X-Restore-Key header. Never deletes trades.
-        if s.path.split('?')[0]!='/api/restore-trades': return s.send_error(404)
+        p=s.path.split('?')[0]
+        if p in('/api/live/reset','/api/live/toggle'):
+            ks=[k for k in (os.environ.get('LIVE_ADMIN_KEY',''),os.environ.get('RESTORE_KEY','')) if k]
+            if not ks or s.headers.get('X-Admin-Key') not in ks: return s.send_error(403)
+            if not LV: return s.send_error(503)
+            if p=='/api/live/reset': LV.reset()
+            else:
+                try: body=json.loads(s.rfile.read(int(s.headers.get('Content-Length','0'))) or b'{}')
+                except Exception: body={}
+                LV.set_paused(not body['on'] if 'on' in body else not LV.paused)
+            b=json.dumps(dict(ok=True,enabled=LV.enabled(),paused=LV.paused,killSwitch=LV.killed)).encode()
+            s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); return s.wfile.write(b)
+        if p!='/api/restore-trades': return s.send_error(404)
         rk=os.environ.get('RESTORE_KEY','')
         if not rk or s.headers.get('X-Restore-Key')!=rk: return s.send_error(403)
         try:
@@ -360,5 +400,5 @@ class H(SimpleHTTPRequestHandler):
         except Exception as e: b=json.dumps({'error':str(e)}).encode(); s.send_response(400)
         s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
 threading.Thread(target=loop,daemon=True).start()
-print('Paper Desk (PAPER ONLY) on port',PORT,'data',TF,flush=True)
+print('Paper Desk (paper; live mirror '+('ON' if LV and LV.enabled() else 'off')+') on port',PORT,'data',TF,flush=True)
 ThreadingHTTPServer(('0.0.0.0',PORT),H).serve_forever()
