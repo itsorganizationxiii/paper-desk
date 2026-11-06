@@ -8,7 +8,7 @@ ENV_ALLOW=os.environ.get('LIVE_TRADING','0')=='1'
 MAX_USD=float(os.environ.get('LIVE_MAX_TRADE_USD','0')); DAILY_LOSS=float(os.environ.get('LIVE_DAILY_LOSS_USD','5'))
 _assets=os.environ.get('LIVE_ASSETS','').strip()
 ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for a in _assets.split(',') if a.strip()}
-BUY_SLIP=0.02; SELL_BUF=0.02
+BUY_SLIP=0.02; SELL_BUF=0.02; MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
 def _key_id(): return os.environ.get('KALSHI_API_KEY_ID','').strip()
 def load_pem():
     b=os.environ.get('KALSHI_PRIVATE_KEY_B64','').strip()
@@ -116,6 +116,12 @@ class Live:
         if c!=200: raise RuntimeError(f'balance HTTP {c}')
         v=float(d['balance_dollars']) if d.get('balance_dollars') is not None else d['balance']/100
         s.cash=round(v,2); s.cashAt=time.time(); return s.cash
+    def _quote(s,ticker,side,kind):
+        try:
+            c,d=api('GET',f'/markets/{ticker}'); m=(d or {}).get('market') or {}
+            k=f"{side.lower()}_{kind}"; v=m.get(k+'_dollars'); v=float(v) if v not in (None,'') else (m[k]/100 if m.get(k) is not None else None)
+            return v if v and v>0 else None
+        except Exception: return None
     def _order(s,ticker,side,action,count,px):
         # V2 single YES book: buy YES=bid@p, buy NO=ask@(1-p); sell YES=ask@p, sell NO=bid@(1-p)
         book='bid' if (action=='buy')==(side=='YES') else 'ask'; yes=px if side=='YES' else 1-px
@@ -133,12 +139,28 @@ class Live:
         with s.lock: s._rollday()
         if s.killed: return s._log(a,'buy-skip',error=f'kill switch: {s.killReason}')
         if a['ticker'] in s.positions: return
-        cash=s.balance(); px=min(0.99,round(a['price']+BUY_SLIP,2))
+        cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
+        maxpx=min(0.99,round(a['price']+MAX_CHASE,2))  # never chase more than MAX_CHASE above the paper entry
         usd=a['frac']*cash  # exact paper fraction (quarter Kelly, 8% cap, night halving) x live cash
         if MAX_USD>0: usd=min(usd,MAX_USD)  # optional cap; 0 = none
-        n=int(usd//px)
-        if n<1: return s._log(a,'buy-skip',error=f'<1 contract affordable (cash ${cash:.2f}, frac {a["frac"]:.3f}, px {px})')
-        c,fc,fpx,fee,oid,err=s._order(a['ticker'],a['side'],'buy',n,px)
+        c=fc=0; fpx=None; fee=0.0; oid=None; err=None; px=None; n=0; cost=0.0
+        for attempt in range(2):
+            ask=s._quote(a['ticker'],a['side'],'ask')
+            px=round(ask,2) if ask else min(0.99,round(a['price']+BUY_SLIP,2))
+            if px>maxpx:
+                err=f'ask {px} above max {maxpx} (paper {a["price"]}); skipped'
+                if attempt==0 and not fc: return s._log(a,'buy-skip',error=err)
+                break
+            n=int(usd//px)-int(fc)
+            if n<1:
+                if not fc: return s._log(a,'buy-skip',error=f'<1 contract affordable (cash ${cash:.2f}, frac {a["frac"]:.3f}, px {px})')
+                break
+            c,f1,p1,fe1,oid,err=s._order(a['ticker'],a['side'],'buy',n,px)
+            if f1>0: cost+=f1*(p1 if p1 is not None else px); fc+=f1; fee+=fe1
+            if f1>=n or err: break
+            time.sleep(1.0)
+        fpx=round(cost/fc,4) if fc else None
+        if fc: s.cashAt=None
         with s.lock:
             if fc>0: s.positions[a['ticker']]=dict(paperId=a['id'],side=a['side'],count=fc,cost=round(fc*fpx,4),fees=fee,openedAt=time.time())
             if err: s.lastError=f'buy HTTP {c}: {err}'
@@ -147,7 +169,18 @@ class Live:
     def _sell(s,a):
         p=s.positions.get(a['ticker'])
         if not p: return
-        px=max(0.01,round(a['bid']-SELL_BUF,2)); c,fc,fpx,fee,oid,err=s._order(a['ticker'],p['side'],'sell',p['count'],px)
+        c=fc=0; fee=0.0; oid=None; err=None; px=None; proceeds=0.0
+        for attempt in range(3):
+            left=round(p['count']-fc,2)
+            if left<=0: break
+            bid=s._quote(a['ticker'],p['side'],'bid') or a['bid']
+            px=max(0.01,round(bid-SELL_BUF*(attempt+1),2))
+            c,f1,p1,fe1,oid,err=s._order(a['ticker'],p['side'],'sell',left,px)
+            if f1>0: proceeds+=f1*(p1 if p1 is not None else px); fc+=f1; fee+=fe1
+            if err: break
+            time.sleep(0.7)
+        fpx=round(proceeds/fc,4) if fc else None
+        if fc: s.cashAt=None
         with s.lock:
             pnl=None
             if fc>0:
