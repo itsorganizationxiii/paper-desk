@@ -1,6 +1,6 @@
-# OPTIONAL live Kalshi execution that mirrors Paper Desk trades. Fully separate from paper:
-# never touches the paper balance or paper trade history; keeps its own state/log ('live' doc).
-# Live only when env LIVE_TRADING=1 (master allow) AND keys present AND dashboard toggle not paused.
+# Live Kalshi execution for Paper Desk. ONE bot: when live (env LIVE_TRADING=1 + keys + not paused) the strategy
+# trades the real Kalshi cash directly; otherwise it paper-trades. This module never touches the paper balance.
+# Keeps its own small state doc ('live'): paused flag, realized-pnl daily kill switch, order log.
 import os, json, time, base64, threading, queue, uuid, urllib.request, urllib.error
 from datetime import datetime
 BASE=os.environ.get('KALSHI_BASE_URL','https://api.elections.kalshi.com/trade-api/v2').rstrip('/')
@@ -62,15 +62,15 @@ def et_day(ts=None):
     return datetime.fromtimestamp(ts or time.time(),ET).strftime('%Y-%m-%d')
 class Live:
     def __init__(s,store_load=None,store_save=None):
-        s.lock=threading.Lock(); s._save=store_save
+        s.lock=threading.RLock(); s._save=store_save
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.positions=st.get('positions',{}); s.totalPnl=float(st.get('totalPnl',0))
-        s.cash=None; s.cashAt=None; s.lastError=None; s.q=queue.Queue()
-        threading.Thread(target=s._worker,daemon=True).start()
-    def enabled(s): return ENV_ALLOW and keys_present() and not s.paused
-    def state(s): return dict(paused=s.paused,day=s.day,dayPnl=s.dayPnl,killed=s.killed,killReason=s.killReason,orders=s.orders[-200:],positions=s.positions,totalPnl=s.totalPnl)
+        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set()
+        s.cash=None; s.cashAt=None; s.lastError=None
+    def allowed(s): return ENV_ALLOW and keys_present()
+    def enabled(s): return s.allowed() and not s.paused
+    def state(s): return dict(paused=s.paused,day=s.day,dayPnl=s.dayPnl,killed=s.killed,killReason=s.killReason,orders=s.orders[-200:],totalPnl=s.totalPnl)
     def persist(s):
         if s._save:
             try: s._save(s.state())
@@ -82,44 +82,24 @@ class Live:
         with s.lock: s.day=et_day(); s.dayPnl=0.0; s.killed=False; s.killReason=None; s.lastError=None; s.persist()
     def set_paused(s,p):
         with s.lock: s.paused=bool(p); s.persist()
-    # ---- hooks called by paper engine (non-blocking; never raise) ----
-    def on_open(s,t,bal_paper_before):
-        try:
-            if not s.enabled() or (ASSETS is not None and t['asset'] not in ASSETS): return
-            s.q.put(('buy',dict(id=t['id'],asset=t['asset'],ticker=t['ticker'],side=t['side'],price=t['price'],frac=t['stake']/bal_paper_before if bal_paper_before else 0)))
-        except Exception as e: s.lastError=f'on_open: {e}'
-    def on_exit(s,t,bid,reason):
-        try:
-            if not ENV_ALLOW or not keys_present(): return  # exits still run when paused so nothing is left stranded
-            if s.positions.get(t['ticker']): s.q.put(('sell',dict(id=t['id'],ticker=t['ticker'],side=t['side'],bid=bid,reason=(reason or '').split(':')[0])))
-        except Exception as e: s.lastError=f'on_exit: {e}'
-    def on_settle(s,t,result_yes):
+    def book(s,pnl):
+        # kill switch counts ONLY realized pnl from live fills/settlements; balance changes (withdrawals/deposits) are ignored
         with s.lock:
-            p=s.positions.pop(t.get('ticker'),None)
-            if not p: return
-            win=result_yes==(p['side']=='YES'); pnl=round((p['count'] if win else 0)-p['cost']-p.get('fees',0),2)
-            s._book(pnl); s.orders.append(dict(at=time.time(),paperId=p['paperId'],ticker=t['ticker'],action='settle',side=p['side'],count=p['count'],result='won' if win else 'lost',pnl=pnl)); s.persist()
-        t['live']=dict(t.get('live') or {},settled='won' if win else 'lost',pnl=pnl)
-    def _book(s,pnl):
-        s.dayPnl=round(s.dayPnl+pnl,2); s.totalPnl=round(s.totalPnl+pnl,2)
-        if DAILY_LOSS>0 and s.dayPnl<=-DAILY_LOSS and not s.killed: s.killed=True; s.killReason=f'realized live loss ${-s.dayPnl:.2f} today >= ${DAILY_LOSS:.2f}'
-    # ---- worker ----
-    def _worker(s):
-        while True:
-            kind,a=s.q.get()
-            try: s._buy(a) if kind=='buy' else s._sell(a)
-            except Exception as e: s.lastError=f'{kind}: {type(e).__name__}: {e}'; s._log(a,kind,error=s.lastError)
-    def _log(s,a,action,**kw):
-        with s.lock: s.orders.append(dict(at=time.time(),paperId=a.get('id'),ticker=a.get('ticker'),action=action,side=a.get('side'),**kw)); s.orders=s.orders[-200:]; s.persist()
+            s._rollday(); s.dayPnl=round(s.dayPnl+pnl,2); s.totalPnl=round(s.totalPnl+pnl,2)
+            if DAILY_LOSS>0 and s.dayPnl<=-DAILY_LOSS and not s.killed: s.killed=True; s.killReason=f'realized live loss ${-s.dayPnl:.2f} today >= ${DAILY_LOSS:.2f}'
+            s.persist()
+    def log(s,**kw):
+        with s.lock: s.orders.append(dict(at=time.time(),**kw)); s.orders=s.orders[-200:]; s.persist()
     def balance(s):
         c,d=api('GET','/portfolio/balance')
         if c!=200: raise RuntimeError(f'balance HTTP {c}')
         v=float(d['balance_dollars']) if d.get('balance_dollars') is not None else d['balance']/100
         s.cash=round(v,2); s.cashAt=time.time(); return s.cash
+    def market(s,ticker):
+        c,d=api('GET',f'/markets/{ticker}'); return (d or {}).get('market') or {}
     def _quote(s,ticker,side,kind):
         try:
-            c,d=api('GET',f'/markets/{ticker}'); m=(d or {}).get('market') or {}
-            k=f"{side.lower()}_{kind}"; v=m.get(k+'_dollars'); v=float(v) if v not in (None,'') else (m[k]/100 if m.get(k) is not None else None)
+            m=s.market(ticker); k=f"{side.lower()}_{kind}"; v=m.get(k+'_dollars'); v=float(v) if v not in (None,'') else (m[k]/100 if m.get(k) is not None else None)
             return v if v and v>0 else None
         except Exception: return None
     def _order(s,ticker,side,action,count,px):
@@ -130,15 +110,14 @@ class Live:
         if action=='sell': body['reduce_only']=True
         c,d=api('POST','/portfolio/events/orders',body); o=d.get('order',d) if isinstance(d,dict) else {}
         def _fc(o):
+            best=0.0
             for k in ('fill_count','fill_count_fp','taker_fill_count','taker_fill_count_fp','filled_count'):
-                v=o.get(k)
-                if v not in (None,''):
-                    try: return float(v)
-                    except Exception: pass
-            return 0.0
+                try: best=max(best,float(o.get(k) or 0))
+                except Exception: pass
+            return best
         fc=_fc(o); oid0=o.get('order_id') or o.get('id')
         if c in (200,201) and fc==0 and oid0:
-            # IOC responses can return before fills are reported; confirm from the order itself
+            # IOC responses can return before fills are reported (a real 1-contract fill was missed); confirm from the order
             for _ in range(3):
                 time.sleep(0.6)
                 try:
@@ -146,78 +125,73 @@ class Live:
                     if o2: o={**o,**o2}; fc=_fc(o)
                     if fc>0 or str(o2.get('status','')) in ('canceled','cancelled','executed'): break
                 except Exception: pass
-        avg=o.get('average_fill_price') or o.get('average_fill_price_dollars') or o.get('taker_fill_cost_dollars') and fc and float(o['taker_fill_cost_dollars'])/fc
+        avg=o.get('average_fill_price') or o.get('average_fill_price_dollars')
         fpx=None
-        if fc>0: fpx=(float(avg) if side=='YES' else 1-float(avg)) if avg not in (None,'') else px
-        fee=float(o.get('taker_fees_dollars') or o.get('fees_dollars') or 0)
-        return c,fc,fpx,fee,o.get('order_id'),(None if c in (200,201) else json.dumps(d)[:200])
-    def _buy(s,a):
+        if fc>0:
+            if avg in (None,''): fpx=px
+            else:
+                a=float(avg); fpx=a if side=='YES' else 1-a
+                # V2 prices are YES-book; if the side-price reading is far off our limit, the API returned side terms
+                if side!='YES' and abs(a-px)<abs(fpx-px): fpx=a
+        fee=float(o['average_fee_paid'])*fc if o.get('average_fee_paid') not in (None,'') else float(o.get('taker_fees_dollars') or o.get('fees_dollars') or 0)
+        return c,fc,fpx,round(fee,4),o.get('order_id') or oid0,(None if c in (200,201) else json.dumps(d)[:200])
+    def buy(s,asset,ticker,side,frac,ref):
+        """Synchronous real buy. Returns dict(contracts,price,fee,cost,orderId,cash) when anything filled, else None (logged)."""
+        a=dict(asset=asset,ticker=ticker,side=side)
         with s.lock: s._rollday()
-        if s.killed: return s._log(a,'buy-skip',error=f'kill switch: {s.killReason}')
-        if a['ticker'] in s.positions: return
-        cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
-        maxpx=min(0.99,round(a['price']+MAX_CHASE,2))  # never chase more than MAX_CHASE above the paper entry
-        usd=a['frac']*cash  # exact paper fraction (quarter Kelly, 8% cap, night halving) x live cash
-        if MAX_USD>0: usd=min(usd,MAX_USD)  # optional cap; 0 = none
-        c=fc=0; fpx=None; fee=0.0; oid=None; err=None; px=None; n=0; cost=0.0
+        if ASSETS is not None and asset not in ASSETS: return None
+        if ticker in s.tried: return None
+        s.tried.add(ticker)
+        if s.killed: s.log(action='buy-skip',error=f'kill switch: {s.killReason}',**a); return None
+        try: cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
+        except Exception as e: s.lastError=f'balance: {e}'; s.log(action='buy-skip',error=s.lastError,**a); return None
+        maxpx=min(0.99,round(ref+MAX_CHASE,2))
+        usd=frac*cash
+        if MAX_USD>0: usd=min(usd,MAX_USD)
+        c=fc=0; fee=0.0; oid=None; err=None; px=None; n=0; cost=0.0
         for attempt in range(2):
-            ask=s._quote(a['ticker'],a['side'],'ask')
-            px=round(ask,2) if ask else min(0.99,round(a['price']+BUY_SLIP,2))
+            ask=s._quote(ticker,side,'ask')
+            px=round(ask,2) if ask else min(0.99,round(ref+BUY_SLIP,2))
             if px>maxpx:
-                err=f'ask {px} above max {maxpx} (paper {a["price"]}); skipped'
-                if attempt==0 and not fc: return s._log(a,'buy-skip',error=err)
+                err=f'ask {px} above max {maxpx} (signal {ref})'
+                if not fc: s.log(action='buy-skip',error=err,**a); return None
                 break
             n=int(usd//px)-int(fc)
             if n<1:
-                if not fc: return s._log(a,'buy-skip',error=f'<1 contract affordable (cash ${cash:.2f}, frac {a["frac"]:.3f}, px {px})')
+                if not fc: s.log(action='buy-skip',error=f'<1 contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
                 break
-            c,f1,p1,fe1,oid,err=s._order(a['ticker'],a['side'],'buy',n,px)
+            c,f1,p1,fe1,oid,err=s._order(ticker,side,'buy',n,px)
             if f1>0: cost+=f1*(p1 if p1 is not None else px); fc+=f1; fee+=fe1
             if f1>=n or err: break
             time.sleep(1.0)
-        fpx=round(cost/fc,4) if fc else None
-        if fc: s.cashAt=None
-        with s.lock:
-            if fc>0: s.positions[a['ticker']]=dict(paperId=a['id'],side=a['side'],count=fc,cost=round(fc*fpx,4),fees=fee,openedAt=time.time())
-            if err: s.lastError=f'buy HTTP {c}: {err}'
-        s._log(a,'buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=fpx,fee=fee,http=c,error=err)
-        s._tag(a['id'],dict(orderId=oid,want=n,filled=fc,fillPrice=fpx,error=err or (None if fc else 'no fill')))
-    def _sell(s,a):
-        p=s.positions.get(a['ticker'])
-        if not p: return
+        if err: s.lastError=f'buy HTTP {c}: {err}'
+        s.log(action='buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=round(cost/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc else 'no fill'),**a)
+        if not fc: return None
+        s.cashAt=None
+        return dict(contracts=fc,price=round(cost/fc,4),fee=round(fee,4),cost=round(cost,4),orderId=oid,cash=cash,frac=frac)
+    def sell(s,ticker,side,count,bid):
+        """Synchronous real sell of up to count. Returns (filled, avg price, fee, orderId, error)."""
         c=fc=0; fee=0.0; oid=None; err=None; px=None; proceeds=0.0
         for attempt in range(3):
-            left=round(p['count']-fc,2)
+            left=round(count-fc,2)
             if left<=0: break
-            bid=s._quote(a['ticker'],p['side'],'bid') or a['bid']
-            px=max(0.01,round(bid-SELL_BUF*(attempt+1),2))
-            c,f1,p1,fe1,oid,err=s._order(a['ticker'],p['side'],'sell',left,px)
+            q=s._quote(ticker,side,'bid') or bid
+            px=max(0.01,round(q-SELL_BUF*(attempt+1),2))
+            c,f1,p1,fe1,oid,err=s._order(ticker,side,'sell',left,px)
             if f1>0: proceeds+=f1*(p1 if p1 is not None else px); fc+=f1; fee+=fe1
             if err: break
-            time.sleep(0.7)
-        fpx=round(proceeds/fc,4) if fc else None
+            if fc<count: time.sleep(0.7)
+        if err: s.lastError=f'sell HTTP {c}: {err}'
         if fc: s.cashAt=None
-        with s.lock:
-            pnl=None
-            if fc>0:
-                share=fc/p['count']; pnl=round(fc*fpx-fee-p['cost']*share-p.get('fees',0)*share,2); s._book(pnl)
-                p['count']=round(p['count']-fc,2); p['cost']*=1-share; p['fees']=p.get('fees',0)*(1-share)
-                if p['count']<=0: s.positions.pop(a['ticker'],None)
-            if err: s.lastError=f'sell HTTP {c}: {err}'
-        s._log(a,'sell',reason=a['reason'],orderId=oid,limit=px,filled=fc,fillPrice=fpx,fee=fee,pnl=pnl,http=c,error=err or (None if fc else 'no fill; position held to settlement'))
-        s._tag(a['id'],dict(sellOrderId=oid,sellFilled=fc,sellPrice=fpx,pnl=pnl,sellError=err or (None if fc else 'no fill')))
-    tag_cb=None
-    def _tag(s,pid,d):
-        if s.tag_cb:
-            try: s.tag_cb(pid,d)
-            except Exception: pass
+        s.log(action='sell',ticker=ticker,side=side,orderId=oid,want=count,limit=px,filled=fc,fillPrice=round(proceeds/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc>=count else 'partial/no fill; rest held'))
+        return fc,(round(proceeds/fc,4) if fc else None),round(fee,4),oid,err
     def status(s):
         with s.lock: s._rollday()
-        if ENV_ALLOW and keys_present() and (s.cashAt is None or time.time()-s.cashAt>60):
+        if s.allowed() and (s.cashAt is None or time.time()-s.cashAt>60):
             try:
                 s.balance()
-                if (s.lastError or '').startswith('balance:'): s.lastError=None
+                if (s.lastError or '').startswith('balance'): s.lastError=None
             except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'; s.cashAt=time.time()  # back off 60s on errors (avoid 429 storms)
         return dict(enabled=s.enabled(),envAllow=ENV_ALLOW,keysPresent=keys_present(),paused=s.paused,baseUrl=BASE,cash=s.cash,
             todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=DAILY_LOSS),
-            maxTradeUsd=MAX_USD,assets=sorted(ASSETS) if ASSETS else 'all',openPositions=s.positions,lastError=s.lastError,recentOrders=s.orders[-20:][::-1])
+            maxTradeUsd=MAX_USD,maxChase=MAX_CHASE,assets=sorted(ASSETS) if ASSETS else 'all',lastError=s.lastError,recentOrders=s.orders[-20:][::-1])

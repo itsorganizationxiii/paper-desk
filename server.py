@@ -1,5 +1,6 @@
-# Paper trading against real public data. Paper balance/history are never touched by live mode.
-# OPTIONAL live mirroring (live.py): only when LIVE_TRADING=1 + Kalshi keys + dashboard toggle on. Default OFF.
+# One strategy engine, two modes. PAPER (default): simulated trades/balance, exactly as before.
+# LIVE (env LIVE_TRADING=1 + Kalshi keys + dashboard not paused): same engine trades the real Kalshi cash; trades are
+# recorded only when contracts actually fill (mode='live'). Live never touches the paper balance (it stays frozen).
 import json, os, time, math, threading, urllib.request, shutil, csv, io
 from datetime import timezone, timedelta
 try:
@@ -76,6 +77,7 @@ class PaperTrader:
         if isinstance(cur,list): cur={'trades':cur}
         if isinstance(seed,dict): seed=seed.get('trades',[])
         s.start=cur.get('startBalance',START); s.trades=[]; s.balance=s.start
+        for t in cur.get('trades',[]): t.pop('exiting',None)  # an in-flight live sell can't survive a restart
         n=s.merge(seed+cur.get('trades',[])); print('boot merge:',n,'trades, balance',round(s.balance,2),flush=True)
     @staticmethod
     def _key(t): return (t.get('ticker'),round(float(t.get('openedAt') or 0),3))
@@ -87,49 +89,82 @@ class PaperTrader:
         tr=sorted(m.values(),key=lambda t:(t.get('openedAt') or 0))
         for i,t in enumerate(tr,1): t['id']=i
         s.trades=tr
-        s.balance=s.start+sum(t.get('pnl') or 0 for t in tr if t.get('status')!='open')-sum(t.get('stake') or 0 for t in tr if t.get('status')=='open')
+        pp=[t for t in tr if t.get('mode')!='live']  # paper balance comes from paper trades only
+        s.balance=s.start+sum(t.get('pnl') or 0 for t in pp if t.get('status')!='open')-sum(t.get('stake') or 0 for t in pp if t.get('status')=='open')
         s.save(); return len(tr)
     def save(s):
         tmp=TF+'.tmp'; json.dump({'balance':round(s.balance,4),'startBalance':s.start,'trades':s.trades},open(tmp,'w'),indent=1); os.replace(tmp,TF)
         if MCOL is not None: _dirty.set()
-    def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
+    @staticmethod
+    def size(side,ask,p_yes):
+        # quarter Kelly fraction (cap, night halving); shared by paper and live
         q=p_yes if side=='YES' else 1-p_yes; edge=q-ask
         nt=night()
         if edge<(NIGHT_EDGE if nt else MIN_EDGE) or not (0<ask<1): return None
-        f=min(KELLY*edge/(1-ask),CAP)*(0.5 if nt else 1); bal=s.balance; stake=round(bal*f,2)
+        return min(KELLY*edge/(1-ask),CAP)*(0.5 if nt else 1),edge,q
+    def openLive(s,asset,side,fill,strike,close,ticker,meta,edge,q):
+        stake=round(fill['cost']+fill['fee'],4)
+        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',asset=asset,side=side,price=fill['price'],stake=stake,stakePct=round(100*fill['frac'],2),
+               contracts=fill['contracts'],entryFee=fill['fee'],liveOrderId=fill['orderId'],liveCashAtEntry=fill['cash'],
+               edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
+        s.trades.append(t); s.save(); print('OPEN LIVE',t['id'],ticker,side,fill['price'],fill['contracts'],flush=True); return t
+    def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
+        sz=s.size(side,ask,p_yes)
+        if not sz: return None
+        f,edge,q=sz; bal=s.balance; stake=round(bal*f,2)
         if stake<0.05: return None
         s.balance-=stake
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
         s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True)
-        if LV: LV.on_open(t,bal)
         return t
     def close(s,t,win,how,val=None):
         payout=t['contracts'] if win else 0
-        t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(payout-t['stake'],2),closedAt=time.time()); s.balance+=payout
+        if t.get('mode')=='live':
+            pnl=round(payout-t['stake'],2); t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(pnl+(t.get('partialPnl') or 0),2),closedAt=time.time())
+            if LV: LV.book(pnl); LV.log(action='settle',ticker=t['ticker'],side=t['side'],count=t['contracts'],result=t['status'],pnl=pnl)
+        else:
+            t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(payout-t['stake'],2),closedAt=time.time()); s.balance+=payout
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
     def exit(s,t,bid,reason,fee=0.0):
+        if t.get('mode')=='live': return s.exitLive(t,bid,reason)
         proceeds=t['contracts']*bid-fee
         t.update(status='exited',exitPrice=round(bid,4),exitReason=reason,exitFee=round(fee,2),settledBy='early-exit@bid',pnl=round(proceeds-t['stake'],2),closedAt=time.time())
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
         s.balance+=proceeds; s.save(); print('EXIT',t['id'],reason,bid,flush=True)
-        if LV: LV.on_exit(t,bid,reason)
+    def exitLive(s,t,bid,reason):
+        # real sell runs off the lock; trade stays 'open' (flagged exiting) until the fill is known
+        if not (LV and LV.allowed()): t['liveSellError']='live disabled (env/keys); holding to settlement'; return
+        t['exiting']=reason; threading.Thread(target=s._sellLive,args=(t,bid,reason),daemon=True).start()
+    def _sellLive(s,t,bid,reason):
+        try: fc,fpx,fee,oid,err=LV.sell(t['ticker'],t['side'],t['contracts'],bid)
+        except Exception as e: fc,fpx,fee,oid,err=0,None,0.0,None,f'{type(e).__name__}: {e}'
+        with lock:
+            t.pop('exiting',None)
+            if fc<=0: t.update(liveSellError=err or 'no fill',liveSellAt=time.time()); s.save(); return
+            share=min(1.0,fc/t['contracts']); realized=round(fc*fpx-fee-t['stake']*share,2)
+            if share>=0.999:
+                t.update(status='exited',exitPrice=fpx,exitReason=reason,exitFee=round(fee,4),liveSellOrderId=oid,settledBy='live-sell',pnl=round(realized+(t.get('partialPnl') or 0),2),closedAt=time.time())
+                for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst','liveSellError'): t.pop(k,None)
+                print('EXIT LIVE',t['id'],reason,fpx,flush=True)
+            else:
+                t.update(contracts=round(t['contracts']-fc,2),stake=round(t['stake']*(1-share),4),partialPnl=round((t.get('partialPnl') or 0)+realized,2),liveSellError=f'partial {fc} filled; rest open')
+            s.save()
+        LV.book(realized)
     def settle(s,spot):
         now=time.time(); ch=False
         for t in s.trades:
-            if t['status']!='open' or now<t['closesAt']: continue
+            if t['status']!='open' or now<t['closesAt'] or t.get('exiting'): continue
             if t.get('ticker'):
                 try:
                     m=get(f"{KALSHI}/markets/{t['ticker']}")['market']
                     if m.get('result') in('yes','no'):
                         s.close(t,(m['result']=='yes')==(t['side']=='YES'),'kalshi',m.get('expiration_value')); ch=True
-                        if LV: LV.on_settle(t,m['result']=='yes')
                         continue
                 except Exception as e: print('kalshi settle err',e,flush=True)
                 if now<t['closesAt']+600: continue
             if t['asset'] in spot:
                 s.close(t,(spot[t['asset']]>=t['strike'])==(t['side']=='YES'),'coinbase-spot',spot[t['asset']]); ch=True
-                if LV: LV.on_settle(t,spot[t['asset']]>=t['strike'])
             # counterfactual for early exits: what holding to settlement would have paid
         for t in s.trades:
             if t['status']=='exited' and t.get('ticker') and 'wouldHaveWon' not in t and now>=t['closesAt']:
@@ -156,16 +191,19 @@ class PaperTrader:
             tpPnlIfSold=round(sum(t.get('tpSellPnl',0) for t in hd),2),holdGain=round(sum(t['pnl']-t.get('tpSellPnl',0) for t in hd),2))
         return dict(all=agg(ex),byReason={k:agg(v) for k,v in by.items()},pending=len(ex)-len(done),takeProfitHolds=held)
     def getStats(s):
-        c=[t for t in s.trades if t['status']!='open']; w=[t for t in c if t.get('pnl',0)>0]
-        o=[t for t in s.trades if t['status']=='open']
-        return dict(mode='paper',balance=round(s.balance,2),startBalance=s.start,
+        def st(ts):
+            c=[t for t in ts if t['status']!='open']; w=[t for t in c if t.get('pnl',0)>0]; o=[t for t in ts if t['status']=='open']
+            return dict(trades=len(ts),closed=len(c),open=len(o),wins=len(w),winRate=round(len(w)/len(c),3) if c else 0,pnl=round(sum(t['pnl'] for t in c),2),
+                expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2))
+        pp=[t for t in s.trades if t.get('mode')!='live']; lt=[t for t in s.trades if t.get('mode')=='live']
+        P=st(pp); Lv=st(lt); A=st(s.trades); o=[t for t in pp if t['status']=='open']
+        return dict(mode='paper',balance=round(s.balance,2),paperBalance=round(s.balance,2),startBalance=s.start,
             equity=round(s.balance+sum(t.get('markPrice',t['price'])*t['contracts'] for t in o),2),
-            unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2),
-            winRate=round(len(w)/len(c),3) if c else 0,expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,
-            closed=len(c),open=len(o),earlyExits=s.exitSummary(),trades=s.trades[::-1])
+            unrealizedPnl=P['unrealizedPnl'],winRate=P['winRate'],expectancy=P['expectancy'],paperStats=P,liveStats=Lv,
+            closed=A['closed'],open=A['open'],earlyExits=s.exitSummary(),trades=s.trades[::-1])
 LV=None
 lock=threading.Lock(); pt=PaperTrader()
-# ---- live mirror: separate state doc ('live' in mongo / live.json), never mixed with paper state ----
+# ---- live mode: separate small state doc ('live' in mongo / live.json), never mixed with paper state ----
 LF=os.path.join(DATA,'live.json')
 def _live_load():
     if MCOL is not None:
@@ -176,13 +214,9 @@ def _live_load():
 def _live_save(st):
     json.dump(st,open(LF,'w'))
     if MCOL is not None: MCOL.replace_one({'_id':'live'},dict(st,_id='live'),upsert=True)
-def _live_tag(pid,d):
-    with lock:
-        for t in pt.trades:
-            if t.get('id')==pid: t['live']=dict(t.get('live') or {},**d); pt.save(); break
 try:
-    import live as _live; LV=_live.Live(_live_load,_live_save); LV.tag_cb=_live_tag
-    print('live mirror:', 'ENABLED' if LV.enabled() else 'off',flush=True)
+    import live as _live; LV=_live.Live(_live_load,_live_save)
+    print('live mode:', 'LIVE' if LV.enabled() else ('paused' if LV.allowed() else 'off'),flush=True)
 except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print('live init err',LIVE_INIT_ERR,flush=True)
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
@@ -286,7 +320,7 @@ def tick_once():
             w=wins.get(tk)
             return w['model_p'] if w and w.get('model_p') is not None and (w.get('age_sec') or 99)<60 and w.get('state')=='open' else None
         # ---- monitor open positions for this asset ----
-        for t in [t for t in pt.trades if t['status']=='open' and t['asset']==a and t.get('ticker') and time.time()<t['closesAt']]:
+        for t in [t for t in pt.trades if t['status']=='open' and t['asset']==a and t.get('ticker') and time.time()<t['closesAt'] and not t.get('exiting')]:
             try: m=k if k and k['ticker']==t['ticker'] else mk(get(f"{KALSHI}/markets/{t['ticker']}")['market'])
             except Exception as e: print('mark err',e,flush=True); continue
             bid=m['yesBid'] if t['side']=='YES' else m['noBid']
@@ -340,9 +374,19 @@ def tick_once():
             used='coinbase+eloedge'
             if mp is None: mp=heur(cb); used='coinbase-fallback (EloEdge unavailable)'
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
-            with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est))
+            meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est)
             q=mp if dirn=='YES' else 1-mp
-            sg['action']=f'OPENED #{t["id"]}' if t else f'skip: edge {q-ask:+.3f} < {NIGHT_EDGE if night() else MIN_EDGE}'
+            if LV and LV.enabled():
+                sz=pt.size(dirn,ask,mp); t=None
+                if sz:
+                    if k['ticker'] in LV.tried: sg['action']='live: already tried this window'; sigs[a]=sg; continue
+                    fill=LV.buy(a,k['ticker'],dirn,sz[0],ask)  # real order, off the lock
+                    if fill:
+                        with lock: t=pt.openLive(a,dirn,fill,k['strike'],k['close'],k['ticker'],meta,sz[1],sz[2])
+                sg['action']=f'OPENED LIVE #{t["id"]}' if t else ('live: no fill/skipped (see live order log)' if sz else f'skip: edge {q-ask:+.3f} < {NIGHT_EDGE if night() else MIN_EDGE}')
+            else:
+                with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],meta)
+                sg['action']=f'OPENED #{t["id"]}' if t else f'skip: edge {q-ask:+.3f} < {NIGHT_EDGE if night() else MIN_EDGE}'
         sigs[a]=sg
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
@@ -362,14 +406,18 @@ class H(SimpleHTTPRequestHandler):
         if p=='/api/status':
             try: lv=LV.status() if LV else dict(enabled=False,keysPresent=False,lastError=globals().get('LIVE_INIT_ERR','live module unavailable'))
             except Exception as e: lv=dict(enabled=False,error=str(e))
-            with lock: d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); d['persistence']=PERSIST; d['live']=lv; b=json.dumps(d).encode()
+            with lock:
+                d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); d['persistence']=PERSIST; d['live']=lv
+                live_on=bool(lv.get('enabled')); d['mode']='live' if live_on else 'paper'; d['liveCash']=lv.get('cash')
+                if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
+                b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/trades.csv':
-            cols=['id','opened ET','closed ET','asset','ticker','side','entry','stake','stakePct','edge','signalSource','status','exitPrice','exitReason','settle','pnl']
+            cols=['id','mode','opened ET','closed ET','asset','ticker','side','entry','stake','stakePct','edge','signalSource','status','exitPrice','exitReason','settle','pnl']
             et=lambda x:datetime.fromtimestamp(x,ET).strftime('%Y-%m-%d %H:%M:%S') if x else ''
             buf=io.StringIO(); w=csv.writer(buf); w.writerow(cols)
             with lock: tr=list(pt.trades)
-            for t in tr: w.writerow([t.get('id'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl','')])
+            for t in tr: w.writerow([t.get('id'),t.get('mode','paper'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl','')])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')
             s.send_header('Content-Disposition',f'attachment; filename="paper-desk-trades-{datetime.now(ET).strftime("%Y%m%d-%H%M")}.csv"'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
@@ -400,5 +448,5 @@ class H(SimpleHTTPRequestHandler):
         except Exception as e: b=json.dumps({'error':str(e)}).encode(); s.send_response(400)
         s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
 threading.Thread(target=loop,daemon=True).start()
-print('Paper Desk (paper; live mirror '+('ON' if LV and LV.enabled() else 'off')+') on port',PORT,'data',TF,flush=True)
+print('Paper Desk (mode '+('LIVE' if LV and LV.enabled() else 'paper')+') on port',PORT,'data',TF,flush=True)
 ThreadingHTTPServer(('0.0.0.0',PORT),H).serve_forever()
