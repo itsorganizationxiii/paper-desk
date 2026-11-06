@@ -9,7 +9,7 @@ ENV_ALLOW=os.environ.get('LIVE_TRADING','0')=='1'
 MAX_USD=float(os.environ.get('LIVE_MAX_TRADE_USD','0')); DAILY_LOSS=float(os.environ.get('LIVE_DAILY_LOSS_USD','5'))
 _assets=os.environ.get('LIVE_ASSETS','').strip()
 ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for a in _assets.split(',') if a.strip()}
-BUY_SLIP=0.02; SELL_BUF=0.02; MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
+SHARD=int(os.environ.get('LIVE_EXCHANGE_INDEX','2')); BUY_SLIP=0.02; SELL_BUF=0.02; MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
 def _key_id(): return os.environ.get('KALSHI_API_KEY_ID','').strip()
 def load_pem():
     b=os.environ.get('KALSHI_PRIVATE_KEY_B64','').strip()
@@ -109,6 +109,9 @@ class Live:
         c,d=api('GET','/portfolio/balance')
         if c!=200: raise RuntimeError(f'balance HTTP {c}')
         v=float(d['balance_dollars']) if d.get('balance_dollars') is not None else d['balance']/100
+        # Kalshi exchange sharding: crypto + commodities markets trade on shard 2 and API orders can only use that shard's cash
+        for b in d.get('balance_breakdown') or []:
+            if int(b.get('exchange_index',-1))==SHARD: v=float(b.get('balance') or 0); break
         s.cash=round(v,2); s.cashAt=time.time(); return s.cash
     def diag_balance(s):
         # On insufficient_balance: record Kalshi's raw balance fields + resting orders (at most once a minute)
