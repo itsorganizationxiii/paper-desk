@@ -1,3 +1,4 @@
+import math
 # Live Kalshi execution for Paper Desk. ONE bot: when live (env LIVE_TRADING=1 + keys + not paused) the strategy
 # trades the real Kalshi cash directly; otherwise it paper-trades. This module never touches the paper balance.
 # Keeps its own small state doc ('live'): paused flag, realized-pnl daily kill switch, order log.
@@ -66,7 +67,7 @@ class Live:
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set()
+        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=None
         s.cash=None; s.cashAt=None; s.lastError=None
     def allowed(s): return ENV_ALLOW and keys_present()
     def enabled(s): return s.allowed() and not s.paused
@@ -164,11 +165,19 @@ class Live:
                 err=f'ask {px} above max {maxpx} (signal {ref})'
                 if not fc: s.log(action='buy-skip',error=err,**a); return None
                 break
-            n=int(usd//px)-int(fc)
-            if n<1:
-                if not fc: s.log(action='buy-skip',error=f'<1 contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
+            if s.fracOK is not False: n=round(math.floor((usd/px-fc)*100)/100,2); mn=0.01
+            else: n=int(usd//px)-int(fc); mn=1
+            if n<mn:
+                if not fc: s.log(action='buy-skip',error=f'<{mn} contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
                 break
             c,f1,p1,fe1,oid,err=s._order(ticker,side,'buy',n,px)
+            if s.fracOK is None and n!=int(n):
+                if err and c not in (200,201) and not f1:
+                    s.fracOK=False; s.log(action='frac-test',error=f'Kalshi rejected fractional count {n}: {err}; using whole contracts',**a)
+                    err=None; n2=int(usd//px)
+                    if n2<1: s.log(action='buy-skip',error=f'<1 whole contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
+                    c,f1,p1,fe1,oid,err=s._order(ticker,side,'buy',n2,px); n=n2
+                elif c in (200,201): s.fracOK=True; s.log(action='frac-test',error=f'Kalshi accepted fractional count {n} (filled {f1})',**a)
             if f1>0: cost+=f1*(p1 if p1 is not None else px); fc+=f1; fee+=fe1
             if f1>=n or err: break
             time.sleep(1.0)
@@ -202,4 +211,4 @@ class Live:
             except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'; s.cashAt=time.time()  # back off 60s on errors (avoid 429 storms)
         return dict(enabled=s.enabled(),envAllow=ENV_ALLOW,keysPresent=keys_present(),paused=s.paused,baseUrl=BASE,cash=s.cash,
             todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=DAILY_LOSS),
-            maxTradeUsd=MAX_USD,maxChase=MAX_CHASE,assets=sorted(ASSETS) if ASSETS else 'all',lastError=s.lastError,recentOrders=s.orders[-20:][::-1])
+            maxTradeUsd=MAX_USD,maxChase=MAX_CHASE,assets=sorted(ASSETS) if ASSETS else 'all',fractional=s.fracOK,lastError=s.lastError,recentOrders=s.orders[-20:][::-1])
