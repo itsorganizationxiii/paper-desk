@@ -110,6 +110,15 @@ class Live:
         if c!=200: raise RuntimeError(f'balance HTTP {c}')
         v=float(d['balance_dollars']) if d.get('balance_dollars') is not None else d['balance']/100
         s.cash=round(v,2); s.cashAt=time.time(); return s.cash
+    def diag_balance(s):
+        # On insufficient_balance: record Kalshi's raw balance fields + resting orders (at most once a minute)
+        if time.time()-getattr(s,'_diagAt',0)<60: return
+        s._diagAt=time.time()
+        try:
+            c,d=api('GET','/portfolio/balance'); c2,d2=api('GET','/portfolio/orders?status=resting&limit=50')
+            ro=[dict(ticker=o.get('ticker'),side=o.get('side'),count=o.get('remaining_count_fp') or o.get('remaining_count'),price=o.get('yes_price_dollars') or o.get('yes_price')) for o in (d2 or {}).get('orders',[])]
+            s.log(action='balance-diag',balance=d if c==200 else f'HTTP {c}',resting=ro[:10],restingCount=len(ro))
+        except Exception as e: s.log(action='balance-diag',error=f'{type(e).__name__}: {e}')
     def market(s,ticker):
         c,d=api('GET',f'/markets/{ticker}'); return (d or {}).get('market') or {}
     def _quote(s,ticker,side,kind):
@@ -200,6 +209,7 @@ class Live:
             if f1>=n or err: break
             time.sleep(1.0)
         if err: s.lastError=f'buy HTTP {c}: {err}'
+        if err and 'insufficient' in str(err): s.diag_balance()
         s.log(action='buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=round(cost/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc else 'no fill'),**a)
         if not fc: s.lastBuy='nofill' if (c in (200,201) or not err) else 'error'; return None
         s.cashAt=None
