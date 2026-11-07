@@ -34,6 +34,7 @@ WKND_DROP=float(os.environ.get('WKND_LOCK_DROP','0.04'))  # weekend: flat 4c giv
 WKND_MODE=os.environ.get('WKND_MODE','volatile')  # 'volatile' (thin weekend: Up bets lock early) or 'normal'
 WKND_UP_ARM=float(os.environ.get('WKND_UP_ARM','0.12')); WKND_UP_DROP=float(os.environ.get('WKND_UP_DROP','0.05'))
 def wknd_up(t): return t is not None and WKND_MODE=='volatile' and wknd_night() and t.get('side')=='YES'
+def stop_pct(): return WKND_STOP if (WKND_STOP>0 and wknd_night()) else STOP
 def lock_arm(t=None): return WKND_UP_ARM if wknd_up(t) else (WKND_LOCK_ARM_C if wknd_night() else LOCK_ARM_C)
 def lock_drop(t): return WKND_UP_DROP if wknd_up(t) else (WKND_DROP if WKND_DROP>0 and wknd_night() else (BIG_DROP if t['peakBid']-t['price']>=BIG_RUN else LOCK_DROP))
 # lock used to be night-only; replay of 153 peak-recorded trades showed arming entry+10c all day
@@ -46,7 +47,7 @@ TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
 # metals only: once the bid is 10c above entry, never give back past entry (thin books gap through the 40% stop)
 GUARD_ASSETS={'GOLD','SILVER'}; GUARD_GIVEBACK=float(os.environ.get('GUARD_GIVEBACK','0.0'))
 def kalshi_fee(c,p): return math.ceil(7*c*p*(1-p))/100  # Kalshi taker fee: ceil(0.07*C*P*(1-P)) in $
-MIN_EDGE=0.03; NIGHT_EDGE=0.05; WKND_EDGE=float(os.environ.get('WKND_NIGHT_EDGE','0.07')); REV=os.environ.get('REVERSAL','0')!='0'; REV_MAX=float(os.environ.get('REVERSAL_MAX_PRICE','0.60')); FADE=os.environ.get('WKND_FADE','0')!='0'; WKND_MAX_EDGE=float(os.environ.get('WKND_NIGHT_MAX_EDGE','0.20')); MIN_ENTRY=float(os.environ.get('MIN_ENTRY','0.40')); EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10')); REST_SEC=int(os.environ.get('LIVE_REST_SEC','30')); LIVE_TICK=int(os.environ.get('LIVE_TICK_SEC','5'))
+MIN_EDGE=0.03; NIGHT_EDGE=0.05; WKND_EDGE=float(os.environ.get('WKND_NIGHT_EDGE','0.07')); REV=os.environ.get('REVERSAL','0')!='0'; REV_MAX=float(os.environ.get('REVERSAL_MAX_PRICE','0.60')); FADE=os.environ.get('WKND_FADE','0')!='0'; WKND_MAX_EDGE=float(os.environ.get('WKND_NIGHT_MAX_EDGE','0.20')); MIN_ENTRY=float(os.environ.get('MIN_ENTRY','0.40')); EXIT_EDGE=0.03; STOP=0.40; WKND_STOP=float(os.environ.get('WKND_STOP','0.60')); KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10')); REST_SEC=int(os.environ.get('LIVE_REST_SEC','30')); LIVE_TICK=int(os.environ.get('LIVE_TICK_SEC','5'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
     if auth: h['Authorization']='Bearer '+KEY
@@ -490,7 +491,7 @@ def tick_once():
                     f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)); pt.exit(t,bid,f'profitlock: {"night" if night() else "day"}, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
                 elif t['asset'] in GUARD_ASSETS and t['peakBid']>=t['price']+0.10 and bid>0 and bid<=t['price']-GUARD_GIVEBACK and not (q is not None and q>=LOCK_HOLD_P):
                     f3=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'breakeven: {t["asset"]} peaked {t["peakBid"]:.3f} (>=entry+0.10), fell to bid {bid:.3f} vs entry {t["price"]:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f3:.2f}',fee=f3)
-                elif bid>0 and bid<=STOP*t['price']: pt.exit(t,bid,f'stop: mark {bid:.3f} <= {STOP:.0%} of entry {t["price"]}')
+                elif bid>0 and bid<=stop_pct()*t['price']: pt.exit(t,bid,f'stop: mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}')
                 elif not t.get('fade') and whale_against and bid>0 and not (left_t<90 and bid>=0.85) and (q is None or bid>=q-WHALE_MAX_GIVEUP):
                     pt.exit(t,bid,f'whale: net whale flow ${wnet:,.0f} against {t["side"]}, sold at bid {bid:.3f}')
                 elif not t.get('fade') and sig_against and elo_against and q is not None and bid-q>=EXIT_EDGE:
