@@ -6,6 +6,8 @@ import os, json, time, base64, threading, queue, uuid, urllib.request, urllib.er
 from datetime import datetime
 BASE=os.environ.get('KALSHI_BASE_URL','https://api.elections.kalshi.com/trade-api/v2').rstrip('/')
 ENV_ALLOW=os.environ.get('LIVE_TRADING','0')=='1'
+BET_USD=1.00  # flat live stake per bet, set in code (0 = old %-of-balance sizing)
+def stake(usd,cash): return min(BET_USD,0.9*cash) if BET_USD>0 else usd
 MAX_USD=float(os.environ.get('LIVE_MAX_TRADE_USD','0')); DAILY_LOSS=float(os.environ.get('LIVE_DAILY_LOSS_USD','5'))
 _assets=os.environ.get('LIVE_ASSETS','').strip()
 ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for a in _assets.split(',') if a.strip()}
@@ -221,6 +223,7 @@ class Live:
         maxpx=min(0.99,round(ref+MAX_CHASE,2)) if sizer is None else 0.99
         usd=frac*cash
         if MAX_USD>0: usd=min(usd,MAX_USD)
+        usd=stake(usd,cash)
         c=fc=0; fee=0.0; oid=None; err=None; px=None; n=0; cost=0.0
         for attempt in range(2):
             ask=s._quote(ticker,side,'ask')
@@ -232,7 +235,7 @@ class Live:
                     s.lastBuy='edge'; s.tried.discard(ticker)  # edge gone at the live price; re-check next tick
                     if ticker not in s.edgeLogged: s.edgeLogged.add(ticker); s.log(action='buy-skip',error=f'edge gone at live ask {px} (signal {ref}); will keep checking',**a)
                     return None
-                if not fc: frac=f2; usd=f2*cash; usd=min(usd,MAX_USD) if MAX_USD>0 else usd
+                if not fc: frac=f2; usd=f2*cash; usd=min(usd,MAX_USD) if MAX_USD>0 else usd; usd=stake(usd,cash)
             if px>maxpx:
                 err=f'ask {px} above max {maxpx} (signal {ref})'
                 if not fc: s.log(action='buy-skip',error=err,**a); return None
@@ -278,7 +281,7 @@ class Live:
             px=round(ref,2); f=sizer(px)
             if not f: return None
             cash=s.cash if s.cash is not None else s.balance()
-            usd=f*cash; usd=min(usd,MAX_USD) if MAX_USD>0 else usd
+            usd=f*cash; usd=min(usd,MAX_USD) if MAX_USD>0 else usd; usd=stake(usd,cash)
             n=round(math.floor(usd/px*100)/100,2) if s.fracOK is not False else int(usd//px)
             if n<(0.01 if s.fracOK is not False else 1): return None
             book='bid' if side=='YES' else 'ask'; yes=px if side=='YES' else 1-px
