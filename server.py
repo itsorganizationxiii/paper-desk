@@ -288,6 +288,18 @@ def wknd_night(ts=None):
     # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
     d=datetime.fromtimestamp(ts or time.time(),ET); wd,h=d.weekday(),d.hour
     return (wd==4 and h>=17) or wd in (5,6) or (wd==0 and h<9)
+TREND_N=int(os.environ.get('TREND_N','3')); _trend={}
+def trend_dir(series):
+    # direction of the last TREND_N settled 15m windows if they all agree ('YES'/'NO'), else None; cached 60s
+    c=_trend.get(series)
+    if c and time.time()-c[0]<60: return c[1]
+    d=None
+    try:
+        ms=json.load(urllib.request.urlopen(f'https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker={series}&status=settled&limit={TREND_N}',timeout=6))['markets']
+        rs=[m.get('result') for m in ms]
+        if len(rs)==TREND_N and len(set(rs))==1 and rs[0] in ('yes','no'): d=rs[0].upper()
+    except Exception: d=c[1] if c else None
+    _trend[series]=(time.time(),d); return d
 def need_edge(): return WKND_EDGE if wknd_night() else (NIGHT_EDGE if night() else MIN_EDGE)
 def metals_closed(ts=None):
     # Kalshi GOLD/SILVER closed: daily 17:00-18:00 ET, and Fri 17:00 ET -> Sun 18:00 ET (DST-aware)
@@ -396,6 +408,8 @@ def tick_once():
                 oe=round(q-ask,3); dirn='NO' if dirn=='YES' else 'YES'; ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
                 fq=min(ask+WKND_EDGE+0.001,0.99); mp=fq if dirn=='YES' else 1-fq; q=fq
                 meta=dict(meta,fade=True,fadeOrigEdge=oe)
+            td=trend_dir(k['ticker'].split('-')[0]) if TREND_N>0 else None
+            if td and td!=dirn: sg['action']=f'skip: against trend (last {TREND_N} windows settled {td})'; sigs[a]=sg; continue
             if WKND_MAX>0 and wknd_night() and ask>WKND_MAX: sg['action']=f'skip: weekend-night price cap ({ask:.2f} > {WKND_MAX:.2f})'; sigs[a]=sg; continue
             if LV and LV.enabled():
                 sz=pt.size(dirn,ask,mp); t=None
