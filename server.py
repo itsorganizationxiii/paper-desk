@@ -436,7 +436,7 @@ def tick_once():
                         if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
                             sz=pt.size(rd,rask,rmp)
                             if sz:
-                                _rs=lambda px,d=rd,m=rmp:None if px>REV_MAX else (pt.size(d,px,m) or [None])[0]
+                                _rs=lambda px,d=rd:None if px>REV_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
                                 fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_rs)
                                 if fill:
                                     with lock: t=pt.openLive(a,rd,fill,k['strike'],k['close'],k['ticker'],rmeta,sz[1],sz[2])
@@ -455,7 +455,7 @@ def tick_once():
                         if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
                             sz=pt.size(rd,rask,rmp)
                             if sz:
-                                _as=lambda px,d=rd,m=rmp:None if px>ALT_MAX else (pt.size(d,px,m) or [None])[0]
+                                _as=lambda px,d=rd:None if px>ALT_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
                                 fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_as)
                                 if fill:
                                     with lock: t=pt.openLive(a,rd,fill,k['strike'],k['close'],k['ticker'],rmeta,sz[1],sz[2])
