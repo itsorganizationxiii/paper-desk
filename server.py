@@ -110,7 +110,7 @@ class PaperTrader:
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',asset=asset,side=side,price=fill['price'],stake=stake,stakePct=round(100*fill['frac'],2),
                contracts=fill['contracts'],entryFee=fill['fee'],liveOrderId=fill['orderId'],liveCashAtEntry=fill['cash'],
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
-        t['perpPremium']=perp_premium(asset); t['regime']=regime(asset)
+        t['perpPremium']=perp_premium(asset); t['regime']=regime(asset); t['flowAtEntry']=flow(asset)
         s.trades.append(t); s.save(); print('OPEN LIVE',t['id'],ticker,side,fill['price'],fill['contracts'],flush=True); return t
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
         sz=s.size(side,ask,p_yes)
@@ -120,7 +120,7 @@ class PaperTrader:
         s.balance-=stake
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
-        t['perpPremium']=perp_premium(asset); t['regime']=regime(asset)
+        t['perpPremium']=perp_premium(asset); t['regime']=regime(asset); t['flowAtEntry']=flow(asset)
         s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True)
         return t
     def close(s,t,win,how,val=None):
@@ -303,6 +303,31 @@ def alt_votes(btc_ticker):
             if b>0 and k>0: v[a]='YES' if (b+k)/2>0.5 else 'NO'
         except Exception: pass
     _altc[suf]=(time.time(),v); return v
+_FSYM={'BTC':'PF_XBTUSD','ETH':'PF_ETHUSD','SOL':'PF_SOLUSD','GOLD':'PF_XAUUSD','SILVER':'PF_XAGUSD','XAU':'PF_XAUUSD','XAG':'PF_XAGUSD'}
+_flow={}; _fseen=set()
+def _flow_poller():
+    # log-only: Kraken futures taker flow + liquidations per minute (user Nov 7)
+    while True:
+        for a,sym in set(_FSYM.items()):
+            try:
+                h=json.load(urllib.request.urlopen(f'https://futures.kraken.com/derivatives/api/v3/history?symbol={sym}',timeout=8)).get('history',[])
+                for x in h:
+                    u=x.get('uid')
+                    if not u or u in _fseen: continue
+                    _fseen.add(u); mn=x['time'][:16]; usd=float(x['price'])*float(x['size'])
+                    b=_flow.setdefault(sym,{}).setdefault(mn,{'buy':0.0,'sell':0.0,'liqLong':0.0,'liqShort':0.0})
+                    b['buy' if x.get('side')=='buy' else 'sell']+=usd
+                    if x.get('type')=='liquidation': b['liqLong' if x.get('side')=='sell' else 'liqShort']+=usd
+                for k in sorted(_flow.get(sym,{}))[:-40]: _flow[sym].pop(k,None)
+            except Exception as e: print('flow err',sym,e,flush=True)
+        if len(_fseen)>200000: _fseen.clear()
+        time.sleep(20)
+def flow(asset,mins=2):
+    sym=_FSYM.get(asset.upper())
+    if not sym or sym not in _flow: return None
+    ks=sorted(_flow[sym])[-mins:]; b=sum(_flow[sym][k]['buy'] for k in ks); se=sum(_flow[sym][k]['sell'] for k in ks)
+    return {'buy':round(b),'sell':round(se),'imb':round((b-se)/(b+se),3) if b+se else 0,'liqLong':round(sum(_flow[sym][k]['liqLong'] for k in ks)),'liqShort':round(sum(_flow[sym][k]['liqShort'] for k in ks))}
+threading.Thread(target=_flow_poller,daemon=True).start()
 _perp={}
 def perp_premium(asset):
     # log-only (Nov 7): Kraken perp last vs spot index, as a fraction; cached 15s
@@ -402,6 +427,10 @@ def tick_once():
             sig_against=dirn is not None and dirn!=t['side']
             elo_against=(mp is not None and (mp>0.5)!=(t['side']=='YES')) or est!='live'
             agree=dirn==t['side'] and (mp is None and est!='live' or mp is not None and (mp>0.5)==(t['side']=='YES'))
+            try:  # log-only per-minute flow while open
+                f=flow(t['asset'],1); mk_=time.strftime('%H:%M')
+                if f and (not t.get('flowLog') or t['flowLog'][-1].get('m')!=mk_): t.setdefault('flowLog',[]).append(dict(f,m=mk_,bid=round(bid,3))); t['flowLog']=t['flowLog'][-16:]
+            except Exception as e: print('flowlog err',e,flush=True)
             try:  # log-only: one other coin >=90% against us late, no lock armed, bid near entry (user Nov 7)
                 lt=t['closesAt']-time.time()
                 if not t.get('oneAgainstFlag') and 0<lt<=300 and (t.get('peakBid') or 0)<t['price']+0.10 and abs(bid-t['price'])<=0.10:
