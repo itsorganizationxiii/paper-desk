@@ -110,7 +110,7 @@ class PaperTrader:
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',asset=asset,side=side,price=fill['price'],stake=stake,stakePct=round(100*fill['frac'],2),
                contracts=fill['contracts'],entryFee=fill['fee'],liveOrderId=fill['orderId'],liveCashAtEntry=fill['cash'],
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
-        t['perpPremium']=perp_premium(asset)
+        t['perpPremium']=perp_premium(asset); t['regime']=regime(asset)
         s.trades.append(t); s.save(); print('OPEN LIVE',t['id'],ticker,side,fill['price'],fill['contracts'],flush=True); return t
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
         sz=s.size(side,ask,p_yes)
@@ -120,7 +120,7 @@ class PaperTrader:
         s.balance-=stake
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
-        t['perpPremium']=perp_premium(asset)
+        t['perpPremium']=perp_premium(asset); t['regime']=regime(asset)
         s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True)
         return t
     def close(s,t,win,how,val=None):
@@ -317,6 +317,22 @@ def perp_premium(asset):
     x=c[1].get(sym) or {}
     try: return round((float(x['last'])-float(x['indexPrice']))/float(x['indexPrice']),6)
     except Exception: return None
+_reg={}
+def regime(asset):
+    # log-only (Nov 7): last 30 one-minute Coinbase candles -> trend_up/trend_down/choppy/quiet; cached 60s
+    if asset not in ('BTC','ETH','SOL'): return None
+    c=_reg.get(asset)
+    if c and time.time()-c[0]<60: return c[1]
+    r=None
+    try:
+        req=urllib.request.Request(f'https://api.exchange.coinbase.com/products/{asset}-USD/candles?granularity=60',headers={'User-Agent':'paper-desk'})
+        k=sorted(json.load(urllib.request.urlopen(req,timeout=5))[:30])  # [t,low,high,open,close,vol]
+        cl=[x[4] for x in k]; hi=max(x[2] for x in k); lo=min(x[1] for x in k)
+        mv=(cl[-1]-k[0][3])/k[0][3]; rng=(hi-lo)/cl[-1]; path=sum(abs(cl[i]-cl[i-1]) for i in range(1,len(cl))) or 1e-9
+        eff=abs(cl[-1]-k[0][3])/path
+        r=dict(tag='quiet' if rng<0.001 else (('trend_up' if mv>0 else 'trend_down') if eff>=0.4 and abs(mv)>=0.0015 else 'choppy'),move=round(mv,5),range=round(rng,5),eff=round(eff,3))
+    except Exception: r=c[1] if c else None
+    _reg[asset]=(time.time(),r); return r
 PAIR_TP=float(os.environ.get('PAIR_CASH_C','0.25'))
 TREND_N=int(os.environ.get('TREND_N','3')); _trend={}
 def trend_dir(series):
