@@ -296,6 +296,17 @@ class Live:
                 if side!='YES' and abs(v-px)<abs(fpx-px): fpx=v
             fee=float(o2['average_fee_paid'])*fc if o2.get('average_fee_paid') not in (None,'') else float(o2.get('taker_fees_dollars') or o2.get('maker_fees_dollars') or o2.get('fees_dollars') or 0)
             s.log(action='rest-buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=fpx if fc else None,fee=round(fee,4),http=c,error=((f'no fill in {wait}s' if not fc else 'filled while resting')+(f'; cancel {cancel} status {o2.get("status")}' if cancel else '')) if (not fc or cancel) else None,**a)
+            if not fc:  # cancel may race a fill: re-check Kalshi fills for this order before giving up (Nov 7 ETH ghost fill)
+                for _ in range(3):
+                    try:
+                        time.sleep(1.5); cf,df=api('GET',f'/portfolio/fills?order_id={oid}')
+                        fl=(df or {}).get('fills') or []
+                        g=sum(float(x.get('count_fp') or x.get('count') or 0) for x in fl)
+                        if g>0:
+                            fc=round(g,2); pp=[float(x.get('yes_price_dollars') or x.get('no_price_dollars') or 0) for x in fl]
+                            fpx=px
+                            s.log(action='ghost-fill',orderId=oid,filled=fc,error='filled during cancel; now tracking',**a); break
+                    except Exception as e: s.log(action='ghost-fill',error=f'check err {e}',**a)
             if not fc: return None
             s.tried.add(ticker); s.cashAt=None
             return dict(contracts=fc,price=round(fpx,4),fee=round(fee,4),cost=round(fc*fpx,4),orderId=oid,cash=cash,frac=f)
