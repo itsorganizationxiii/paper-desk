@@ -280,7 +280,7 @@ elo_com=dict(at=0,wins={},err=None)
 def night(ts=None):
     h=datetime.fromtimestamp(ts or time.time(),ET).hour
     return h>=17 or h<9
-WKND_MAX=float(os.environ.get('WKND_NIGHT_MAX_PRICE','0.75'))  # 0 disables
+WKND_MAX=float(os.environ.get('WKND_NIGHT_MAX_PRICE','0.69'))  # 0 disables
 def wknd_night(ts=None):
     # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
     d=datetime.fromtimestamp(ts or time.time(),ET); wd,h=d.weekday(),d.hour
