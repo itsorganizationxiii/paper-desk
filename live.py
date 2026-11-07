@@ -234,6 +234,13 @@ class Live:
         s.log(action='buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=round(cost/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc else 'no fill'),**a)
         if not fc: s.lastBuy='nofill' if (c in (200,201) or not err) else 'error'; return None
         s.cashAt=None
+        # Kalshi often fills below our limit and the order may not report its average price; trust the real cash change
+        try:
+            time.sleep(0.8); nc=s.balance(); spent=round(cash-nc,4)
+            if 0<spent<(cost+fee)*1.05 and spent>(cost+fee)*0.3:
+                s.log(action='fill-fix',error=f'cash-based cost {spent} vs limit-based {round(cost+fee,4)}',**a)
+                cost=max(0.0,spent-fee)
+        except Exception: pass
         return dict(contracts=fc,price=round(cost/fc,4),fee=round(fee,4),cost=round(cost,4),orderId=oid,cash=cash,frac=frac)
     def rest_buy(s,asset,ticker,side,ref,sizer,wait=30,close_at=None):
         """Resting limit buy at the signal price: waits up to `wait`s for Kalshi to fill, then cancels the rest."""
