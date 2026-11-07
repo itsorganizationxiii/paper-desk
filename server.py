@@ -32,7 +32,7 @@ LOCK_ARM_C=float(os.environ.get('LOCK_ARM_C','0.10'))
 WKND_LOCK_ARM_C=float(os.environ.get('WKND_LOCK_ARM_C','0.15'))  # Fri 5PM-Mon 9AM ET
 WKND_DROP=float(os.environ.get('WKND_LOCK_DROP','0.04'))  # weekend: flat 4c giveback, big-run off (7-weekend grid best, user Nov 7)
 WKND_MODE=os.environ.get('WKND_MODE','volatile')  # 'volatile' (thin weekend: Up bets lock early) or 'normal'
-WKND_UP_ARM=float(os.environ.get('WKND_UP_ARM','0.08')); WKND_UP_DROP=float(os.environ.get('WKND_UP_DROP','0.03'))
+WKND_UP_ARM=float(os.environ.get('WKND_UP_ARM','0.12')); WKND_UP_DROP=float(os.environ.get('WKND_UP_DROP','0.05'))
 def wknd_up(t): return t is not None and WKND_MODE=='volatile' and wknd_night() and t.get('side')=='YES'
 def lock_arm(t=None): return WKND_UP_ARM if wknd_up(t) else (WKND_LOCK_ARM_C if wknd_night() else LOCK_ARM_C)
 def lock_drop(t): return WKND_UP_DROP if wknd_up(t) else (WKND_DROP if WKND_DROP>0 and wknd_night() else (BIG_DROP if t['peakBid']-t['price']>=BIG_RUN else LOCK_DROP))
