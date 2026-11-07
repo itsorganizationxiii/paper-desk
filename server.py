@@ -41,7 +41,7 @@ TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
 # metals only: once the bid is 10c above entry, never give back past entry (thin books gap through the 40% stop)
 GUARD_ASSETS={'GOLD','SILVER'}; GUARD_GIVEBACK=float(os.environ.get('GUARD_GIVEBACK','0.0'))
 def kalshi_fee(c,p): return math.ceil(7*c*p*(1-p))/100  # Kalshi taker fee: ceil(0.07*C*P*(1-P)) in $
-MIN_EDGE=0.03; NIGHT_EDGE=0.05; WKND_EDGE=float(os.environ.get('WKND_NIGHT_EDGE','0.07')); WKND_MAX_EDGE=float(os.environ.get('WKND_NIGHT_MAX_EDGE','0.20')); EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10')); REST_SEC=int(os.environ.get('LIVE_REST_SEC','30')); LIVE_TICK=int(os.environ.get('LIVE_TICK_SEC','5'))
+MIN_EDGE=0.03; NIGHT_EDGE=0.05; WKND_EDGE=float(os.environ.get('WKND_NIGHT_EDGE','0.07')); FADE=os.environ.get('WKND_FADE','1')!='0'; WKND_MAX_EDGE=float(os.environ.get('WKND_NIGHT_MAX_EDGE','0.20')); EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10')); REST_SEC=int(os.environ.get('LIVE_REST_SEC','30')); LIVE_TICK=int(os.environ.get('LIVE_TICK_SEC','5'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
     if auth: h['Authorization']='Bearer '+KEY
@@ -391,6 +391,11 @@ def tick_once():
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
             meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est)
             q=mp if dirn=='YES' else 1-mp
+            if FADE and WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE:
+                # fade test: weekend-night 20c+ edges went 0/4, so buy the other side, sized as a minimum-edge bet
+                oe=round(q-ask,3); dirn='NO' if dirn=='YES' else 'YES'; ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
+                fq=min(ask+WKND_EDGE+0.001,0.99); mp=fq if dirn=='YES' else 1-fq; q=fq
+                meta=dict(meta,fade=True,fadeOrigEdge=oe)
             if WKND_MAX>0 and wknd_night() and ask>WKND_MAX: sg['action']=f'skip: weekend-night price cap ({ask:.2f} > {WKND_MAX:.2f})'; sigs[a]=sg; continue
             if LV and LV.enabled():
                 sz=pt.size(dirn,ask,mp); t=None
