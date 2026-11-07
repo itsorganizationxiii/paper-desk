@@ -41,7 +41,7 @@ TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
 # metals only: once the bid is 10c above entry, never give back past entry (thin books gap through the 40% stop)
 GUARD_ASSETS={'GOLD','SILVER'}; GUARD_GIVEBACK=float(os.environ.get('GUARD_GIVEBACK','0.0'))
 def kalshi_fee(c,p): return math.ceil(7*c*p*(1-p))/100  # Kalshi taker fee: ceil(0.07*C*P*(1-P)) in $
-MIN_EDGE=0.03; NIGHT_EDGE=0.05; WKND_EDGE=float(os.environ.get('WKND_NIGHT_EDGE','0.07')); FADE=os.environ.get('WKND_FADE','1')!='0'; WKND_MAX_EDGE=float(os.environ.get('WKND_NIGHT_MAX_EDGE','0.20')); EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10')); REST_SEC=int(os.environ.get('LIVE_REST_SEC','30')); LIVE_TICK=int(os.environ.get('LIVE_TICK_SEC','5'))
+MIN_EDGE=0.03; NIGHT_EDGE=0.05; WKND_EDGE=float(os.environ.get('WKND_NIGHT_EDGE','0.07')); REV=os.environ.get('REVERSAL','1')!='0'; REV_MAX=float(os.environ.get('REVERSAL_MAX_PRICE','0.60')); FADE=os.environ.get('WKND_FADE','1')!='0'; WKND_MAX_EDGE=float(os.environ.get('WKND_NIGHT_MAX_EDGE','0.20')); EXIT_EDGE=0.03; STOP=0.40; KELLY=0.25; CAP=0.08; TICK=int(os.environ.get('TICK_SEC','10')); REST_SEC=int(os.environ.get('LIVE_REST_SEC','30')); LIVE_TICK=int(os.environ.get('LIVE_TICK_SEC','5'))
 def get(url,auth=False):
     h={'User-Agent':'paper-desk/1.1','Accept':'application/json'}
     if auth: h['Authorization']='Bearer '+KEY
@@ -391,6 +391,26 @@ def tick_once():
         if a in METALS and (metals_closed() or metals_closed(k['close']-1)): sg['action']='skip: metals session closed (Kalshi 5-6 PM ET daily, Fri 5 PM-Sun 6 PM ET)'; sigs[a]=sg; continue
         mp=fresh(k['ticker']); sg['modelP']=mp
         left=k['close']-time.time(); sg['secsToClose']=round(left)
+        if REV and 600<=left<=840 and not any(t.get('ticker')==k['ticker'] for t in pt.trades):
+            # reversal bet (user test, Nov 7): after 3+ same-way settles, buy the other side early in the window; backtest 59% wins
+            td=trend_dir(k['ticker'].split('-')[0])
+            if td:
+                rd='NO' if td=='YES' else 'YES'; rask=k['yesAsk'] if rd=='YES' else k['noAsk']
+                if 0<rask<=REV_MAX:
+                    fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
+                    rmeta=dict(priceSource='kalshi',signalSource='reversal-after-3',fade=True,reversal=True,streak=td)
+                    t=None
+                    if LV and LV.enabled():
+                        if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
+                            sz=pt.size(rd,rask,rmp)
+                            if sz:
+                                _rs=lambda px,d=rd,m=rmp:None if px>REV_MAX else (pt.size(d,px,m) or [None])[0]
+                                fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_rs)
+                                if fill:
+                                    with lock: t=pt.openLive(a,rd,fill,k['strike'],k['close'],k['ticker'],rmeta,sz[1],sz[2])
+                    else:
+                        with lock: t=pt.openTrade(a,rd,rask,rmp,k['strike'],k['close'],k['ticker'],rmeta)
+                    if t: sg['action']=f'OPENED REVERSAL #{t["id"]} {rd} after 3x {td}'; sigs[a]=sg; continue
         if not dirn: sg['action']='skip: momentum/CVD disagree'
         elif est=='live' and mp is None: sg['action']='skip: no fresh EloEdge model_p'
         elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
