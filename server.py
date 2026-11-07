@@ -280,6 +280,11 @@ elo_com=dict(at=0,wins={},err=None)
 def night(ts=None):
     h=datetime.fromtimestamp(ts or time.time(),ET).hour
     return h>=17 or h<9
+WKND_MAX=float(os.environ.get('WKND_NIGHT_MAX_PRICE','0.75'))  # 0 disables
+def wknd_night(ts=None):
+    # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
+    d=datetime.fromtimestamp(ts or time.time(),ET); wd,h=d.weekday(),d.hour
+    return (wd==4 and h>=17) or wd in (5,6) or (wd==0 and h<9)
 def metals_closed(ts=None):
     # Kalshi GOLD/SILVER closed: daily 17:00-18:00 ET, and Fri 17:00 ET -> Sun 18:00 ET (DST-aware)
     d=datetime.fromtimestamp(ts if ts is not None else time.time(),ET); wd,h=d.weekday(),d.hour
@@ -382,11 +387,12 @@ def tick_once():
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
             meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est)
             q=mp if dirn=='YES' else 1-mp
+            if WKND_MAX>0 and wknd_night() and ask>WKND_MAX: sg['action']=f'skip: weekend-night price cap ({ask:.2f} > {WKND_MAX:.2f})'; sigs[a]=sg; continue
             if LV and LV.enabled():
                 sz=pt.size(dirn,ask,mp); t=None
                 if sz:
                     if k['ticker'] in LV.tried or k['ticker'] in LV.resting: sg['action']='live: order working / already tried this window'; sigs[a]=sg; continue
-                    _sz=lambda px,d=dirn,m=mp:(pt.size(d,px,m) or [None])[0]
+                    _sz=lambda px,d=dirn,m=mp:None if (WKND_MAX>0 and wknd_night() and px>WKND_MAX) else (pt.size(d,px,m) or [None])[0]
                     LV.lastBuy=None
                     fill=LV.buy(a,k['ticker'],dirn,sz[0],ask,sizer=_sz)  # real order; edge re-checked at the live ask
                     if fill:
