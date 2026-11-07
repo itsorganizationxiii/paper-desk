@@ -34,6 +34,7 @@ WKND_DROP=float(os.environ.get('WKND_LOCK_DROP','0.04'))  # weekend: flat 4c giv
 WKND_MODE=os.environ.get('WKND_MODE','volatile')  # 'volatile' (thin weekend: Up bets lock early) or 'normal'
 WKND_UP_ARM=float(os.environ.get('WKND_UP_ARM','0.12')); WKND_UP_DROP=float(os.environ.get('WKND_UP_DROP','0.05'))
 def wknd_up(t): return t is not None and WKND_MODE=='volatile' and wknd_night() and t.get('side')=='YES'
+def tp_bid(): return (WKND_TP if WKND_TP>0 else 9.0) if (WKND_MODE=='volatile' and wknd_night()) else TP_BID
 def stop_pct(): return WKND_STOP if (WKND_STOP>0 and wknd_night()) else STOP
 def lock_arm(t=None): return WKND_UP_ARM if wknd_up(t) else (WKND_LOCK_ARM_C if wknd_night() else LOCK_ARM_C)
 def lock_drop(t): return WKND_UP_DROP if wknd_up(t) else (WKND_DROP if WKND_DROP>0 and wknd_night() else (BIG_DROP if t['peakBid']-t['price']>=BIG_RUN else LOCK_DROP))
@@ -43,7 +44,7 @@ LOCK_ALL_DAY=os.environ.get('LOCK_ALL_DAY','1')!='0'
 def lock_active(ts=None): return LOCK_ALL_DAY or night(ts)
 # metals flip harder off their peaks (thin book), so they lock in lower: 65c peak instead of 80c
 LOCK_PEAK_BY_ASSET={'GOLD':float(os.environ.get('LOCK_PEAK_GOLD','0.65')),'SILVER':float(os.environ.get('LOCK_PEAK_SILVER','0.65'))}
-TP_BID=0.91; TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
+TP_BID=0.91; WKND_TP=float(os.environ.get('WKND_TP','0')); TP_HOLD_P=0.97; TP_HOLD_Z=3.0; TP_HOLD_MAX_LEFT=180
 # metals only: once the bid is 10c above entry, never give back past entry (thin books gap through the 40% stop)
 GUARD_ASSETS={'GOLD','SILVER'}; GUARD_GIVEBACK=float(os.environ.get('GUARD_GIVEBACK','0.0'))
 def kalshi_fee(c,p): return math.ceil(7*c*p*(1-p))/100  # Kalshi taker fee: ceil(0.07*C*P*(1-P)) in $
@@ -472,7 +473,7 @@ def tick_once():
                 t.update(whaleFlowUsd=wnet,whaleAgainst=whale_against,whaleCount=cb['whale']['count'])
                 t['peakBid']=round(max(t.get('peakBid') or 0,bid),4)
                 tp=None
-                if bid>=TP_BID:
+                if bid>=tp_bid():
                     sd=cb.get('sd15'); strike=t.get('strike'); z=None
                     if sd and strike and left_t>0:
                         z=(cb['spot']-strike)/(cb['spot']*sd*math.sqrt(max(left_t,1)/900))*(1 if t['side']=='YES' else -1)
