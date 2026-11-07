@@ -110,6 +110,7 @@ class PaperTrader:
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',asset=asset,side=side,price=fill['price'],stake=stake,stakePct=round(100*fill['frac'],2),
                contracts=fill['contracts'],entryFee=fill['fee'],liveOrderId=fill['orderId'],liveCashAtEntry=fill['cash'],
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
+        t['perpPremium']=perp_premium(asset)
         s.trades.append(t); s.save(); print('OPEN LIVE',t['id'],ticker,side,fill['price'],fill['contracts'],flush=True); return t
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
         sz=s.size(side,ask,p_yes)
@@ -119,6 +120,7 @@ class PaperTrader:
         s.balance-=stake
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
+        t['perpPremium']=perp_premium(asset)
         s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True)
         return t
     def close(s,t,win,how,val=None):
@@ -301,6 +303,20 @@ def alt_votes(btc_ticker):
             if b>0 and k>0: v[a]='YES' if (b+k)/2>0.5 else 'NO'
         except Exception: pass
     _altc[suf]=(time.time(),v); return v
+_perp={}
+def perp_premium(asset):
+    # log-only (Nov 7): Kraken perp last vs spot index, as a fraction; cached 15s
+    sym={'BTC':'PF_XBTUSD','ETH':'PF_ETHUSD','SOL':'PF_SOLUSD'}.get(asset)
+    if not sym: return None
+    c=_perp.get('t')
+    if not c or time.time()-c[0]>15:
+        try:
+            d=json.load(urllib.request.urlopen('https://futures.kraken.com/derivatives/api/v3/tickers',timeout=4))
+            c=(time.time(),{x['symbol']:x for x in d.get('tickers',[])}); _perp['t']=c
+        except Exception: return None
+    x=c[1].get(sym) or {}
+    try: return round((float(x['last'])-float(x['indexPrice']))/float(x['indexPrice']),6)
+    except Exception: return None
 PAIR_TP=float(os.environ.get('PAIR_CASH_C','0.25'))
 TREND_N=int(os.environ.get('TREND_N','3')); _trend={}
 def trend_dir(series):
