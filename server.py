@@ -1,7 +1,7 @@
 # One strategy engine, two modes. PAPER (default): simulated trades/balance, exactly as before.
 # LIVE (env LIVE_TRADING=1 + Kalshi keys + dashboard not paused): same engine trades the real Kalshi cash; trades are
 # recorded only when contracts actually fill (mode='live'). Live never touches the paper balance (it stays frozen).
-import json, os, time, math, threading, urllib.request, shutil, csv, io
+import uuid,json, os, time, math, threading, urllib.request, shutil, csv, io
 from datetime import timezone, timedelta
 try:
     from zoneinfo import ZoneInfo; ET=ZoneInfo('America/New_York')
@@ -66,6 +66,7 @@ if MURI:
 def _mongo_writer():
     while True:
         _dirty.wait(); time.sleep(2); _dirty.clear()
+        if LV is not None and LV.lease_ok is not None and not LV.owner(): continue  # stale instance: never overwrite the new one's state
         try:
             with lock: doc={'balance':round(pt.balance,4),'startBalance':pt.start,'trades':json.loads(json.dumps(pt.trades)),'updatedAt':time.time()}
             MCOL.replace_one({'_id':'state'},doc,upsert=True)
@@ -215,6 +216,8 @@ class PaperTrader:
             closed=A['closed'],open=A['open'],earlyExits=s.exitSummary(),trades=s.trades[::-1])
 LV=None
 lock=threading.Lock(); pt=PaperTrader()
+for _t in pt.trades:
+    if _t.get('status')=='open' and _t.pop('exiting',None): _t['liveSellError']='sell thread lost in restart; exit/settle re-armed'  # a dead sell thread must not block settlement forever
 # ---- live mode: separate small state doc ('live' in mongo / live.json), never mixed with paper state ----
 LF=os.path.join(DATA,'live.json')
 def _live_load():
@@ -228,6 +231,17 @@ def _live_save(st):
     if MCOL is not None: MCOL.replace_one({'_id':'live'},dict(st,_id='live'),upsert=True)
 try:
     import live as _live; LV=_live.Live(_live_load,_live_save)
+    # single-owner lease: Render runs old+new instances together during a deploy; only the newest boot may trade or write the live doc
+    INSTANCE=f'{os.getpid()}-{uuid.uuid4().hex[:8]}-{int(time.time())}'; _lease={'at':0,'ok':True}
+    if MCOL is not None:
+        try: MCOL.replace_one({'_id':'lease'},{'_id':'lease','inst':INSTANCE,'at':time.time()},upsert=True)
+        except Exception as e: print('lease claim err',e,flush=True)
+        def _lease_ok():
+            if time.time()-_lease['at']<3: return _lease['ok']
+            try: d=MCOL.find_one({'_id':'lease'}); _lease['ok']=(not d) or d.get('inst')==INSTANCE
+            except Exception: pass
+            _lease['at']=time.time(); return _lease['ok']
+        LV.lease_ok=_lease_ok
     print('live mode:', 'LIVE' if LV.enabled() else ('paused' if LV.allowed() else 'off'),flush=True)
 except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print('live init err',LIVE_INIT_ERR,flush=True)
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
@@ -575,6 +589,7 @@ def tick_once():
         signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
 def loop():
     while True:
+        if LV is not None and LV.lease_ok is not None and not LV.owner(): time.sleep(5); continue  # newer instance owns trading; stale one idles
         try: tick_once()
         except Exception as e: print('tick err',e,flush=True)
         time.sleep(LIVE_TICK if any(t.get('mode')=='live' and t['status']=='open' for t in pt.trades) else TICK)  # faster checks while a real position is open

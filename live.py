@@ -69,6 +69,7 @@ class Live:
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
         s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None
         s.cash=None; s.cashAt=None; s.lastError=None; s.ws=None
+        s.lease_ok=None  # set by server: False when a newer deploy instance owns live trading (Render overlap, Nov 7 #1033)
         if s.allowed():
             try:
                 import kws
@@ -84,9 +85,31 @@ class Live:
         except Exception: pass
         return None
     def allowed(s): return ENV_ALLOW and keys_present()
-    def enabled(s): return s.allowed() and not s.paused
+    def owner(s):
+        try: return s.lease_ok is None or bool(s.lease_ok())
+        except Exception: return True
+    def enabled(s): return s.allowed() and not s.paused and s.owner()
+    def position(s,ticker):
+        """Net Kalshi position for a ticker: >0 YES contracts, <0 NO contracts, None if unknown."""
+        try:
+            c,d=api('GET',f'/portfolio/positions?ticker={ticker}')
+            if c!=200: return None
+            for p in (d or {}).get('market_positions') or []:
+                if p.get('ticker')==ticker:
+                    v=p.get('position_fp'); return float(v) if v not in (None,'') else float(p.get('position') or 0)
+            return 0.0
+        except Exception: return None
+    def verify(s,ticker,side,want,a):
+        """After a fill, read the real Kalshi position and log it; returns the side/size actually held (net)."""
+        time.sleep(0.5); p=s.position(ticker)
+        if p is None: s.log(action='position-check',error='positions unavailable',expect=f'{side} {want}',**a); return side,want
+        held='YES' if p>0 else ('NO' if p<0 else None); n=round(abs(p),2)
+        ok=(held==side and n>=want-0.011)
+        s.log(action='position-check' if ok else 'position-mismatch',expect=f'{side} {want}',actual=f'{held} {n}' if held else 'flat',error=None if ok else 'Kalshi position differs from recorded trade; recording what Kalshi holds',**a)
+        return (held,min(n,want) if held==side else n) if held else (side,0.0)
     def state(s): return dict(paused=s.paused,day=s.day,dayPnl=s.dayPnl,killed=s.killed,killReason=s.killReason,orders=s.orders[-200:],totalPnl=s.totalPnl)
     def persist(s):
+        if not s.owner(): return  # stale deploy instance must not overwrite the new instance's order log
         if s._save:
             try: s._save(s.state())
             except Exception as e: s.lastError=f'persist: {e}'
@@ -157,6 +180,7 @@ class Live:
         body=dict(ticker=ticker,client_order_id=f'pd-{uuid.uuid4().hex[:20]}',side=book,count=f'{count:.2f}',price=f'{max(0.01,min(0.99,yes)):.4f}',
                   time_in_force='immediate_or_cancel',self_trade_prevention_type='taker_at_cross')
         if action=='sell': body['reduce_only']=True
+        if not s.owner(): return 0,0,None,0.0,None,'stale instance: newer deploy owns live trading'
         c,d=api('POST','/portfolio/events/orders',body); o=d.get('order',d) if isinstance(d,dict) else {}
         def _fc(o):
             best=0.0
@@ -241,7 +265,10 @@ class Live:
                 s.log(action='fill-fix',error=f'cash-based cost {spent} vs limit-based {round(cost+fee,4)}',**a)
                 cost=max(0.0,spent-fee)
         except Exception: pass
-        return dict(contracts=fc,price=round(cost/fc,4),fee=round(fee,4),cost=round(cost,4),orderId=oid,cash=cash,frac=frac)
+        hs,hn=s.verify(ticker,side,fc,a)
+        if hs!=side or hn<=0: return None  # never record a position Kalshi doesn't show on our side (logged as position-mismatch)
+        if hn<fc: cost=cost*hn/fc; fee=fee*hn/fc; fc=hn
+        return dict(contracts=fc,price=round(cost/fc,4),fee=round(fee,4),cost=round(cost,4),orderId=oid,cash=cash,frac=frac,side=side)
     def rest_buy(s,asset,ticker,side,ref,sizer,wait=30,close_at=None):
         """Resting limit buy at the signal price: waits up to `wait`s for Kalshi to fill, then cancels the rest."""
         a=dict(asset=asset,ticker=ticker,side=side)
@@ -257,8 +284,10 @@ class Live:
             book='bid' if side=='YES' else 'ask'; yes=px if side=='YES' else 1-px
             body=dict(ticker=ticker,client_order_id=f'pd-{uuid.uuid4().hex[:20]}',side=book,count=f'{n:.2f}',price=f'{max(0.01,min(0.99,yes)):.4f}',
                       time_in_force='good_till_canceled',self_trade_prevention_type='taker_at_cross',expiration_ts=int(time.time()+wait+2))
+            if not s.owner(): s.log(action='rest-buy',error='stale instance: newer deploy owns live trading',**a); return None
             c,d=api('POST','/portfolio/events/orders',body); o=(d or {}).get('order',d) if isinstance(d,dict) else {}
             oid=o.get('order_id') or o.get('id')
+            s.log(action='rest-buy-placed',orderId=oid,want=n,limit=px,http=c,error=None if c in (200,201) else json.dumps(d)[:200],**a)  # log at placement, not only at the end (thread may die on restart)
             if c not in (200,201) or not oid:
                 s.log(action='rest-buy',want=n,limit=px,filled=0,http=c,error=json.dumps(d)[:200],**a); return None
             fc=0.0; o2={}
@@ -309,6 +338,9 @@ class Live:
                     except Exception as e: s.log(action='ghost-fill',error=f'check err {e}',**a)
             if not fc: return None
             s.tried.add(ticker); s.cashAt=None
+            hs,hn=s.verify(ticker,side,fc,a)
+            if hs!=side or hn<=0: return None
+            fc=min(fc,hn)
             return dict(contracts=fc,price=round(fpx,4),fee=round(fee,4),cost=round(fc*fpx,4),orderId=oid,cash=cash,frac=f)
         except Exception as e:
             s.log(action='rest-buy',error=f'{type(e).__name__}: {e}',**a); return None
@@ -316,6 +348,12 @@ class Live:
     def sell(s,ticker,side,count,bid,floor=None):
         """Synchronous real sell of up to count. Returns (filled, avg price, fee, orderId, error)."""
         c=fc=0; fee=0.0; oid=None; err=None; px=None; proceeds=0.0
+        p=s.position(ticker)
+        if p is not None:
+            have=p if side=='YES' else -p
+            if have<=0.0:
+                s.log(action='sell',ticker=ticker,side=side,want=count,filled=0,error=f'Kalshi holds no {side} here (net {p}); not selling'); return 0,None,0.0,None,'no position'
+            count=min(count,round(have,2))
         for attempt in range(3):
             left=round(count-fc,2)
             if left<=0: break
