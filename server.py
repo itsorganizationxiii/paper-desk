@@ -444,7 +444,7 @@ def tick_once():
             td=trend_dir(k['ticker'].split('-')[0])
             if td:
                 rd='NO' if td=='YES' else 'YES'; rask=k['yesAsk'] if rd=='YES' else k['noAsk']
-                if 0<rask<=REV_MAX:
+                if 0<rask<=REV_MAX and not any(t.get('status')=='open' and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
                     fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
                     rmeta=dict(priceSource='kalshi',signalSource='reversal-after-3',fade=True,reversal=True,streak=td)
                     t=None
@@ -463,7 +463,7 @@ def tick_once():
             av=alt_votes(k['ticker'])
             if len(av)==3 and len(set(av.values()))==1:
                 rd=list(av.values())[0]; rask=k['yesAsk'] if rd=='YES' else k['noAsk']
-                if 0<rask<=ALT_MAX:
+                if 0<rask<=ALT_MAX and not any(t.get('status')=='open' and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
                     fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
                     rmeta=dict(priceSource='kalshi',signalSource='alt-consensus',fade=True,altConsensus=True,altVotes=av)
                     t=None
