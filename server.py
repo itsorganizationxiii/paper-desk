@@ -301,6 +301,7 @@ def alt_votes(btc_ticker):
             if b>0 and k>0: v[a]='YES' if (b+k)/2>0.5 else 'NO'
         except Exception: pass
     _altc[suf]=(time.time(),v); return v
+PAIR_TP=float(os.environ.get('PAIR_CASH_C','0.25'))
 TREND_N=int(os.environ.get('TREND_N','3')); _trend={}
 def trend_dir(series):
     # direction of the last TREND_N settled 15m windows if they all agree ('YES'/'NO'), else None; cached 60s
@@ -390,6 +391,8 @@ def tick_once():
                         t.update(tpHeld=True,tpHoldReason=why,tpSellPnl=sellpnl if 'tpSellPnl' not in t else t['tpSellPnl'])
                     else: tp=(fee,why)
                 if tp: pt.exit(t,bid,f'takeprofit: {tp[1]}; fee ${tp[0]:.2f}',fee=tp[0])
+                elif PAIR_TP>0 and bid>=t['price']+PAIR_TP and any(o is not t and o['status']=='open' and not o.get('exiting') and o.get('closesAt')==t.get('closesAt') and o['side']==t['side'] for o in pt.trades):
+                    fp=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'paircash: up {bid-t["price"]:+.2f} with a same-side partner open; cash this one, partner rides the lock; fee ${fp:.2f}',fee=fp)
                 elif lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK), t['price']+lock_arm()) and bid<=t['peakBid']-(BIG_DROP if t['peakBid']-t['price']>=BIG_RUN else LOCK_DROP) and bid>t['price'] and not (q is not None and q>=LOCK_HOLD_P):
                     f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm()); pt.exit(t,bid,f'profitlock: {"night" if night() else "day"}, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
                 elif t['asset'] in GUARD_ASSETS and t['peakBid']>=t['price']+0.10 and bid>0 and bid<=t['price']-GUARD_GIVEBACK and not (q is not None and q>=LOCK_HOLD_P):
