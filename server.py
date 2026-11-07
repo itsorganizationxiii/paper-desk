@@ -402,6 +402,18 @@ def tick_once():
             sig_against=dirn is not None and dirn!=t['side']
             elo_against=(mp is not None and (mp>0.5)!=(t['side']=='YES')) or est!='live'
             agree=dirn==t['side'] and (mp is None and est!='live' or mp is not None and (mp>0.5)==(t['side']=='YES'))
+            try:  # log-only: one other coin >=90% against us late, no lock armed, bid near entry (user Nov 7)
+                lt=t['closesAt']-time.time()
+                if not t.get('oneAgainstFlag') and 0<lt<=300 and (t.get('peakBid') or 0)<t['price']+0.10 and abs(bid-t['price'])<=0.10:
+                    suf=t['ticker'].split('-',1)[1]
+                    for a in ('BTC','ETH','SOL','DOGE','XRP'):
+                        if a==t['asset']: continue
+                        mm=json.load(urllib.request.urlopen(f'https://api.elections.kalshi.com/trade-api/v2/markets/KX{a}15M-{suf}',timeout=5))['market']
+                        md=(float(mm.get('yes_bid_dollars') or 0)+float(mm.get('yes_ask_dollars') or 0))/2
+                        ours=md if t['side']=='YES' else 1-md
+                        if 0<ours<=0.10:
+                            t.update(oneAgainstFlag=True,oneAgainstCoin=a,oneAgainstBid=round(bid,4),oneAgainstLeft=round(lt)); print('ONE-AGAINST flag',t['id'],a,bid,flush=True); break
+            except Exception as e: print('oneagainst err',e,flush=True)
             with lock:
                 t.update(markPrice=round(bid,4),unrealizedPnl=round(t['contracts']*bid-t['stake'],2),signalsAgree=bool(agree),
                          flipWarning=bool(sig_against or (mp is not None and (mp>0.5)!=(t['side']=='YES'))),currentModelP=q)
