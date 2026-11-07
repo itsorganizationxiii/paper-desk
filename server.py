@@ -409,7 +409,9 @@ def tick_once():
                 fq=min(ask+WKND_EDGE+0.001,0.99); mp=fq if dirn=='YES' else 1-fq; q=fq
                 meta=dict(meta,fade=True,fadeOrigEdge=oe)
             td=trend_dir(k['ticker'].split('-')[0]) if TREND_N>0 else None
-            if td and td!=dirn: sg['action']=f'skip: against trend (last {TREND_N} windows settled {td})'; sigs[a]=sg; continue
+            if td and td!=dirn: meta=dict(meta,againstTrend=td)  # log-only: data showed 3-in-a-row reverses ~59%
+            if any(t.get('status')=='open' and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=dirn for t in pt.trades):
+                sg['action']='skip: opposite side of another coin open this window (BTC/ETH settle together ~84%)'; sigs[a]=sg; continue
             if WKND_MAX>0 and wknd_night() and ask>WKND_MAX: sg['action']=f'skip: weekend-night price cap ({ask:.2f} > {WKND_MAX:.2f})'; sigs[a]=sg; continue
             if LV and LV.enabled():
                 sz=pt.size(dirn,ask,mp); t=None
