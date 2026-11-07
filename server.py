@@ -288,6 +288,19 @@ def wknd_night(ts=None):
     # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
     d=datetime.fromtimestamp(ts or time.time(),ET); wd,h=d.weekday(),d.hour
     return (wd==4 and h>=17) or wd in (5,6) or (wd==0 and h<9)
+ALT=os.environ.get('ALT_CONSENSUS','1')!='0'; ALT_MAX=float(os.environ.get('ALT_MAX_PRICE','0.60')); _altc={}
+def alt_votes(btc_ticker):
+    # SOL/DOGE/XRP lean for the same 15m window (YES mid > 0.5); cached 20s. User live test Nov 7.
+    suf=btc_ticker.split('-',1)[1]; c=_altc.get(suf)
+    if c and time.time()-c[0]<20: return c[1]
+    v={}
+    for a in ('SOL','DOGE','XRP'):
+        try:
+            m=json.load(urllib.request.urlopen(f'https://api.elections.kalshi.com/trade-api/v2/markets/KX{a}15M-{suf}',timeout=5))['market']
+            b,k=float(m.get('yes_bid_dollars') or 0),float(m.get('yes_ask_dollars') or 0)
+            if b>0 and k>0: v[a]='YES' if (b+k)/2>0.5 else 'NO'
+        except Exception: pass
+    _altc[suf]=(time.time(),v); return v
 TREND_N=int(os.environ.get('TREND_N','3')); _trend={}
 def trend_dir(series):
     # direction of the last TREND_N settled 15m windows if they all agree ('YES'/'NO'), else None; cached 60s
@@ -411,6 +424,25 @@ def tick_once():
                     else:
                         with lock: t=pt.openTrade(a,rd,rask,rmp,k['strike'],k['close'],k['ticker'],rmeta)
                     if t: sg['action']=f'OPENED REVERSAL #{t["id"]} {rd} after 3x {td}'; sigs[a]=sg; continue
+        if ALT and a=='BTC' and 540<=left<=780 and not any(t.get('ticker')==k['ticker'] for t in pt.trades):
+            av=alt_votes(k['ticker'])
+            if len(av)==3 and len(set(av.values()))==1:
+                rd=list(av.values())[0]; rask=k['yesAsk'] if rd=='YES' else k['noAsk']
+                if 0<rask<=ALT_MAX:
+                    fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
+                    rmeta=dict(priceSource='kalshi',signalSource='alt-consensus',fade=True,altConsensus=True,altVotes=av)
+                    t=None
+                    if LV and LV.enabled():
+                        if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
+                            sz=pt.size(rd,rask,rmp)
+                            if sz:
+                                _as=lambda px,d=rd,m=rmp:None if px>ALT_MAX else (pt.size(d,px,m) or [None])[0]
+                                fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_as)
+                                if fill:
+                                    with lock: t=pt.openLive(a,rd,fill,k['strike'],k['close'],k['ticker'],rmeta,sz[1],sz[2])
+                    else:
+                        with lock: t=pt.openTrade(a,rd,rask,rmp,k['strike'],k['close'],k['ticker'],rmeta)
+                    if t: sg['action']=f'OPENED ALT-CONSENSUS #{t["id"]} {rd} (SOL/DOGE/XRP all {rd})'; sigs[a]=sg; continue
         if not dirn: sg['action']='skip: momentum/CVD disagree'
         elif est=='live' and mp is None: sg['action']='skip: no fresh EloEdge model_p'
         elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
