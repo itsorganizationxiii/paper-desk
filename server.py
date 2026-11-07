@@ -236,11 +236,16 @@ try:
     # single-owner lease: Render runs old+new instances together during a deploy; only the newest boot may trade or write the live doc
     INSTANCE=f'{os.getpid()}-{uuid.uuid4().hex[:8]}-{int(time.time())}'; _lease={'at':0,'ok':True}
     if MCOL is not None:
-        try: MCOL.replace_one({'_id':'lease'},{'_id':'lease','inst':INSTANCE,'at':time.time()},upsert=True)
+        try: MCOL.replace_one({'_id':'lease'},{'_id':'lease','inst':INSTANCE,'at':time.time(),'hb':time.time()},upsert=True)
         except Exception as e: print('lease claim err',e,flush=True)
         def _lease_ok():
             if time.time()-_lease['at']<3: return _lease['ok']
-            try: d=MCOL.find_one({'_id':'lease'}); _lease['ok']=(not d) or d.get('inst')==INSTANCE
+            try:
+                d=MCOL.find_one({'_id':'lease'}); now=time.time()
+                if (not d) or d.get('inst')==INSTANCE or now-float(d.get('hb',d.get('at',0)))>45:
+                    # owner heartbeats; a holder that stopped heartbeating (crashed/removed deploy) is taken over after 45s
+                    MCOL.replace_one({'_id':'lease'},{'_id':'lease','inst':INSTANCE,'at':d.get('at',now) if d and d.get('inst')==INSTANCE else now,'hb':now},upsert=True); _lease['ok']=True
+                else: _lease['ok']=False
             except Exception: pass
             _lease['at']=time.time(); return _lease['ok']
         LV.lease_ok=_lease_ok
