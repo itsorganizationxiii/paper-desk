@@ -141,6 +141,11 @@ def _idx_loop(owner):
                      startWindow=opn[0]['ticker'] if opn else None,endWindow=st[0]['ticker'] if st else None,
                      endResult=st[0].get('result') if st else None,endStrike=st[0].get('floor_strike') if st else None,
                      errStart=(avg-fs if avg and fs else None),errEnd=(avg-ev if avg and ev else None),venues=dict(ST['venues']))
+            ts=[x[0] for x in _sec if b-960<=x[0]<b]
+            gap=max((y-x for x,y in zip(ts,ts[1:])),default=999)
+            row['maxGapSec']=gap; row['firstSample']=ts[0] if ts else None
+            row['complete']=bool(ts and ts[0]<=b-955 and gap<=5 and n>=57 and ev is not None)
+            row['incompleteReason']=None if row['complete'] else ('restart/no data' if not ts or ts[0]>b-955 else ('stream gap %ss'%gap if gap>5 else ('few samples %d'%n if n<57 else 'no settlement')))
             if st and avg and st[0].get('floor_strike'):
                 row['rebuiltResult']='yes' if avg>=float(st[0]['floor_strike']) else 'no'
             _ins('idxcmp',row); ST['idxRows']+=1; done.add(b)
@@ -148,10 +153,10 @@ def _idx_loop(owner):
 def stats():
     c=_col.get('idxcmp')
     if c is None: return dict(ST,n=0)
-    rows=list(c.find({},{'_id':0}))
+    allr=list(c.find({},{'_id':0})); rows=[r for r in allr if r.get('complete')]
     errs=[abs(e) for r in rows for e in (r.get('errStart'),r.get('errEnd')) if e is not None]
     dis=[r for r in rows if r.get('rebuiltResult') and r.get('endResult')]
-    out=dict(ST,n=len(rows),errN=len(errs))
+    out=dict(ST,n=len(rows),excluded=len(allr)-len(rows),errN=len(errs))
     if errs:
         s=sorted(errs); out.update(meanAbsErr=round(sum(s)/len(s),3),stdErr=round(statistics.pstdev(s),3),p95AbsErr=round(s[min(len(s)-1,int(0.95*len(s)))],3))
     if dis: out['upDownDisagree']=round(sum(r['rebuiltResult']!=r['endResult'] for r in dis)/len(dis),4); out['disagreeN']=len(dis)
