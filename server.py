@@ -155,7 +155,7 @@ class PaperTrader:
         stake=SHADOW_USD if (sh or PAPER_FLAT) else round(bal*f,2)
         if stake<0.05: return None
         if not sh: s.balance-=stake
-        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=0 if sh else round(100*stake/bal,2),contracts=round(stake/ask,3),
+        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=0 if sh else round(100*stake/bal,2),contracts=round(max(stake-kalshi_fee(stake/ask,ask),0.01)/ask,3),entryFee=kalshi_fee(stake/ask,ask),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
         t['perpPremium']=perp_premium(asset); t['regime']=regime(asset); t['flowAtEntry']=flow(asset)
         s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True)
