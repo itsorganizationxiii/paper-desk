@@ -16,6 +16,9 @@ PORT=int(os.environ.get('PORT','8080')); START=float(os.environ.get('START_BALAN
 # Owner request Nov 8 9:12 AM ET: paper balance test at the real Kalshi balance. Pre-test paper balance was 2136.83. Set PAPER_TEST_AT=0 to restore (trades/logs kept).
 PAPER_TEST_AT=1794147162
 PAPER_TEST_START=15.12
+# Paper parity with live (Nov 8): paper stops/locks react on websocket quotes like live; paper buys re-check the fresh ask and skip if it ran >1c away.
+PAPER_WS_EXITS=True
+PAPER_FRESH_FILL=True
 KEY=os.environ.get('ELOEDGE_API_KEY','')
 KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange.coinbase.com'
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
@@ -149,6 +152,13 @@ class PaperTrader:
         print('ADOPT LIVE',t['id'],ticker,side,contracts,price,flush=True)
         return t
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
+        if PAPER_FRESH_FILL and not meta.get('shadow') and LV is not None:
+            try: fq=LV.wsq(ticker)
+            except Exception: fq=None
+            fa=None if not fq or fq.get('yesAsk') is None or fq.get('yesBid') is None else (fq['yesAsk'] if side=='YES' else round(1-fq['yesBid'],4))
+            if fa is not None:
+                if fa>ask+0.01: print('PAPER NOFILL',ticker,side,ask,fa,flush=True); return None
+                ask=fa
         sz=s.size(side,ask,p_yes)
         if not sz: return None
         f,edge,q=sz; bal=s.balance; sh=bool(meta.get('shadow'))
@@ -904,7 +914,7 @@ def _ws_quote(tk,q):
     try: tick_rec(tk,q)
     except Exception: pass
     if not (LV and LV.allowed()): return
-    ts=[t for t in list(pt.trades) if not t.get('shadow') and t.get('mode')=='live' and t.get('status')=='open' and t.get('ticker')==tk and not t.get('exiting')]
+    ts=[t for t in list(pt.trades) if not t.get('shadow') and (t.get('mode')=='live' or PAPER_WS_EXITS) and t.get('status')=='open' and t.get('ticker')==tk and not t.get('exiting')]
     if not ts or not LV.owner(): return
     if not lock.acquire(timeout=0.2): return
     try:
@@ -918,7 +928,7 @@ def _ws_quote(tk,q):
             if lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not LH.should_hold(t,log=_lh_log) and not (mp is not None and mp>=LOCK_HOLD_P):
                 f2=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'profitlock: ws quote, peak {t["peakBid"]:.3f} -> bid {bid:.3f}; fee ${f2:.2f}',fee=f2)
             elif bid>0 and bid<=stop_pct()*t['price']:
-                pt.exit(t,bid,f'stop: ws mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}')
+                pt.exit(t,bid,f'stop: ws mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}',fee=0 if t.get('mode')=='live' else kalshi_fee(t['contracts'],bid))
     finally: lock.release()
 if LV is not None and getattr(LV,'ws',None) is not None: LV.ws.on_quote=_ws_quote
 REENTRY_WAIT=60; REENTRY_MIN_LEFT=120
