@@ -16,3 +16,4 @@
     next buy after kill -> None kill switch: stale Kalshi data on 3 straight buy attempts
 - #4 logs: Mongo collection idxcmp per 15-min boundary: rebuilt, rebuiltMedian, floorStrike, expirationValue, errStart/errEnd (+Median), rebuiltResult vs endResult. Stats at /api/idxstats (mean, std, p95 abs error, Up/Down disagreement).
 - #1/#2 logs: Mongo collection books every 3s for BTC/ETH/SOL/XRP: ms (Kalshi Date-header clock offset applied), window, secsLeft, yes/no bid/ask, top-5 depth each side.
+- 2026-11-08 10:14 EST CF constituent list v13.7 (issued 24th August 2026), sha256 263998d7058ed59d; BRTI active: Bitstamp, Coinbase, Kraken, Gemini, Bullish, Crypto.com, LMAX Digital
