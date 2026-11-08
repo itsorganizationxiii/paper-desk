@@ -115,6 +115,11 @@ def run(pt,lock,L,live,col=None):
         if col is not None: col.insert_one({**{k:v for k,v in ST.items() if k!='_id'},'at':time.time()})
     except Exception as e: ST['err']=traceback.format_exc()[-400:]
 def start(pt,lock,L,live,col=None,delay=60):
+    try:
+        if col is not None:
+            last=col.find_one({'manual':{'$exists':True}},sort=[('at',-1)])
+            if last: ST['manual']=last['manual']; ST['recon']=last.get('recon'); ST['lastRunAt']=last.get('at')
+    except Exception as e: print('truthfix load err',e,flush=True)
     def go():
         time.sleep(delay)
         while L.lease_ok is not None and not L.owner(): time.sleep(10)
