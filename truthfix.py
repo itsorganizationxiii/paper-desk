@@ -32,9 +32,11 @@ def run(pt,lock,L,live,col=None):
         by={}
         for t in trades: by.setdefault(t['ticker'],[]).append(t)
         botTot=0.0; kalTot=0.0; per=[]
+        ST['total']=len(by); ST['done']=0; ST['errs']=[]
         for tk,ts in by.items():
+            ST['done']+=1; ST['cur']=tk
             try: k=ticker_pnl(L,live,tk)
-            except Exception as e: per.append(dict(ticker=tk,err=str(e)[:100])); continue
+            except Exception as e: per.append(dict(ticker=tk,err=str(e)[:100])); ST['errs'].append(tk+': '+str(e)[:80]); continue
             bp=round(sum(t.get('pnl') or 0 for t in ts),4); botTot+=bp; kalTot+=k['pnl']
             per.append(dict(ticker=tk,ids=[t['id'] for t in ts],bot=bp,kalshi=k['pnl'],diff=round(bp-k['pnl'],4)))
             with lock:
@@ -46,7 +48,7 @@ def run(pt,lock,L,live,col=None):
                         t['exitFee']=round(k['fees']-(t.get('entryFee') or 0),4)
                         if k['avgSell'] is not None: t['exitPrice']=round(k['avgSell'],4)
                         t['kalshiRecord']=k; ST['fixed'].append(dict(id=t['id'],old=old,new=k['pnl']))
-            time.sleep(0.3)
+            time.sleep(1.0)
         with lock: pt.save()
         bal=None
         try: bal=L.balance()
