@@ -19,6 +19,8 @@ PAPER_TEST_START=15.12
 # Paper parity with live (Nov 8): paper stops/locks react on websocket quotes like live; paper buys re-check the fresh ask and skip if it ran >1c away.
 PAPER_WS_EXITS=True
 PAPER_FRESH_FILL=True
+# Owner request Nov 8 9:36 AM ET: when live is paused, paper may enter on EloEdge direction even if momentum/CVD disagree (more test trades). Live unaffected.
+PAPER_LOOSE=True
 KEY=os.environ.get('ELOEDGE_API_KEY','')
 KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange.coinbase.com'
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
@@ -808,6 +810,7 @@ def tick_once():
         reok=False
         try: reok=(bool(LV and LV.enabled()) and any(t.get('ticker')==k['ticker'] for t in pt.trades) and reentry_ok(a,k,dirn,cb,left)) or False
         except Exception as e: print('reentry err',e,flush=True)
+        if PAPER_LOOSE and not dirn and not (LV and LV.enabled()) and mp is not None and abs(mp-0.5)>=0.05: dirn='YES' if mp>0.5 else 'NO'
         if not dirn: sg['action']='skip: momentum/CVD disagree'
         elif est=='live' and mp is None and a!='XRP': sg['action']='skip: no fresh EloEdge model_p'
         elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
