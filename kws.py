@@ -83,15 +83,22 @@ class Feed:
         out.sort(key=lambda t:t['ts_ms'])
         return out[:limit]
     def trade_flow(s):
-        now=time.time()*1000; tr=list(s.trades)
+        now=time.time()*1000; n=len(s.trades); old=s.trades[0]['ts_ms'] if n else None
         with s.lock: want=sorted(s.want)[-8:]
         per={}
+        tr=[]
+        for i in range(1,n+1):
+            try: t=s.trades[-i]
+            except IndexError: break
+            if now-t.get('rx_ms',t['ts_ms'])>120000: break
+            tr.append(t)
+        tr.reverse()
         for t in tr:
             if now-t['ts_ms']>60000 or t['market_ticker'] not in want: continue
             e=per.setdefault(t['market_ticker'],dict(yes=0.0,no=0.0,n=0)); e['n']+=1
             if t['taker_side'] in ('yes','no'): e[t['taker_side']]=round(e[t['taker_side']]+(t['count_fp'] or 0),2)
-        r1=len([t for t in tr if now-t['rx_ms']<=60000])
-        return dict(bufferSize=len(tr),oldestTsMs=tr[0]['ts_ms'] if tr else None,tradesLast60s=r1,totalSeen=s.tradeSeen,lastTradeAge=round(now/1000-s.tradeLast,1) if s.tradeLast else None,last60sByTicker=per)
+        r1=len([t for t in tr if now-t.get('rx_ms',t['ts_ms'])<=60000])
+        return dict(bufferSize=n,oldestTsMs=old,tradesLast60s=r1,totalSeen=s.tradeSeen,lastTradeAge=round(now/1000-s.tradeLast,1) if s.tradeLast else None,last60sByTicker=per)
     def _run(s):
         try: import websocket
         except Exception as e: s.err=f'websocket-client missing: {e}'; return

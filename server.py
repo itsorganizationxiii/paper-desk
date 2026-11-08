@@ -378,7 +378,9 @@ def is_shadow(t): return bool(t.get('shadow'))
 ALT=os.environ.get('ALT_CONSENSUS','1')!='0'; ALT_MAX=float(os.environ.get('ALT_MAX_PRICE','0.60')); _altc={}
 from altcap import state as alt_cap_state
 _alt_cap_skips=[]; _alt_cap_seen=set()
+ALT_CAP_ENABLED=False
 def alt_cap_allow(ticker,now=None):
+    if not ALT_CAP_ENABLED: return True
     cap=alt_cap_state(pt.trades,now)
     if not cap['blocked']: return True
     key=(ticker,cap['blockedUntil'],cap['reason'])
@@ -914,6 +916,31 @@ def loop():
         try: tick_once()
         except Exception as e: print('tick err',e,flush=True)
         time.sleep(LIVE_TICK if any(t.get('mode')=='live' and t['status']=='open' for t in pt.trades) else TICK)  # faster checks while a real position is open
+STATUS_TRADES=100
+STATUS_ORDERS=50
+STATUS_TRIGGERS=20
+def _newest_first(v):
+    a,b=v[0],v[-1]
+    ta=(a.get('at') or a.get('openedAt') or a.get('ts') or 0) if isinstance(a,dict) else 0
+    tb=(b.get('at') or b.get('openedAt') or b.get('ts') or 0) if isinstance(b,dict) else 0
+    return ta>tb
+def slim_status(d):
+    tr=d.get('trades') or []
+    d['tradesTotal']=len(tr)
+    if len(tr)>STATUS_TRADES:
+        keep=[t for t in tr if t.get('status')=='open']
+        keep+= [t for t in tr if t.get('status')!='open'][:STATUS_TRADES]
+        d['trades']=sorted(keep,key=lambda t:-(t.get('openedAt') or 0))
+        d['tradesTrimmed']=True
+    lv=d.get('live') or {}
+    if isinstance(lv.get('recentOrders'),list): lv['recentOrders']=lv['recentOrders'][:STATUS_ORDERS]
+    for sec in ('leadlag','ethlead','reentries','altCap','tradeFlow','reconcile'):
+        x=d.get(sec)
+        if not isinstance(x,dict): continue
+        for k,v in list(x.items()):
+            if isinstance(v,list) and len(v)>STATUS_TRIGGERS:
+                x[k+'Total']=len(v); x[k]=v[:STATUS_TRIGGERS] if _newest_first(v) else v[-STATUS_TRIGGERS:]
+    return d
 class H(SimpleHTTPRequestHandler):
     def __init__(s,*a,**k): super().__init__(*a,directory=APP,**k)
     def log_message(s,*a): pass
@@ -934,7 +961,8 @@ class H(SimpleHTTPRequestHandler):
                 d['reconcile']=dict(RECON.state)
                 d['deployment']='looser-lock-fast-stop-alt-cap-v3-tradefeed'
                 d['profitLock']=dict(weekend=wknd_night(),mode=WKND_MODE,upArmC=round(WKND_UP_ARM*100),upDropC=round(WKND_UP_DROP*100),downArmC=round(WKND_LOCK_ARM_C*100),downDropC=round(WKND_DROP*100),fixedPeakC=round(LOCK_PEAK*100))
-                d['altCap']=dict(alt_cap_state(pt.trades),enabled=ALT,recentSkips=list(_alt_cap_skips))
+                d['altCap']=dict(alt_cap_state(pt.trades),enabled=ALT,capEnabled=ALT_CAP_ENABLED,recentSkips=list(_alt_cap_skips))
+                if not ALT_CAP_ENABLED: d['altCap']['blocked']=False; d['altCap']['reason']=None; d['altCap']['blockedUntil']=None
                 d['stopExecution']=dict(limitAttempts=1,confirmation='single immediate order-status poll',confirmationWaitSec=0,aggressiveLimitC=1,preflightPosition=False)
                 _re=[t for t in pt.trades if t.get('reentry')]; _rc=[t for t in _re if t.get('status')!='open']
                 d['reentries']=dict(count=len(_re),open=len(_re)-len(_rc),closed=len(_rc),wins=len([t for t in _rc if (t.get('pnl') or 0)>0]),pnl=round(sum(t.get('pnl') or 0 for t in _rc),2))
@@ -947,6 +975,7 @@ class H(SimpleHTTPRequestHandler):
                     d['live']['cooldownsEnabled']=COOLDOWNS_ENABLED
                     d['live']['lossStreaks']=dict(_cool.get('streaks',{}))
                 except Exception as e: d['live']['cooldowns']={'error':str(e)}
+                if 'full=1' not in s.path: slim_status(d)
                 b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/trades.csv':

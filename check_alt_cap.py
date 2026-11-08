@@ -41,7 +41,7 @@ print('PASS most recent closed trade by timestamp, restart reconstruction, and o
 
 src=Path('server.py').read_text();tree=ast.parse(src)
 pt=SimpleNamespace(trades=[loss]);logs=[]
-g=dict(alt_cap_state=state,pt=pt,time=SimpleNamespace(time=lambda:NOW),_alt_cap_seen=set(),_alt_cap_skips=[],LV=SimpleNamespace(log=lambda **kw:logs.append(kw)))
+g=dict(ALT_CAP_ENABLED=True,alt_cap_state=state,pt=pt,time=SimpleNamespace(time=lambda:NOW),_alt_cap_seen=set(),_alt_cap_skips=[],LV=SimpleNamespace(log=lambda **kw:logs.append(kw)))
 exec(next(ast.get_source_segment(src,n) for n in tree.body if getattr(n,'name',None)=='alt_cap_allow'),g)
 assert not g['alt_cap_allow']('KXBTC15M-TEST',NOW)
 assert not g['alt_cap_allow']('KXBTC15M-TEST',NOW)
@@ -73,3 +73,8 @@ exec(wrapper,g)
 pt.trades=[loss];g['run_branch']();assert not buys
 pt.trades=[];g['run_branch']();assert len(buys)==1
 print('PASS actual server ALT branch refuses capped live buy and leaves uncapped live execution enabled')
+assert 'ALT_CAP_ENABLED=False' in src.splitlines()
+g['ALT_CAP_ENABLED']=False;buys.clear();pt.trades=[loss]
+assert original_allow('KXBTC15M-TEST',NOW)
+g['run_branch']();assert len(buys)==1
+print('PASS cap disabled by code flag: no hourly limit or post-loss block; cap logic kept for re-enable')
