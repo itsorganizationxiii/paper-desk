@@ -144,9 +144,10 @@ def _sampler():
         try: med,dm,n=consolidated(); t=int(time.time())
         except Exception as e:  # a feed thread mutated a book mid-read; skip this second, never kill the sampler
             ST['sampleErr']=f'{type(e).__name__}: {str(e)[:80]}'; ST['sampleErrN']=ST.get('sampleErrN',0)+1; continue
-        ST['samplerAt']=t
+        ST['samplerAt']=t; ST['sampleTicks']=ST.get('sampleTicks',0)+1
         if med:
-            row=(t,dm or med,n,med); _sec.append(row); _pend.append(row)
+            row=(t,dm or med,n,med); _sec.append(row); _pend.append(row); ST['samplesGenerated']=ST.get('samplesGenerated',0)+1
+        else: ST['samplesNoPrice']=ST.get('samplesNoPrice',0)+1  # <2 fresh venues: no sample (never fabricated)
 PEND_MAX=7200
 def _flush():
     """Write queued samples; a sample leaves the queue only once Mongo acked it (or it already exists). Failures retry next pass."""
@@ -246,7 +247,7 @@ def stats():
     by=collections.Counter(r.get('status') or ('LEGACY-COMPLETE' if r.get('complete') else 'LEGACY-EXCLUDED') for r in allr)
     errs=[abs(e) for r in rows for e in (r.get('errStart'),r.get('errEnd')) if e is not None]
     dis=[r for r in rows if r.get('rebuiltResult') and r.get('endResult')]
-    out.update(pendingWrites=len(_pend),settlementPending=sum(1 for r in rows if r.get('settlement')=='PENDING'),n=len(rows),windows=len(rows),excluded=len(allr)-len(rows),byStatus=dict(by),errN=len(errs),
+    out.update(pendingWrites=len(_pend),samplesQueued=len(_pend),samplesPersisted=ST.get('secWritten',0),samplesDropped=ST.get('secDropped',0),settlementPending=sum(1 for r in rows if r.get('settlement')=='PENDING'),n=len(rows),windows=len(rows),excluded=len(allr)-len(rows),byStatus=dict(by),errN=len(errs),
                recent=[{k:r.get(k) for k in ('boundary','status','incompleteReason','settlement','received','maxGapSec','closing60','spannedRestart')} for r in sorted(allr,key=lambda r:r['boundary'])[-8:]])
     if errs:
         s=sorted(errs); out.update(meanAbsErr=round(sum(s)/len(s),3),stdErr=round(statistics.pstdev(s),3),p95AbsErr=round(s[min(len(s)-1,int(0.95*len(s)))],3))
