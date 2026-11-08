@@ -45,3 +45,27 @@ Collector: complete-window rule added (windowlog.py): a window counts toward 300
 - Paper not evidence: DONE. Recorded as a standing rule; paper results are excluded from strategy decisions. Only live Kalshi fills and idxcmp/books window data count.
 - Paper fills at real ask/bid and real fees: DONE earlier (commit 516ad4f, 2df7d1e). Paper entry re-checks the Kalshi websocket ask at that moment and skips (PAPER NOFILL) if it moved >1c worse, else fills at that ask; entry fee = Kalshi fee ceil(0.07*C*P*(1-P)); paper stops/locks run on the same websocket bid as live and pay the Kalshi exit fee.
 - Hold-to-settlement P&L: DONE (already logged). Every exited trade carries counterfactualPnl (P&L if held to settlement), finalResult, wouldHaveWon and exitSavedPnl next to the actual pnl: 189/189 live exited, 813/813 paper exited. Settled trades: hold P&L = actual pnl.
+
+## hold_pnl (commit 26433aa, Nov 08 11:04 AM ET)
+hold_pnl = contracts*(won?1:0) - stake - entryFee (settled trades: = pnl). Auto-filled in settle(); backfilled 1085/1085. Exit type from exitReason prefix. Paper pre-real-fill rows not evidence.
+```
+live TOTAL n=198 exit=-13.45 hold=-17.76
+  flip n=4 exit=-0.57 hold=1.40 diff=-1.97
+  other:breakeven n=3 exit=-0.02 hold=-0.04 diff=0.02
+  other:closed outside bot ( n=1 exit=0.07 hold=-1.04 diff=1.10
+  other:paircash n=3 exit=1.23 hold=-0.90 diff=2.13
+  other:whale n=5 exit=1.26 hold=0.21 diff=1.05
+  profit lock n=67 exit=8.05 hold=18.90 diff=-10.85
+  settled n=9 exit=0.34 hold=0.34 diff=0.00
+  stop n=69 exit=-33.89 hold=-45.25 diff=11.36
+  take profit n=37 exit=10.08 hold=8.62 diff=1.46
+paper TOTAL n=878 exit=2127.00 hold=1492.41
+  flip n=20 exit=-1.44 hold=84.12 diff=-85.56
+  other:breakeven n=32 exit=-89.98 hold=131.96 diff=-221.94
+  other:whale n=39 exit=135.88 hold=-127.12 diff=263.00
+  profit lock n=244 exit=857.42 hold=538.94 diff=318.48
+  settled n=73 exit=111.57 hold=111.57 diff=0.00
+  stop n=163 exit=-1128.97 hold=-1340.32 diff=211.35
+  take profit n=307 exit=2242.52 hold=2093.26 diff=149.26
+{'pnl': 0.17, 'hold_pnl': 0.587, 'finalResult': 'no', 'exitReason': 'profitlock: ws quote, peak 0.820 -> bid 0.740; fee $0.03', 'price': 0.6}
+```
