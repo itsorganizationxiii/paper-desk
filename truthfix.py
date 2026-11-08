@@ -61,7 +61,7 @@ def run(pt,lock,L,live,col=None):
             note='balance change includes any deposits/withdrawals since the first live trade; Kalshi per-ticker P&L does not',
             worst=sorted([p for p in per if 'diff' in p],key=lambda p:-abs(p['diff']))[:15],errors=[p for p in per if 'err' in p])
         ST.update(ran=True,at=time.time())
-        if col is not None: col.insert_one(dict(at=time.time(),**{k:v for k,v in ST.items() if k!='_id'}))
+        if col is not None: col.insert_one({**{k:v for k,v in ST.items() if k!='_id'},'at':time.time()})
     except Exception as e: ST['err']=traceback.format_exc()[-400:]
 def start(pt,lock,L,live,col=None,delay=60):
     def go():
