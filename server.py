@@ -451,6 +451,62 @@ def pyth():
         if x: out[n]=dict(price=round(int(x['price']['price'])*10**x['price']['expo'],3),age_sec=round(now-x['price']['publish_time']))
     return out
 def heur(cb): return 1/(1+math.exp(-(cb['momentum']*300+cb['cvdRatio']*1.5)))
+from leadlag import LeadLag, entry_skip, MIN_LEFT as LL_MIN_LEFT, MAX_SIGNAL_AGE as LL_MAX_AGE, FRESH as LL_FRESH, MOVE as LL_MOVE, MAX_RETRACE as LL_RETRACE
+LL=LeadLag()
+def leadlag_entry(k):
+    # Only the normal strategy thread submits entries; websocket callbacks never wait for orders.
+    for ev in LL.drain():
+        try:
+            now=time.time(); tk=k['ticker']; side=ev['side']
+            with lock:
+                trades=list(pt.trades)
+            used=tk in LL.attempted or any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('leadlag') for t in trades)
+            held=any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('status')=='open' for t in trades)
+            reason=entry_skip(ev,tk,k['close']-now,used,held,'BTC' in cooldowns(now))
+            if reason is None and now-ev['at']>LL_MAX_AGE: reason='stale trigger'
+            if reason is None and not (LV and LV.enabled()): reason='live disabled/paused/not lease owner'
+            if reason is None and (tk in LV.tried or tk in LV.resting): reason='BTC order already working/tried'
+            if reason is None and any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!='BTC' and t.get('closesAt')==k['close'] and t.get('side')!=side for t in trades):
+                reason='opposite live coin position this window'
+            quote=LV.wsq(tk) if reason is None else None
+            if reason is None and (not quote or quote.get('yesBid') is None or quote.get('yesAsk') is None): reason='no fresh BTC websocket quote'
+            if reason is None and LL.caught_up(ev,(quote['yesBid']+quote['yesAsk'])/2): reason='BTC caught up before entry'
+            if reason is None:
+                with LL.lock:
+                    leader=LL.history.get(ev['triggerCoin'])
+                    latest=leader[1][-1] if leader and leader[0]==ev['triggerTicker'] else None
+                sign=1 if side=='YES' else -1
+                if not latest or now-latest[0]>LL_FRESH or sign*(latest[1]-ev['leaderBase'])+1e-9<max(LL_MOVE,abs(ev['move'])-LL_RETRACE):
+                    reason='leader stale or move retraced >2c'
+            if reason:
+                LL.finish(ev,reason); continue
+            ask=quote['yesAsk'] if side=='YES' else round(1-quote['yesBid'],4)
+            # This is a directional hypothesis, not an EloEdge probability estimate.
+            # Use the existing minimum-edge sizing adapter, exactly as alt-consensus does.
+            q=min(ask+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
+            def size_at(px):
+                if k['close']-time.time()<LL_MIN_LEFT or not LV.enabled() or shadow_asset('BTC'): return None
+                if WKND_MAX>0 and wknd_night() and px>WKND_MAX: return None
+                return (pt.size(side,px,mp) or [None])[0]
+            sz=pt.size(side,ask,mp)
+            if not sz or size_at(ask) is None:
+                LL.finish(ev,'normal entry price/edge filter'); continue
+            LL.attempted={x for x in LL.attempted if x==tk}
+            LL.attempted.add(tk)
+            LL.last_error=None
+            fill=LV.buy('BTC',tk,side,sz[0],ask,sizer=size_at)
+            if fill:
+                meta=dict(priceSource='kalshi',signalSource='leadlag',leadlag=True,
+                          leadlagTriggerCoin=ev['triggerCoin'],leadlagMove=ev['move'],
+                          leadlagBtcMove=ev['btcMove'],leadlagTriggerAt=ev['at'])
+                with lock: trade=pt.openLive('BTC',side,fill,k['strike'],k['close'],tk,meta,sz[1],sz[2])
+                LL.finish(ev,trade=trade)
+            else: LL.finish(ev,'no fill: '+str(LV.lastBuy or 'execution guard'))
+        except Exception as e:
+            LL.last_error=type(e).__name__
+            LL.finish(ev,'entry error: '+type(e).__name__)
+            print('leadlag entry error',type(e).__name__,flush=True)
+
 last_pyth=[0]
 def tick_once():
     src={}; spot={}; sigs={}
@@ -542,6 +598,7 @@ def tick_once():
         if a in METALS and (metals_closed() or metals_closed(k['close']-1)): sg['action']='skip: metals session closed (Kalshi 5-6 PM ET daily, Fri 5 PM-Sun 6 PM ET)'; sigs[a]=sg; continue
         mp=fresh(k['ticker']); sg['modelP']=mp
         left=k['close']-time.time(); sg['secsToClose']=round(left)
+        if a=='BTC': leadlag_entry(k)
         if REV and 600<=left<=840 and not any(t.get('ticker')==k['ticker'] for t in pt.trades):
             # reversal bet (user test, Nov 7): after 3+ same-way settles, buy the other side early in the window; backtest 59% wins
             td=trend_dir(k['ticker'].split('-')[0])
@@ -682,6 +739,8 @@ def _tick_writer():
             except Exception as e: TICKS['lastError']=f'stats: {e}'
 if TCOL is not None: threading.Thread(target=_tick_writer,daemon=True).start()
 def _ws_quote(tk,q):
+    try: LL.observe(tk,q)
+    except Exception: pass
     try: tick_rec(tk,q)
     except Exception: pass
     if not (LV and LV.enabled()): return
@@ -736,6 +795,7 @@ class H(SimpleHTTPRequestHandler):
                 live_on=bool(lv.get('enabled')); d['mode']='live' if live_on else 'paper'; d['liveCash']=lv.get('cash')
                 if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
                 d['ticks']=dict(TICKS,queued=len(_tq))
+                d['leadlag']=LL.snapshot(pt.trades)
                 _re=[t for t in pt.trades if t.get('reentry')]; _rc=[t for t in _re if t.get('status')!='open']
                 d['reentries']=dict(count=len(_re),open=len(_re)-len(_rc),closed=len(_rc),wins=len([t for t in _rc if (t.get('pnl') or 0)>0]),pnl=round(sum(t.get('pnl') or 0 for t in _rc),2))
                 try: d['live']['cooldowns']=cooldowns()
