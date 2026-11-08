@@ -7,6 +7,7 @@ from datetime import datetime
 BASE=os.environ.get('KALSHI_BASE_URL','https://api.elections.kalshi.com/trade-api/v2').rstrip('/')
 ENV_ALLOW=os.environ.get('LIVE_TRADING','0')=='1'
 BET_USD=1.00  # flat live stake per bet, set in code (0 = old %-of-balance sizing)
+def xrp_blocked(ticker): return 'XRP' in str(ticker or '').upper()
 def stake(usd,cash): return min(BET_USD,0.9*cash) if BET_USD>0 else usd
 MAX_USD=float(os.environ.get('LIVE_MAX_TRADE_USD','0')); DAILY_LOSS=float(os.environ.get('LIVE_DAILY_LOSS_USD','5'))
 _assets=os.environ.get('LIVE_ASSETS','').strip()
@@ -56,6 +57,7 @@ def _http(method,url,headers,body):  # replaceable in tests
         except Exception: d={}
         return e.code,d
 def api(method,path,body=None):
+    if method!='GET' and isinstance(body,dict) and xrp_blocked(body.get('ticker')): return 403,{'error':'blocked: XRP is shadow-only, never live'}
     ts=str(int(time.time()*1000))
     h={'Content-Type':'application/json','Accept':'application/json','User-Agent':'paper-desk-live/1.0',
        'KALSHI-ACCESS-KEY':_key_id(),'KALSHI-ACCESS-TIMESTAMP':ts,'KALSHI-ACCESS-SIGNATURE':sign(private_key(),ts,method,path)}
@@ -69,7 +71,7 @@ class Live:
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None
+        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.entry_block=None
         s.cash=None; s.cashAt=None; s.lastError=None; s.ws=None
         s.lease_ok=None  # set by server: False when a newer deploy instance owns live trading (Render overlap, Nov 7 #1033)
         if s.allowed():
@@ -177,6 +179,7 @@ class Live:
             return v if v and v>0 else None
         except Exception: return None
     def _order(s,ticker,side,action,count,px):
+        if xrp_blocked(ticker): return 0,0,None,0.0,None,'blocked: XRP is shadow-only, never live'
         # V2 single YES book: buy YES=bid@p, buy NO=ask@(1-p); sell YES=ask@p, sell NO=bid@(1-p)
         book='bid' if (action=='buy')==(side=='YES') else 'ask'; yes=px if side=='YES' else 1-px
         body=dict(ticker=ticker,client_order_id=f'pd-{uuid.uuid4().hex[:20]}',side=book,count=f'{count:.2f}',price=f'{max(0.01,min(0.99,yes)):.4f}',
@@ -213,6 +216,8 @@ class Live:
     def buy(s,asset,ticker,side,frac,ref,sizer=None):
         """Synchronous real buy. Returns dict(contracts,price,fee,cost,orderId,cash) when anything filled, else None (logged)."""
         a=dict(asset=asset,ticker=ticker,side=side)
+        if xrp_blocked(ticker) or xrp_blocked(asset): s.lastBuy='blocked'; return None
+        if s.entry_block and s.entry_block(asset,ticker): s.lastBuy='blocked'; return None
         with s.lock: s._rollday()
         if ASSETS is not None and asset not in ASSETS: return None
         if ticker in s.tried: return None
@@ -275,6 +280,8 @@ class Live:
     def rest_buy(s,asset,ticker,side,ref,sizer,wait=30,close_at=None):
         """Resting limit buy at the signal price: waits up to `wait`s for Kalshi to fill, then cancels the rest."""
         a=dict(asset=asset,ticker=ticker,side=side)
+        if xrp_blocked(ticker) or xrp_blocked(asset): return None
+        if s.entry_block and s.entry_block(asset,ticker): return None
         if ticker in s.resting or s.killed: return None
         s.resting.add(ticker)
         try:
@@ -350,6 +357,7 @@ class Live:
         finally: s.resting.discard(ticker)
     def sell(s,ticker,side,count,bid,floor=None):
         """Synchronous real sell of up to count. Returns (filled, avg price, fee, orderId, error)."""
+        if xrp_blocked(ticker): return 0,None,0.0,None,'blocked: XRP is shadow-only, never live'
         c=fc=0; fee=0.0; oid=None; err=None; px=None; proceeds=0.0
         p=s.position(ticker)
         if p is not None:

@@ -15,7 +15,7 @@ PORT=int(os.environ.get('PORT','8080')); START=float(os.environ.get('START_BALAN
 KEY=os.environ.get('ELOEDGE_API_KEY','')
 KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange.coinbase.com'
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
-SERIES={'BTC':'KXBTC15M','ETH':'KXETH15M','SOL':'KXSOL15M','GOLD':'KXGOLD15M','SILVER':'KXSILVER15M'}
+SERIES={'BTC':'KXBTC15M','ETH':'KXETH15M','SOL':'KXSOL15M','XRP':'KXXRP15M','GOLD':'KXGOLD15M','SILVER':'KXSILVER15M'}
 METALS={'GOLD':'PF_XAUUSD','SILVER':'PF_XAGUSD'}  # spot/momentum/flow from Kraken public futures (Coinbase has no metals)
 KF='https://futures.kraken.com'; ELO_COM='https://eloedge.com/api/v1/commodity15m/windows'; ELO_COM_TTL=int(os.environ.get('ELO_COM_TTL_SEC','30'))
 PYTH={'GOLD':'765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2','SILVER':'f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e','OIL':'f2464139c45f26097e0173b03207c4a490dbd8bf1b72dfbf064eeb832c7c2933'}
@@ -23,7 +23,8 @@ WHALE_WIN=60; WHALE_MAX_GIVEUP=0.10
 # per-asset whale cutoff, calibrated to 6h of Coinbase trades (Nov 2-3 2026): BTC max $200k, p99.99 $101k; ETH max $125k (outlier), p99.99 $38k
 WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),cap=float(os.environ.get('WHALE_CAP_BTC','150000')),p99mult=10,volfrac=0.5),
            'ETH':dict(floor=float(os.environ.get('WHALE_FLOOR_ETH','35000')),cap=float(os.environ.get('WHALE_CAP_ETH','60000')),p99mult=4,volfrac=0.5),
-           'SOL':dict(floor=float(os.environ.get('WHALE_FLOOR_SOL','25000')),cap=float(os.environ.get('WHALE_CAP_SOL','45000')),p99mult=4,volfrac=0.5)}
+           'SOL':dict(floor=float(os.environ.get('WHALE_FLOOR_SOL','25000')),cap=float(os.environ.get('WHALE_CAP_SOL','45000')),p99mult=4,volfrac=0.5),
+           'XRP':dict(floor=25000,cap=45000,p99mult=4,volfrac=0.5)}
 # take-profit: sell at bid (minus Kalshi taker fee) once our side's bid >= TP_BID, unless very confident it won't flip
 # profit lock arms once the bid is LOCK_ARM_C above ENTRY (so mid-range peaks 55c->76c->12c get protected),
 # or at the old fixed peaks, whichever comes first. LOCK_ARM_C=0 disables the entry-relative arm.
@@ -212,9 +213,10 @@ class PaperTrader:
                 expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2))
         pp=[t for t in s.trades if t.get('mode')!='live']; lt=[t for t in s.trades if t.get('mode')=='live']
         P=st(pp); Lv=st(lt); A=st(s.trades); o=[t for t in pp if t['status']=='open']
+        sh={f'{x} shadow':st([t for t in s.trades if is_shadow(t) and t.get('asset')==x]) for x in ('ETH','XRP')}
         return dict(mode='paper',balance=round(s.balance,2),paperBalance=round(s.balance,2),startBalance=s.start,
             equity=round(s.balance+sum(t.get('markPrice',t['price'])*t['contracts'] for t in o),2),
-            unrealizedPnl=P['unrealizedPnl'],winRate=P['winRate'],expectancy=P['expectancy'],paperStats=P,liveStats=Lv,
+            unrealizedPnl=P['unrealizedPnl'],winRate=P['winRate'],expectancy=P['expectancy'],paperStats=P,liveStats=Lv,shadowStats=sh,
             closed=A['closed'],open=A['open'],earlyExits=s.exitSummary(),trades=s.trades[::-1])
 LV=None
 lock=threading.Lock(); pt=PaperTrader()
@@ -249,6 +251,7 @@ try:
             except Exception: pass
             _lease['at']=time.time(); return _lease['ok']
         LV.lease_ok=_lease_ok
+    LV.entry_block=lambda asset,ticker:shadow_asset(str(asset).upper()) or 'XRP' in str(ticker).upper() or ('KXETH' in str(ticker).upper() and wknd_night())
     print('live mode:', 'LIVE' if LV.enabled() else ('paused' if LV.allowed() else 'off'),flush=True)
 except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print('live init err',LIVE_INIT_ERR,flush=True)
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
@@ -317,6 +320,10 @@ def wknd_night(ts=None):
     # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
     d=datetime.fromtimestamp(ts or time.time(),ET); wd,h=d.weekday(),d.hour
     return (wd==4 and h>=17) or wd in (5,6) or (wd==0 and h<9)
+def shadow_asset(a,ts=None):
+    # paper-only shadow (user Nov 7): XRP always; ETH on weekend nights. Never a live entry.
+    return a=='XRP' or (a=='ETH' and wknd_night(ts))
+def is_shadow(t): return bool(t.get('shadow'))
 ALT=os.environ.get('ALT_CONSENSUS','1')!='0'; ALT_MAX=float(os.environ.get('ALT_MAX_PRICE','0.60')); _altc={}
 def alt_votes(btc_ticker):
     # SOL/DOGE/XRP lean for the same 15m window (YES mid > 0.5); cached 20s. User live test Nov 7.
@@ -491,7 +498,7 @@ def tick_once():
                         t.update(tpHeld=True,tpHoldReason=why,tpSellPnl=sellpnl if 'tpSellPnl' not in t else t['tpSellPnl'])
                     else: tp=(fee,why)
                 if tp: pt.exit(t,bid,f'takeprofit: {tp[1]}; fee ${tp[0]:.2f}',fee=tp[0])
-                elif PAIR_TP>0 and bid>=t['price']+PAIR_TP and any(o is not t and o['status']=='open' and not o.get('exiting') and o.get('closesAt')==t.get('closesAt') and o['side']==t['side'] for o in pt.trades):
+                elif PAIR_TP>0 and bid>=t['price']+PAIR_TP and any(o is not t and o['status']=='open' and not o.get('exiting') and o.get('closesAt')==t.get('closesAt') and o['side']==t['side'] and is_shadow(o)==is_shadow(t) for o in pt.trades):
                     fp=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'paircash: up {bid-t["price"]:+.2f} with a same-side partner open; cash this one, partner rides the lock; fee ${fp:.2f}',fee=fp)
                 elif lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK), t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not (q is not None and q>=LOCK_HOLD_P):
                     f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)); pt.exit(t,bid,f'profitlock: {"night" if night() else "day"}, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
@@ -512,11 +519,12 @@ def tick_once():
             td=trend_dir(k['ticker'].split('-')[0])
             if td:
                 rd='NO' if td=='YES' else 'YES'; rask=k['yesAsk'] if rd=='YES' else k['noAsk']
-                if 0<rask<=REV_MAX and not any(t.get('status')=='open' and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
+                if 0<rask<=REV_MAX and not any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
                     fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
                     rmeta=dict(priceSource='kalshi',signalSource='reversal-after-3',fade=True,reversal=True,streak=td)
+                    if shadow_asset(a): rmeta=dict(rmeta,shadow=True,mode='shadow')
                     t=None
-                    if LV and LV.enabled():
+                    if LV and LV.enabled() and not shadow_asset(a):
                         if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
                             sz=pt.size(rd,rask,rmp)
                             if sz:
@@ -531,7 +539,7 @@ def tick_once():
             av=alt_votes(k['ticker'])
             if len(av)==3 and len(set(av.values()))==1:
                 rd=list(av.values())[0]; rask=k['yesAsk'] if rd=='YES' else k['noAsk']
-                if 0<rask<=ALT_MAX and not any(t.get('status')=='open' and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
+                if 0<rask<=ALT_MAX and not any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
                     fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
                     rmeta=dict(priceSource='kalshi',signalSource='alt-consensus',fade=True,altConsensus=True,altVotes=av)
                     t=None
@@ -547,17 +555,19 @@ def tick_once():
                         with lock: t=pt.openTrade(a,rd,rask,rmp,k['strike'],k['close'],k['ticker'],rmeta)
                     if t: sg['action']=f'OPENED ALT-CONSENSUS #{t["id"]} {rd} (SOL/DOGE/XRP all {rd})'; sigs[a]=sg; continue
         if not dirn: sg['action']='skip: momentum/CVD disagree'
-        elif est=='live' and mp is None: sg['action']='skip: no fresh EloEdge model_p'
+        elif est=='live' and mp is None and a!='XRP': sg['action']='skip: no fresh EloEdge model_p'
         elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
         elif cb['whale']['strongDir'] not in (None,dirn): sg['action']=f"skip: strong whale flow against (${cb['whale']['netFlowUsd']:,.0f})"
         elif left<60: sg['action']='skip: <60s to close'
         elif any(t.get('ticker')==k['ticker'] for t in pt.trades): sg['action']='holding/traded this window'
         else:
             used='coinbase+eloedge'
-            if mp is None: mp=heur(cb); used='coinbase-fallback (EloEdge unavailable)'
+            if mp is None: mp=heur(cb); used='coinbase-proxy (XRP shadow, no EloEdge)' if a=='XRP' else 'coinbase-fallback (EloEdge unavailable)'
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
             meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est)
             q=mp if dirn=='YES' else 1-mp
+            shd=shadow_asset(a)
+            if shd: meta=dict(meta,shadow=True,mode='shadow',shadowTag=f'{a} shadow')
             if FADE and WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE:
                 # fade test: weekend-night 20c+ edges went 0/4, so buy the other side, sized as a minimum-edge bet
                 oe=round(q-ask,3); dirn='NO' if dirn=='YES' else 'YES'; ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
@@ -565,10 +575,10 @@ def tick_once():
                 meta=dict(meta,fade=True,fadeOrigEdge=oe)
             td=trend_dir(k['ticker'].split('-')[0]) if TREND_N>0 else None
             if td and td!=dirn: meta=dict(meta,againstTrend=td)  # log-only: data showed 3-in-a-row reverses ~59%
-            if any(t.get('status')=='open' and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=dirn for t in pt.trades):
+            if any(t.get('status')=='open' and is_shadow(t)==shd and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=dirn for t in pt.trades):
                 sg['action']='skip: opposite side of another coin open this window (BTC/ETH settle together ~84%)'; sigs[a]=sg; continue
             if WKND_MAX>0 and wknd_night() and ask>WKND_MAX: sg['action']=f'skip: weekend-night price cap ({ask:.2f} > {WKND_MAX:.2f})'; sigs[a]=sg; continue
-            if LV and LV.enabled():
+            if LV and LV.enabled() and not shd:
                 sz=pt.size(dirn,ask,mp); t=None
                 if sz:
                     if k['ticker'] in LV.tried or k['ticker'] in LV.resting: sg['action']='live: order working / already tried this window'; sigs[a]=sg; continue
@@ -587,7 +597,7 @@ def tick_once():
                 sg['action']=f'OPENED LIVE #{t["id"]}' if t else ('live: no fill / edge gone at live price (see live order log)' if sz else (f'skip: weekend-night edge too big ({q-ask:+.3f} > {WKND_MAX_EDGE})' if WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE else f'skip: edge {q-ask:+.3f} < {need_edge()}'))
             else:
                 with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],meta)
-                sg['action']=f'OPENED #{t["id"]}' if t else (f'skip: weekend-night edge too big ({q-ask:+.3f} > {WKND_MAX_EDGE})' if WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE else f'skip: edge {q-ask:+.3f} < {need_edge()}')
+                sg['action']=(f'OPENED {a} SHADOW #{t["id"]} (paper only)' if shd else f'OPENED #{t["id"]}') if t else (f'skip: weekend-night edge too big ({q-ask:+.3f} > {WKND_MAX_EDGE})' if WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE else f'skip: edge {q-ask:+.3f} < {need_edge()}')
         sigs[a]=sg
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
