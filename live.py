@@ -17,8 +17,8 @@ ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for
 HARD_MAX_USD=2.0
 STALE_GUARD=True
 STALE_KILL_N=3
-HARD_DAILY_LOSS=3.0
-def _daily_cap(): return min(DAILY_LOSS,HARD_DAILY_LOSS) if DAILY_LOSS>0 else HARD_DAILY_LOSS
+HARD_DAILY_LOSS=0.0
+def _daily_cap(): return DAILY_LOSS if DAILY_LOSS>0 else (HARD_DAILY_LOSS if HARD_DAILY_LOSS>0 else float("inf"))
 SHARD=int(os.environ.get('LIVE_EXCHANGE_INDEX','2')); SWEEP=os.environ.get('LIVE_SWEEP','1')=='1'; BUY_SLIP=0.02; SELL_BUF=0.02; STOP_LIMIT_BUF=0.02; STOP_LIMIT_TRIES=1; STOP_RETRY_SEC=0.0; STOP_CONFIRM=(1,0); MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
 def _key_id(): return os.environ.get('KALSHI_API_KEY_ID','').strip()
 def load_pem():
