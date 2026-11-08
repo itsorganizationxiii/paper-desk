@@ -870,6 +870,9 @@ import collections
 _tq=collections.deque(maxlen=TICK_MAXQ); _tlast={}
 TICKS=dict(enabled=False,recorded=0,dropped=0,deduped=0,flushErrors=0,lastFlush=None,lastError=None,count=None,sizeMB=None,storageMB=None,paused=False,ttlDays=TICK_TTL_DAYS,maxMB=TICK_MAX_MB,ratePerMin=None)
 TCOL=MCOL.database['ticks'] if MCOL is not None else None
+import windowlog as WL
+try: WL.start(MCOL.database if MCOL is not None else None,owner=lambda:(LV is None or LV.lease_ok is None or LV.owner()))
+except Exception as _e: print('windowlog start err',_e,flush=True)
 def tick_rec(tk,q):
     if TCOL is None or TICKS['paused']: return
     row=(q.get('yesBid'),q.get('yesAsk'),q.get('noBid'),q.get('noAsk'),q.get('last'))
@@ -1097,6 +1100,7 @@ class H(SimpleHTTPRequestHandler):
                     b=json.dumps({'count':len(rows),'limit':lim,'rows':rows}).encode()
                 except Exception as e: b=json.dumps({'error':str(e)[:200],'rows':[]}).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/idxstats': b=json.dumps(WL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p in('/','/index.html','/manifest.json'): super().do_GET()
         else: s.send_error(404)
