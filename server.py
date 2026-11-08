@@ -582,12 +582,15 @@ def tick_once():
                     else:
                         with lock: t=pt.openTrade(a,rd,rask,rmp,k['strike'],k['close'],k['ticker'],rmeta)
                     if t: sg['action']=f'OPENED ALT-CONSENSUS #{t["id"]} {rd} (SOL/DOGE/XRP all {rd})'; sigs[a]=sg; continue
+        reok=False
+        try: reok=bool(LV and LV.enabled()) and any(t.get('ticker')==k['ticker'] for t in pt.trades) and reentry_ok(a,k,dirn,cb,left)
+        except Exception as e: print('reentry err',e,flush=True)
         if not dirn: sg['action']='skip: momentum/CVD disagree'
         elif est=='live' and mp is None and a!='XRP': sg['action']='skip: no fresh EloEdge model_p'
         elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
         elif cb['whale']['strongDir'] not in (None,dirn): sg['action']=f"skip: strong whale flow against (${cb['whale']['netFlowUsd']:,.0f})"
         elif left<60: sg['action']='skip: <60s to close'
-        elif any(t.get('ticker')==k['ticker'] for t in pt.trades): sg['action']='holding/traded this window'
+        elif any(t.get('ticker')==k['ticker'] for t in pt.trades) and not reok: sg['action']='holding/traded this window'
         else:
             used='coinbase+eloedge'
             if mp is None: mp=heur(cb); used='coinbase-proxy (XRP shadow, no EloEdge)' if a=='XRP' else 'coinbase-fallback (EloEdge unavailable)'
@@ -595,6 +598,8 @@ def tick_once():
             meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est)
             q=mp if dirn=='YES' else 1-mp
             shd=shadow_asset(a)
+            if reok and not shd:
+                meta=dict(meta,reentry=True,signalSource=used+'+reentry'); LV.tried.discard(k['ticker'])
             if shd: meta=dict(meta,shadow=True,mode='shadow',shadowTag=f'{a} shadow')
             if FADE and WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE:
                 # fade test: weekend-night 20c+ edges went 0/4, so buy the other side, sized as a minimum-edge bet
@@ -697,6 +702,21 @@ def _ws_quote(tk,q):
                 pt.exit(t,bid,f'stop: ws mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}')
     finally: lock.release()
 if LV is not None and getattr(LV,'ws',None) is not None: LV.ws.on_quote=_ws_quote
+REENTRY_WAIT=60; REENTRY_MIN_LEFT=120
+def reentry_ok(a,k,dirn,cb,left,now=None):
+    # one live re-buy per window, same side, only after a profit-lock exit
+    now=now or time.time()
+    if not dirn or left<REENTRY_MIN_LEFT or shadow_asset(a) or 'XRP' in str(k.get('ticker')): return False
+    ts=[t for t in pt.trades if t.get('ticker')==k['ticker'] and not t.get('shadow')]
+    if not ts or any(t.get('status')=='open' or t.get('reentry') or t.get('exiting') for t in ts): return False
+    lv=[t for t in ts if t.get('mode')=='live']
+    if len(lv)!=1 or len(ts)!=1: return False
+    t=lv[0]
+    if t.get('status')!='exited' or not str(t.get('exitReason','')).startswith('profitlock') or t.get('side')!=dirn: return False
+    if now-(t.get('closedAt') or now)<REENTRY_WAIT: return False
+    up=dirn=='YES'; st=k.get('strike'); sp=cb.get('spot'); mom=cb.get('momentum') or 0
+    side_ok=(st is not None and sp is not None and (sp>st if up else sp<st)) or (mom>0 if up else mom<0)
+    return bool(side_ok)
 def loop():
     while True:
         if LV is not None and LV.lease_ok is not None and not LV.owner(): time.sleep(5); continue  # newer instance owns trading; stale one idles
@@ -716,6 +736,8 @@ class H(SimpleHTTPRequestHandler):
                 live_on=bool(lv.get('enabled')); d['mode']='live' if live_on else 'paper'; d['liveCash']=lv.get('cash')
                 if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
                 d['ticks']=dict(TICKS,queued=len(_tq))
+                _re=[t for t in pt.trades if t.get('reentry')]; _rc=[t for t in _re if t.get('status')!='open']
+                d['reentries']=dict(count=len(_re),open=len(_re)-len(_rc),closed=len(_rc),wins=len([t for t in _rc if (t.get('pnl') or 0)>0]),pnl=round(sum(t.get('pnl') or 0 for t in _rc),2))
                 try: d['live']['cooldowns']=cooldowns()
                 except Exception as e: d['live']['cooldowns']={'error':str(e)}
                 b=json.dumps(d).encode()
