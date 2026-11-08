@@ -12,7 +12,7 @@ def stake(usd,cash): return min(BET_USD,0.9*cash) if BET_USD>0 else usd
 MAX_USD=float(os.environ.get('LIVE_MAX_TRADE_USD','0')); DAILY_LOSS=float(os.environ.get('LIVE_DAILY_LOSS_USD','5'))
 _assets=os.environ.get('LIVE_ASSETS','').strip()
 ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for a in _assets.split(',') if a.strip()}
-SHARD=int(os.environ.get('LIVE_EXCHANGE_INDEX','2')); SWEEP=os.environ.get('LIVE_SWEEP','1')=='1'; BUY_SLIP=0.02; SELL_BUF=0.02; MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
+SHARD=int(os.environ.get('LIVE_EXCHANGE_INDEX','2')); SWEEP=os.environ.get('LIVE_SWEEP','1')=='1'; BUY_SLIP=0.02; SELL_BUF=0.02; STOP_LIMIT_BUF=0.02; STOP_LIMIT_TRIES=3; STOP_RETRY_SEC=0.8; MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
 def _key_id(): return os.environ.get('KALSHI_API_KEY_ID','').strip()
 def load_pem():
     b=os.environ.get('KALSHI_PRIVATE_KEY_B64','').strip()
@@ -381,6 +381,37 @@ class Live:
         if fc: s.cashAt=None
         s.log(action='sell',ticker=ticker,side=side,orderId=oid,want=count,limit=px,filled=fc,fillPrice=round(proceeds/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc>=count else 'partial/no fill; rest held'))
         return fc,(round(proceeds/fc,4) if fc else None),round(fee,4),oid,err
+    def stop_sell(s,ticker,side,count,stop,bid,trig_at=None):
+        """Limit-protected stop: up to 3 IOC sells at max(1c, stop-2c), then the normal aggressive sell for anything left."""
+        if xrp_blocked(ticker): return 0,None,0.0,None,'blocked: XRP is shadow-only, never live'
+        trig_at=trig_at or time.time(); lim=max(0.01,round(stop-STOP_LIMIT_BUF,2))
+        fc=0.0; fee=0.0; proceeds=0.0; oid=None; err=None; tries=0
+        p=s.position(ticker)
+        if p is not None:
+            have=p if side=='YES' else -p
+            if have<=0.0:
+                s.log(action='stop-sell',ticker=ticker,side=side,want=count,filled=0,error=f'Kalshi holds no {side} here (net {p}); not selling'); return 0,None,0.0,None,'no position'
+            count=min(count,round(have,2))
+        for attempt in range(STOP_LIMIT_TRIES):
+            left=round(count-fc,2)
+            if left<=0: break
+            q=s._quote(ticker,side,'bid') if attempt else bid
+            if q is not None and q>=lim:
+                tries+=1
+                c,f1,p1,fe1,oid1,e1=s._order(ticker,side,'sell',left,lim)
+                if f1>0: proceeds+=f1*(p1 if p1 is not None else lim); fc+=f1; fee+=fe1; oid=oid1
+                if e1 and 'stale instance' in str(e1): err=e1; break
+            if fc<count-0.001 and attempt<STOP_LIMIT_TRIES-1: time.sleep(STOP_RETRY_SEC)
+        lim_fc=fc; fb=False
+        if fc<count-0.001 and not err:
+            fb=True
+            f2,p2,fe2,o2,e2=s.sell(ticker,side,round(count-fc,2),s._quote(ticker,side,'bid') or bid)
+            if f2: proceeds+=f2*p2; fc+=f2; fee+=fe2; oid=o2 or oid
+            err=e2
+        fpx=round(proceeds/fc,4) if fc else None
+        s.log(action='stop-sell',ticker=ticker,side=side,want=count,stopLevel=round(stop,4),limit=lim,bidAtTrigger=bid,triggerAt=round(trig_at,3),limitTries=tries,limitFilled=lim_fc,
+              fallback=fb,filled=fc,fillPrice=fpx,fillAt=round(time.time(),3),slipC=round((stop-fpx)*100,1) if fpx is not None else None,fee=round(fee,4),error=err)
+        return fc,fpx,round(fee,4),oid,err
     def status(s):
         with s.lock: s._rollday()
         if s.allowed() and (s.cashAt is None or time.time()-s.cashAt>60):

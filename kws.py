@@ -5,7 +5,7 @@ WS_URL=None; FRESH=3.0
 class Feed:
     def __init__(s,url,headers_fn):
         s.url=url; s.hdr=headers_fn; s.q={}; s.want=set(); s.subbed=set(); s.ws=None; s.connected=False
-        s.lastMsg=None; s.err=None; s.lock=threading.Lock(); s.mid=0; s.reconnects=0
+        s.lastMsg=None; s.err=None; s.lock=threading.Lock(); s.mid=0; s.reconnects=0; s.on_quote=None
         threading.Thread(target=s._run,daemon=True).start()
     def watch(s,ticker):
         if not ticker: return
@@ -47,6 +47,10 @@ class Feed:
         yb=f('yes_bid'); ya=f('yes_ask')
         ts=m.get('ts_ms'); ts=ts/1000 if isinstance(ts,(int,float)) else (m.get('ts') if isinstance(m.get('ts'),(int,float)) else None)
         s.q[tk]=dict(yesBid=yb if yb is not None else old.get('yesBid'),yesAsk=ya if ya is not None else old.get('yesAsk'),ts=ts,rx=time.time())
+        cb=s.on_quote
+        if cb:
+            try: cb(tk,s.q[tk])
+            except Exception as e: s.err=f'on_quote: {e}'
     def _run(s):
         try: import websocket
         except Exception as e: s.err=f'websocket-client missing: {e}'; return

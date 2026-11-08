@@ -150,13 +150,20 @@ class PaperTrader:
     def exitLive(s,t,bid,reason):
         # real sell runs off the lock; trade stays 'open' (flagged exiting) until the fill is known
         if not (LV and LV.allowed()): t['liveSellError']='live disabled (env/keys); holding to settlement'; return
-        t['exiting']=reason; threading.Thread(target=s._sellLive,args=(t,bid,reason),daemon=True).start()
+        if t.get('exiting'): return
+        t['exiting']=reason; t['exitTrigAt']=time.time(); t['exitTrigBid']=round(bid,4)
+        threading.Thread(target=s._sellLive,args=(t,bid,reason),daemon=True).start()
     def _sellLive(s,t,bid,reason):
         floor=round(t['price']+0.01,2) if str(reason).lower().startswith(('profitlock','take','tp','breakeven')) is True and not str(reason).lower().startswith('breakeven') else None  # profit exits never sell below entry
-        try: fc,fpx,fee,oid,err=LV.sell(t['ticker'],t['side'],t['contracts'],bid,floor=floor)
+        isstop=str(reason).lower().startswith('stop')
+        stl=round(stop_pct()*t['price'],4)
+        try:
+            if isstop: fc,fpx,fee,oid,err=LV.stop_sell(t['ticker'],t['side'],t['contracts'],stl,bid,t.get('exitTrigAt'))
+            else: fc,fpx,fee,oid,err=LV.sell(t['ticker'],t['side'],t['contracts'],bid,floor=floor)
         except Exception as e: fc,fpx,fee,oid,err=0,None,0.0,None,f'{type(e).__name__}: {e}'
         with lock:
             t.pop('exiting',None)
+            if isstop and fc>0: t.update(stopLevel=stl,stopBidAtTrigger=t.get('exitTrigBid'),stopTriggerAt=t.get('exitTrigAt'),stopFillPrice=fpx,stopFillAt=time.time(),stopSlipC=round((stl-fpx)*100,1) if fpx is not None else None)
             if fc<=0: t.update(liveSellError=err or 'no fill',liveSellAt=time.time()); s.save(); return
             share=min(1.0,fc/t['contracts']); realized=round(fc*fpx-fee-t['stake']*share,2)
             if share>=0.999:
@@ -604,6 +611,25 @@ def tick_once():
     fb=src.get('eloedge')!='live'
     status.update(metalsClosed=metals_closed(),nightMode=night(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
         signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
+def _ws_quote(tk,q):
+    if not (LV and LV.enabled()): return
+    ts=[t for t in list(pt.trades) if t.get('mode')=='live' and t.get('status')=='open' and t.get('ticker')==tk and not t.get('exiting')]
+    if not ts: return
+    if not lock.acquire(timeout=0.2): return
+    try:
+        now=time.time()
+        for t in ts:
+            if t['status']!='open' or t.get('exiting') or now>=t['closesAt'] or now-(t.get('liveSellAt') or 0)<3: continue
+            yb,ya=q.get('yesBid'),q.get('yesAsk')
+            bid=yb if t['side']=='YES' else (None if ya is None else round(1-ya,4))
+            if bid is None: continue
+            t['peakBid']=round(max(t.get('peakBid') or 0,bid),4); mp=t.get('currentModelP')
+            if lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not (mp is not None and mp>=LOCK_HOLD_P):
+                f2=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'profitlock: ws quote, peak {t["peakBid"]:.3f} -> bid {bid:.3f}; fee ${f2:.2f}',fee=f2)
+            elif bid>0 and bid<=stop_pct()*t['price']:
+                pt.exit(t,bid,f'stop: ws mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}')
+    finally: lock.release()
+if LV is not None and getattr(LV,'ws',None) is not None: LV.ws.on_quote=_ws_quote
 def loop():
     while True:
         if LV is not None and LV.lease_ok is not None and not LV.owner(): time.sleep(5); continue  # newer instance owns trading; stale one idles
