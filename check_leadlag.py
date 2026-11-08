@@ -1,3 +1,4 @@
+import leadlag as leadlag_mod
 """Offline deterministic lead-lag and server-entry tests. Never contacts Kalshi."""
 import ast
 import threading
@@ -73,13 +74,15 @@ class FakePT:
         t=dict(id=len(self.trades)+1,asset=asset,side=side,mode='live',status='open',ticker=tk,closesAt=close,**meta)
         self.trades.append(t); return t
 
-def harness(ll=None,left=400,trades=None,cool=False):
+def harness(ll=None,left=400,trades=None,cool=False,mp=0.7):
     L=FakeLV(); pt=FakePT(); pt.trades=list(trades or [])
     g=dict(LL=ll or scenario(),LV=L,pt=pt,time=SimpleNamespace(time=lambda:NOW),lock=threading.Lock(),
            cooldowns=lambda now=None: {'BTC':{}} if cool else {},entry_skip=entry_skip,
            LL_MIN_LEFT=180,LL_MAX_AGE=20,LL_FRESH=10,LL_MOVE=0.08,LL_RETRACE=0.02,is_shadow=lambda t:False,shadow_asset=lambda a:cool,
            WKND_MAX=0.69,wknd_night=lambda:True,need_edge=lambda:0.07,up_tilt_skip=lambda *a:False)
+    g['leadlag']=leadlag_mod
     exec(code,g)
+    _e=g['leadlag_entry']; g['leadlag_entry']=lambda kk,_e=_e,_m=mp: _e(kk,_m)
     k=dict(ticker=BTC,close=NOW+left,strike=100)
     g['leadlag_entry'](k)
     return g,L,pt,k
@@ -113,4 +116,7 @@ assert snap['lastTrigger']['triggerCoin']=='SOL'
 for i in range(300): ll.events.append(dict(at=i))
 assert len(ll.snapshot([])['triggers'])==200
 print('PASS status fields and bounded 200-trigger log')
+g,L,pt,k=harness(mp=0.55); assert not L.calls
+g,L,pt,k=harness(mp=None); assert not L.calls
+print('PASS leadlag needs EloEdge p >= 60% for our side')
 print('ALL LEADLAG TESTS PASSED (offline; no real orders)')

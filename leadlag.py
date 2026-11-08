@@ -13,6 +13,8 @@ MAX_SIGNAL_AGE = 20
 MAX_SPREAD = 0.10
 MAX_RETRACE = 0.02
 MAX_LOG = 200
+# Owner request Nov 8 3:50 AM ET: require fresh EloEdge model p for our side >= this (None/missing skips)
+MIN_MODEL_P = 0.60
 
 
 def entry_skip(event, ticker, left, used=False, held=False, cooldown=False):

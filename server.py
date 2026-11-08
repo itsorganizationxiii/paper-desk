@@ -498,8 +498,9 @@ def pyth():
     return out
 def heur(cb): return 1/(1+math.exp(-(cb['momentum']*300+cb['cvdRatio']*1.5)))
 from leadlag import LeadLag, entry_skip, MIN_LEFT as LL_MIN_LEFT, MAX_SIGNAL_AGE as LL_MAX_AGE, FRESH as LL_FRESH, MOVE as LL_MOVE, MAX_RETRACE as LL_RETRACE
+import leadlag
 LL=LeadLag()
-def leadlag_entry(k):
+def leadlag_entry(k,model_p=None):
     # Only the normal strategy thread submits entries; websocket callbacks never wait for orders.
     for ev in LL.drain():
         try:
@@ -527,6 +528,11 @@ def leadlag_entry(k):
                 sign=1 if side=='YES' else -1
                 if not latest or now-latest[0]>LL_FRESH or sign*(latest[1]-ev['leaderBase'])+1e-9<max(LL_MOVE,abs(ev['move'])-LL_RETRACE):
                     reason='leader stale or move retraced >2c'
+            if reason is None:
+                _qs=None if model_p is None else (model_p if side=='YES' else 1-model_p)
+                ev['eloP']=None if _qs is None else round(_qs,4)
+                if _qs is None: reason='no fresh EloEdge model p'
+                elif _qs+1e-9<leadlag.MIN_MODEL_P: reason='EloEdge model p below 60%'
             if reason:
                 LL.finish(ev,reason); continue
             ask=quote['yesAsk'] if side=='YES' else round(1-quote['yesBid'],4)
@@ -547,7 +553,7 @@ def leadlag_entry(k):
             if fill:
                 meta=dict(priceSource='kalshi',signalSource='leadlag',leadlag=True,
                           leadlagTriggerCoin=ev['triggerCoin'],leadlagMove=ev['move'],
-                          leadlagBtcMove=ev['btcMove'],leadlagTriggerAt=ev['at'])
+                          leadlagBtcMove=ev['btcMove'],leadlagTriggerAt=ev['at'],leadlagEloP=ev.get('eloP'))
                 with lock: trade=pt.openLive('BTC',side,fill,k['strike'],k['close'],tk,meta,sz[1],sz[2])
                 LL.finish(ev,trade=trade)
             else: LL.finish(ev,'no fill: '+str(LV.lastBuy or 'execution guard'))
@@ -693,7 +699,7 @@ def tick_once():
         if a in METALS and (metals_closed() or metals_closed(k['close']-1)): sg['action']='skip: metals session closed (Kalshi 5-6 PM ET daily, Fri 5 PM-Sun 6 PM ET)'; sigs[a]=sg; continue
         mp=fresh(k['ticker']); sg['modelP']=mp
         left=k['close']-time.time(); sg['secsToClose']=round(left)
-        if a=='BTC': leadlag_entry(k)
+        if a=='BTC': leadlag_entry(k,mp)
         if a=='BTC': ethlead_entry(k)
         if REV and 600<=left<=840 and not any(t.get('ticker')==k['ticker'] for t in pt.trades):
             # reversal bet (user test, Nov 7): after 3+ same-way settles, buy the other side early in the window; backtest 59% wins
