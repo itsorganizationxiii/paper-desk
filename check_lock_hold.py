@@ -1,4 +1,5 @@
 import time,lockhold as LH
+LH.LOCK_HOLD_ENABLED=True
 fails=0
 def ok(c,m):
     global fails

@@ -1,5 +1,5 @@
 import time
-LOCK_HOLD_ENABLED=True
+LOCK_HOLD_ENABLED=False
 LOCK_HOLD_MIN_P=0.73
 LOCK_HOLD_MAX_AGE=60
 def model_p(t,now=None):

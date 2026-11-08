@@ -32,7 +32,7 @@ WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),ca
 # take-profit: sell at bid (minus Kalshi taker fee) once our side's bid >= TP_BID, unless very confident it won't flip
 # profit lock arms once the bid is LOCK_ARM_C above ENTRY (so mid-range peaks 55c->76c->12c get protected),
 # or at the old fixed peaks, whichever comes first. LOCK_ARM_C=0 disables the entry-relative arm.
-LOCK_PEAK=0.80; LOCK_DROP=0.10; BIG_RUN=float(os.environ.get('LOCK_BIG_RUN','0.20')); BIG_DROP=float(os.environ.get('LOCK_BIG_DROP','0.05')); LOCK_HOLD_P=0.90
+LOCK_PEAK=0.80; LOCK_DROP=0.10; BIG_RUN=float(os.environ.get('LOCK_BIG_RUN','0.20')); BIG_DROP=float(os.environ.get('LOCK_BIG_DROP','0.05')); LOCK_HOLD_P=1.01
 LOCK_ARM_C=float(os.environ.get('LOCK_ARM_C','0.10'))
 # Weekend lock thresholds are code constants, not deployment overrides.
 WKND_LOCK_ARM_C=0.20
