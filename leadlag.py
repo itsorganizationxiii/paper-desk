@@ -20,8 +20,6 @@ LEADLAG_PAUSED = True
 
 
 def entry_skip(event, ticker, left, used=False, held=False, cooldown=False):
-    if LEADLAG_PAUSED:
-        return 'paused by user'
     if not ticker.startswith('KXBTC15M-') or event['ticker'] != ticker:
         return 'not matching BTC window'
     if left < MIN_LEFT:

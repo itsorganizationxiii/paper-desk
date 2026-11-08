@@ -147,7 +147,7 @@ class PaperTrader:
         sz=s.size(side,ask,p_yes)
         if not sz: return None
         f,edge,q=sz; bal=s.balance; sh=bool(meta.get('shadow'))
-        stake=SHADOW_USD if sh else round(bal*f,2)
+        stake=SHADOW_USD if (sh or PAPER_FLAT) else round(bal*f,2)
         if stake<0.05: return None
         if not sh: s.balance-=stake
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=0 if sh else round(100*stake/bal,2),contracts=round(stake/ask,3),
@@ -268,6 +268,8 @@ class PaperTrader:
             unrealizedPnl=P['unrealizedPnl'],winRate=P['winRate'],expectancy=P['expectancy'],paperStats=P,liveStats=Lv,shadowStats=sh,
             closed=A['closed'],open=A['open'],earlyExits=s.exitSummary(),trades=s.trades[::-1])
 SHADOW_USD=1.00
+# Owner request Nov 8: paper trades bet flat $1 like live, not Kelly of the paper balance. Set False to restore.
+PAPER_FLAT=True
 LV=None
 lock=threading.Lock(); pt=PaperTrader()
 for _t in pt.trades:
@@ -536,13 +538,14 @@ def leadlag_entry(k,model_p=None):
             now=time.time(); tk=k['ticker']; side=ev['side']
             with lock:
                 trades=list(pt.trades)
-            used=tk in LL.attempted or any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('leadlag') for t in trades)
+            paper=not (LV and LV.enabled())
+            used=tk in LL.attempted or any(t.get('ticker')==tk and t.get('leadlag') for t in trades)
             held=any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('status')=='open' for t in trades)
             cd=cooldowns(now)
             reason=entry_skip(ev,tk,k['close']-now,used,held,'BTC' in cd or 'ALL' in cd)
             if reason=='BTC loss cooldown' and 'ALL' in cd: reason='ALL shared loss cooldown'
             if reason is None and now-ev['at']>LL_MAX_AGE: reason='stale trigger'
-            if reason is None and not (LV and LV.enabled()): reason='live disabled/paused/not lease owner'
+            if reason is None and leadlag.LEADLAG_PAUSED and not paper: reason='paused by user (live only)'
             if reason is None and up_tilt_skip('BTC',tk,side,None,'leadlag'): reason='up-tilt'
             if reason is None and (tk in LV.tried or tk in LV.resting): reason='BTC order already working/tried'
             if reason is None and any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!='BTC' and t.get('closesAt')==k['close'] and t.get('side')!=side for t in trades):
@@ -571,7 +574,7 @@ def leadlag_entry(k,model_p=None):
             # Use the existing minimum-edge sizing adapter, exactly as alt-consensus does.
             q=min(ask+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
             def size_at(px):
-                if k['close']-time.time()<LL_MIN_LEFT or not LV.enabled() or shadow_asset('BTC'): return None
+                if k['close']-time.time()<LL_MIN_LEFT or not (paper or LV.enabled()) or shadow_asset('BTC'): return None
                 if WKND_MAX>0 and wknd_night() and px>WKND_MAX: return None
                 return (pt.size(side,px,mp) or [None])[0]
             sz=pt.size(side,ask,mp)
@@ -580,6 +583,11 @@ def leadlag_entry(k,model_p=None):
             LL.attempted={x for x in LL.attempted if x==tk}
             LL.attempted.add(tk)
             LL.last_error=None
+            if paper:
+                pmeta=dict(priceSource='kalshi',signalSource='leadlag',leadlag=True,leadlagTriggerCoin=ev['triggerCoin'],leadlagMove=ev['move'],leadlagBtcMove=ev['btcMove'],leadlagTriggerAt=ev['at'],leadlagEloP=ev.get('eloP'))
+                if flow_blocked('BTC',side): LL.finish(ev,'flow gate'); continue
+                with lock: trade=pt.openTrade('BTC',side,ask,mp,k['strike'],k['close'],tk,pmeta)
+                LL.finish(ev,trade=trade) if trade else LL.finish(ev,'paper size filter'); continue
             fill=_gbuy('BTC',tk,side,sz[0],ask,sizer=size_at,shadow=False,mode='live')
             if fill:
                 meta=dict(priceSource='kalshi',signalSource='leadlag',leadlag=True,
@@ -600,7 +608,8 @@ def ethlead_entry(k,model_p=None):
     # ETH-leads-BTC: buy BTC on ETH's >50c side when BTC is 7-10c cheaper; one per window.
     try:
         now=time.time(); tk=k['ticker']; left=k['close']-now
-        if not (LV and LV.enabled()): EL.last_reason='live disabled/paused/not lease owner'; return
+        if not LV: return
+        paper=not LV.enabled()
         if now<ethlead.ETHLEAD_RESUME_AT: EL.last_reason='paused by user until 8 AM ET'; return
         eq=LV.wsq('KXETH15M-'+tk.split('15M-',1)[1]); bq=LV.wsq(tk)
         side,ea,ba,gap,reason=el_eval(eq,bq,left,now)
@@ -609,7 +618,7 @@ def ethlead_entry(k,model_p=None):
         ev=dict(at=now,ticker=tk,side=side,ethAsk=ea,btcAsk=ba,gapC=round(gap*100,2),secsLeft=round(left),status='pending',skipReason=None,
                 eloP=None if model_p is None else round(model_p if side=='YES' else 1-model_p,4))
         with lock: trades=list(pt.trades)
-        if tk in EL.attempted or any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('signalSource')=='ethlead' for t in trades): reason='already traded ethlead this window'
+        if tk in EL.attempted or any(t.get('ticker')==tk and t.get('signalSource')=='ethlead' for t in trades): reason='already traded ethlead this window'
         elif any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('status')=='open' for t in trades): reason='BTC position already open'
         elif shadow_asset('BTC'): reason='BTC shadow/cooldown'
         elif tk in LV.tried or tk in LV.resting: reason='BTC order already working/tried'
@@ -621,7 +630,7 @@ def ethlead_entry(k,model_p=None):
         if reason is None:
             q=min(ba+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
             def size_at(px):
-                if k['close']-time.time()<EL_MIN_LEFT or not LV.enabled() or shadow_asset('BTC'): return None
+                if k['close']-time.time()<EL_MIN_LEFT or not (paper or LV.enabled()) or shadow_asset('BTC'): return None
                 if WKND_MAX>0 and wknd_night() and px>WKND_MAX: return None
                 if not (0.40<=px<=0.69): return None
                 return (pt.size(side,px,mp) or [None])[0]
@@ -632,6 +641,11 @@ def ethlead_entry(k,model_p=None):
                 ev.update(status='skipped',skipReason=reason); EL.log(ev)
             return
         EL.attempted={x for x in EL.attempted if x==tk}; EL.attempted.add(tk)
+        if paper:
+            pmeta=dict(priceSource='kalshi',signalSource='ethlead',ethlead=True,ethleadEthAsk=ea,ethleadBtcAsk=ba,ethleadGap=gap,ethleadEloP=ev.get('eloP'),ethleadSecsIn=round(900-left))
+            if flow_blocked('BTC',side): ev.update(status='skipped',skipReason='flow gate'); EL.log(ev); return
+            with lock: trade=pt.openTrade('BTC',side,ba,mp,k['strike'],k['close'],tk,pmeta)
+            ev.update(status='filled (paper)',tradeId=trade and trade['id']); EL.log(ev); return
         fill=_gbuy('BTC',tk,side,sz[0],ba,sizer=size_at,shadow=False,mode='live')
         if fill:
             meta=dict(priceSource='kalshi',signalSource='ethlead',ethlead=True,ethleadEthAsk=ea,ethleadBtcAsk=ba,ethleadGap=gap,ethleadEloP=ev.get('eloP'),ethleadSecsIn=round(900-left))
