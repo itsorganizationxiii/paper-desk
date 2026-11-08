@@ -916,9 +916,10 @@ def loop():
         try: tick_once()
         except Exception as e: print('tick err',e,flush=True)
         time.sleep(LIVE_TICK if any(t.get('mode')=='live' and t['status']=='open' for t in pt.trades) else TICK)  # faster checks while a real position is open
-STATUS_TRADES=100
+STATUS_TRADES=75
 STATUS_ORDERS=50
 STATUS_TRIGGERS=20
+STATUS_DROP_KEYS=('flowLog',)
 def _newest_first(v):
     a,b=v[0],v[-1]
     ta=(a.get('at') or a.get('openedAt') or a.get('ts') or 0) if isinstance(a,dict) else 0
@@ -932,6 +933,7 @@ def slim_status(d):
         keep+= [t for t in tr if t.get('status')!='open'][:STATUS_TRADES]
         d['trades']=sorted(keep,key=lambda t:-(t.get('openedAt') or 0))
         d['tradesTrimmed']=True
+    d['trades']=[{k:v for k,v in t.items() if k not in STATUS_DROP_KEYS} for t in d.get('trades') or []]
     lv=d.get('live') or {}
     if isinstance(lv.get('recentOrders'),list): lv['recentOrders']=lv['recentOrders'][:STATUS_ORDERS]
     for sec in ('leadlag','ethlead','reentries','altCap','tradeFlow','reconcile'):
