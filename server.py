@@ -331,14 +331,18 @@ def wknd_night(ts=None):
     # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
     d=datetime.fromtimestamp(ts or time.time(),ET); wd,h=d.weekday(),d.hour
     return (wd==4 and h>=17) or wd in (5,6) or (wd==0 and h<9)
-COOL_LOSSES=3; COOL_SEC=3600; _cool={'at':0,'map':{}}; _cool_logged=set()
+COOL_LOSSES=3; COOL_SEC=3600; SHARED_COOL_LOSSES=2; SHARED_COOL_SEC=1800; _cool={'at':0,'map':{}}; _cool_logged=set()
 def cooldowns(now=None):
     # per-coin loss-streak cooldown, derived from closed live trades so restarts keep it
     now=now or time.time()
     if now-_cool['at']<5 and _cool['map'] is not None: return _cool['map']
     tr=sorted([t for t in pt.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status') in ('won','lost','exited') and t.get('closedAt')],key=lambda t:t['closedAt'])
-    st={}; out={}
+    st={}; out={}; shared_streak=0; shared_until=0
     for t in tr:
+        if (t.get('pnl') or 0)<0:
+            shared_streak+=1
+            if shared_streak>=SHARED_COOL_LOSSES: shared_until=t['closedAt']+SHARED_COOL_SEC
+        else: shared_streak=0
         a=t.get('asset'); s=st.setdefault(a,{'streak':0,'until':0})
         if (t.get('pnl') or 0)<0:
             s['streak']+=1
@@ -348,10 +352,13 @@ def cooldowns(now=None):
         if s['until']>now:
             out[a]=dict(until=round(s['until']),minsLeft=round((s['until']-now)/60,1))
             if (a,round(s['until'])) not in _cool_logged: _cool_logged.add((a,round(s['until']))); print('COOLDOWN',a,'shadow-only until',datetime.fromtimestamp(s['until'],ET).strftime('%H:%M ET'),flush=True)
+    if shared_until>now:
+        out['ALL']=dict(until=round(shared_until),minsLeft=round((shared_until-now)/60,1),reason='2 consecutive closed live losses across coins; all new live entries cooling down')
     _cool.update(at=now,map=out); return out
 def shadow_asset(a,ts=None):
     # paper-only shadow: XRP always; any coin in a loss-streak cooldown. Never a live entry.
-    return a=='XRP' or a in cooldowns()
+    cd=cooldowns()
+    return a=='XRP' or a in cd or 'ALL' in cd
 def is_shadow(t): return bool(t.get('shadow'))
 ALT=os.environ.get('ALT_CONSENSUS','1')!='0'; ALT_MAX=float(os.environ.get('ALT_MAX_PRICE','0.60')); _altc={}
 def alt_votes(btc_ticker):
@@ -462,7 +469,9 @@ def leadlag_entry(k):
                 trades=list(pt.trades)
             used=tk in LL.attempted or any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('leadlag') for t in trades)
             held=any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('status')=='open' for t in trades)
-            reason=entry_skip(ev,tk,k['close']-now,used,held,'BTC' in cooldowns(now))
+            cd=cooldowns(now)
+            reason=entry_skip(ev,tk,k['close']-now,used,held,'BTC' in cd or 'ALL' in cd)
+            if reason=='BTC loss cooldown' and 'ALL' in cd: reason='ALL shared loss cooldown'
             if reason is None and now-ev['at']>LL_MAX_AGE: reason='stale trigger'
             if reason is None and not (LV and LV.enabled()): reason='live disabled/paused/not lease owner'
             if reason is None and (tk in LV.tried or tk in LV.resting): reason='BTC order already working/tried'

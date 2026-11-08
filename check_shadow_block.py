@@ -7,7 +7,7 @@ calls=[]
 live._http=lambda *a,**k:(calls.append(a) or (200,{}))
 src=open('server.py').read(); tree=ast.parse(src)
 code=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if getattr(n,'name',None) in ('cooldowns','shadow_asset'))
-code+=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if isinstance(n,ast.Assign) and any(getattr(t,'id',None) in ('COOL_LOSSES','COOL_SEC','_cool','_cool_logged') for t in n.targets))
+code+=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if isinstance(n,ast.Assign) and any(getattr(t,'id',None) in ('COOL_LOSSES','COOL_SEC','SHARED_COOL_LOSSES','SHARED_COOL_SEC','_cool','_cool_logged') for t in n.targets))
 class PT: trades=[]
 g=dict(time=time,datetime=datetime,ET=ET,pt=PT); exec(code,g)
 L=live.Live(); L.owner=lambda:True
@@ -28,13 +28,13 @@ mk=lambda a,p,ago:dict(mode='live',asset=a,status='lost' if p<0 else 'won',pnl=p
 PT.trades=[mk('ETH',-0.5,900),mk('ETH',-0.4,600),mk('ETH',-0.3,300)]; reset()
 chk('ETH after 3 straight live losses refused',L.entry_block('ETH','KXETH15M-X') and L.buy('ETH','KXETH15M-X','YES',0.1,0.5) is None and L.lastBuy=='blocked')
 chk('cooldown ~55 min left',50<g['cooldowns']()['ETH']['minsLeft']<=60)
-chk('other coins unaffected',not L.entry_block('BTC','KXBTC15M-X') and not L.entry_block('SOL','KXSOL15M-X'))
+chk('other coins have no per-coin cooldown but obey shared pause','BTC' not in g['cooldowns']() and 'SOL' not in g['cooldowns']() and 'ALL' in g['cooldowns']() and L.entry_block('BTC','KXBTC15M-X') and L.entry_block('SOL','KXSOL15M-X'))
 PT.trades=[mk('ETH',-0.5,900),mk('ETH',0.4,600),mk('ETH',-0.3,300),mk('ETH',-0.3,200)]; reset()
-chk('win resets streak (2 losses after win -> live)',not L.entry_block('ETH','KXETH15M-X'))
+chk('win resets per-coin streak; 2 later losses trigger only shared cooldown','ETH' not in g['cooldowns']() and 'ALL' in g['cooldowns']() and L.entry_block('ETH','KXETH15M-X'))
 PT.trades=[mk('SOL',-0.5,4800),mk('SOL',-0.4,4500),mk('SOL',-0.3,4000)]; reset()
 chk('cooldown expires after 60 min',not L.entry_block('SOL','KXSOL15M-X'))
 PT.trades=[mk('SOL',-0.5,4800),mk('SOL',-0.4,4500),mk('SOL',-0.3,4000),mk('SOL',-0.2,100)]; reset()
-chk('one loss after expired cooldown does not re-trigger',not L.entry_block('SOL','KXSOL15M-X'))
+chk('one loss after expired per-coin cooldown does not re-trigger SOL; consecutive losses still trigger shared','SOL' not in g['cooldowns']() and 'ALL' in g['cooldowns']())
 
 # ---- profit-lock re-entry ----
 code3=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if getattr(n,'name',None)=='reentry_ok')
