@@ -844,8 +844,10 @@ class H(SimpleHTTPRequestHandler):
                 if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
                 d['ticks']=dict(TICKS,queued=len(_tq))
                 d['leadlag']=LL.snapshot(pt.trades)
+                try: d['tradeFlow']=LV.ws.trade_flow() if (LV is not None and getattr(LV,'ws',None) is not None) else dict(enabled=False)
+                except Exception as e: d['tradeFlow']=dict(error=str(e)[:200])
                 d['reconcile']=dict(RECON.state)
-                d['deployment']='looser-lock-fast-stop-alt-cap-v3'
+                d['deployment']='looser-lock-fast-stop-alt-cap-v3-tradefeed'
                 d['profitLock']=dict(weekend=wknd_night(),mode=WKND_MODE,upArmC=round(WKND_UP_ARM*100),upDropC=round(WKND_UP_DROP*100),downArmC=round(WKND_LOCK_ARM_C*100),downDropC=round(WKND_DROP*100),fixedPeakC=round(LOCK_PEAK*100))
                 d['altCap']=dict(alt_cap_state(pt.trades),enabled=ALT,recentSkips=list(_alt_cap_skips))
                 d['stopExecution']=dict(limitAttempts=1,confirmation='single immediate order-status poll',confirmationWaitSec=0,aggressiveLimitC=1,preflightPosition=False)
@@ -866,6 +868,17 @@ class H(SimpleHTTPRequestHandler):
             for t in tr: w.writerow([t.get('id'),t.get('mode','paper'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl','')])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')
             s.send_header('Content-Disposition',f'attachment; filename="paper-desk-trades-{datetime.now(ET).strftime("%Y%m%d-%H%M")}.csv"'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/kxtrades':
+            from urllib.parse import parse_qs
+            q=parse_qs(s.path.split('?',1)[1] if '?' in s.path else '')
+            try: after=int(float((q.get('after') or ['0'])[0]))
+            except Exception: after=0
+            try: lim=max(1,min(20000,int((q.get('limit') or ['5000'])[0])))
+            except Exception: lim=5000
+            ws=getattr(LV,'ws',None) if LV is not None else None
+            rows=ws.trades_after(after,lim) if ws is not None else []
+            b=json.dumps(dict(trades=rows,count=len(rows),next=rows[-1]['ts_ms'] if rows else after,bufferSize=len(ws.trades) if ws is not None else 0)).encode()
+            s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/ticks':
             from urllib.parse import parse_qs
             qs={k:v[0] for k,v in parse_qs(s.path.split('?',1)[1] if '?' in s.path else '').items()}
