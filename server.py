@@ -916,7 +916,7 @@ def loop():
         try: tick_once()
         except Exception as e: print('tick err',e,flush=True)
         time.sleep(LIVE_TICK if any(t.get('mode')=='live' and t['status']=='open' for t in pt.trades) else TICK)  # faster checks while a real position is open
-STATUS_TRADES=75
+STATUS_TRADES=50
 STATUS_ORDERS=50
 STATUS_TRIGGERS=20
 STATUS_DROP_KEYS=('flowLog',)
