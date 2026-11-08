@@ -1,6 +1,6 @@
 # Owner checklist #1, #2, #4 (Nov 8, 2026). Data only: no trading decisions use this yet (owner: no trading logic until 300+ windows logged).
 # #1/#2: Kalshi bid/ask + top-5 depth every BOOK_SEC seconds per open window, each row with synced timestamp, window id, seconds left.
-# #4: rebuilt BRTI (median of mids from CF-published BRTI constituent exchanges over public websockets: Coinbase, Kraken, Bitstamp, Gemini).
+# #4: rebuilt BRTI from a consolidated level-2 order book (mid of 5 BTC depth VWAP; median of venue mids also kept) built from CF-published BRTI constituents (CME CF Constituent Exchanges PDF, docs.cfbenchmarks.com): Bitstamp, Coinbase, Kraken, Gemini, Bullish, Crypto.com over public websockets. LMAX Digital is a constituent but has no public feed; itBit suspended 27-Jul-26.
 #     At each window start/end, compare our 60s average to Kalshi floor_strike (start) and expiration_value (end) from
 #     GET https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXBTC15M (status=open / status=settled).
 import json, time, threading, statistics, urllib.request, email.utils, collections
@@ -56,37 +56,68 @@ def _ws(name,url,sub,parse):
                 if sub: ws.send(json.dumps(sub))
                 ST['venues'][name]='up'
                 while True:
-                    m=parse(json.loads(ws.recv()))
-                    if m: _mids[name]=(m,time.time())
+                    parse(json.loads(ws.recv()),ws)
             except Exception as e: ST['venues'][name]=f'down: {type(e).__name__}'; time.sleep(5)
     threading.Thread(target=run,daemon=True).start()
-def _p_cb(d):
-    if d.get('type')=='ticker' and d.get('best_bid') and d.get('best_ask'): return (float(d['best_bid'])+float(d['best_ask']))/2
-def _p_kr(d):
-    if isinstance(d,dict) and d.get('channel')=='ticker' and d.get('data'): x=d['data'][0]; return (x['bid']+x['ask'])/2
-def _p_bs(d):
+B={}
+def _bk(n): return B.setdefault(n,{'bid':{},'ask':{},'t':0})
+def _snap(n,bids,asks):
+    k=_bk(n); k['bid']={float(p):float(q) for p,q in bids if float(q)>0}; k['ask']={float(p):float(q) for p,q in asks if float(q)>0}; k['t']=time.time()
+def _upd(n,side,px,q):
+    k=_bk(n); px=float(px); q=float(q)
+    if q==0: k[side].pop(px,None)
+    else: k[side][px]=q
+    k['t']=time.time()
+def _p_cb(d,ws=None):
+    if d.get('type')=='snapshot': _snap('coinbase',d['bids'],d['asks'])
+    elif d.get('type')=='l2update':
+        for sd,px,q in d['changes']: _upd('coinbase','bid' if sd=='buy' else 'ask',px,q)
+def _p_kr(d,ws=None):
+    if not isinstance(d,dict) or d.get('channel')!='book': return
+    x=d['data'][0]
+    if d.get('type')=='snapshot': _snap('kraken',[(l['price'],l['qty']) for l in x['bids']],[(l['price'],l['qty']) for l in x['asks']])
+    else:
+        for l in x.get('bids',[]): _upd('kraken','bid',l['price'],l['qty'])
+        for l in x.get('asks',[]): _upd('kraken','ask',l['price'],l['qty'])
+        k=_bk('kraken')
+        for sd,rev in (('bid',True),('ask',False)):
+            for px in sorted(k[sd],reverse=rev)[10:]: k[sd].pop(px,None)
+def _p_bs(d,ws=None):
     x=d.get('data') or {}
-    if d.get('event')=='data' and x.get('bids') and x.get('asks'): return (float(x['bids'][0][0])+float(x['asks'][0][0]))/2
-_gm={}
-def _p_gm(d):
-    for e in d.get('events',[]) if d.get('type')=='update' else []:
-        if e.get('type')=='change': _gm[e['side']]=float(e['price']) if e.get('reason')!='cancel' or True else None
-    return None
-_gb={'bid':{},'ask':{}}
-def _p_gm2(d):
-    if d.get('type')!='l2_updates' and d.get('type')!='update': return None
-    for c in d.get('changes',[]):
-        side=c[0].replace('buy','bid').replace('sell','ask'); px=float(c[1]); q=float(c[2])
-        if q==0: _gb[side].pop(px,None)
-        else: _gb[side][px]=q
-    if _gb['bid'] and _gb['ask']: return (max(_gb['bid'])+min(_gb['ask']))/2
+    if d.get('event')=='data' and x.get('bids'): _snap('bitstamp',x['bids'][:50],x['asks'][:50])
+def _p_gm2(d,ws=None):
+    if d.get('type') not in ('l2_updates','update'): return
+    for c in d.get('changes',[]): _upd('gemini','bid' if c[0]=='buy' else 'ask',c[1],c[2])
+def _p_cdc(d,ws=None):
+    if d.get('method')=='public/heartbeat': ws.send(json.dumps({'id':d.get('id'),'method':'public/respond-heartbeat'})); return
+    x=((d.get('result') or {}).get('data') or [None])[0]
+    if x and x.get('bids'): _snap('cryptocom',[l[:2] for l in x['bids']],[l[:2] for l in x['asks']])
+def _p_bl(d,ws=None):
+    x=d.get('data') or {}
+    if x.get('bestBid') and x.get('bestAsk'): _snap('bullish',[(x['bestBid'],x.get('bidVolume') or 0.01)],[(x['bestAsk'],x.get('askVolume') or 0.01)])
+DEPTH_BTC=5.0
+def consolidated(now=None):
+    """Consolidated L2 book across fresh venues -> (median of venue mids, depth-weighted mid at DEPTH_BTC, venues used)."""
+    now=now or time.time(); live={n:k for n,k in B.items() if now-k['t']<10 and k['bid'] and k['ask'] and max(k['bid'])<min(k['ask'])}
+    if len(live)<2: return None,None,0
+    mids=[(max(k['bid'])+min(k['ask']))/2 for k in live.values()]; med=statistics.median(mids)
+    bids=sorted(((p,q) for k in live.values() for p,q in k['bid'].items() if p>med*0.995),reverse=True)
+    asks=sorted((p,q) for k in live.values() for p,q in k['ask'].items() if p<med*1.005)
+    def vwap(lv):
+        got=cost=0.0
+        for p,q in lv:
+            t=min(q,DEPTH_BTC-got); got+=t; cost+=t*p
+            if got>=DEPTH_BTC: break
+        return cost/got if got else None
+    vb,va=vwap(bids),vwap(asks)
+    return med,((vb+va)/2 if vb and va else None),len(live)
 def _sampler():
     while True:
         time.sleep(1-(time.time()%1))
-        now=time.time(); ms=[v for v,t in _mids.values() if now-t<10]
-        if len(ms)>=2: _sec.append((int(now),statistics.median(ms),len(ms)))
+        med,dm,n=consolidated()
+        if med: _sec.append((int(time.time()),dm or med,n,med))
 def _avg60(end):
-    xs=[v for t,v,_ in _sec if end-60<=t<end]
+    xs=[x[1] for x in _sec if end-60<=x[0]<end]
     return (sum(xs)/len(xs),len(xs)) if xs else (None,0)
 def _idx_loop(owner):
     done=set()
@@ -96,6 +127,7 @@ def _idx_loop(owner):
         if b in done or now-b<20 or not owner(): continue
         try:
             avg,n=_avg60(b)
+            _m=[x[3] for x in _sec if b-60<=x[0]<b]; med=sum(_m)/len(_m) if _m else None
             opn=[x for x in _get(f'{KALSHI}/markets?series_ticker={IDX_SERIES}&status=open&limit=5')['markets'] if abs(_iso(x['open_time'])-b)<5]
             st=[x for x in _get(f'{KALSHI}/markets?series_ticker={IDX_SERIES}&status=settled&limit=5')['markets'] if abs(_iso(x['close_time'])-b)<5]
             if not opn and not st:
@@ -105,7 +137,7 @@ def _idx_loop(owner):
             ev=float(st[0]['expiration_value']) if st and st[0].get('expiration_value') else None
             if ev is None and now-b<240: continue
             kal=fs if fs is not None else ev
-            row=dict(boundary=b,ms=int(now*1000),rebuilt=avg,samples=n,floorStrike=fs,expirationValue=ev,
+            row=dict(boundary=b,ms=int(now*1000),rebuilt=avg,rebuiltMedian=med,errStartMedian=(med-fs if med and fs else None),errEndMedian=(med-ev if med and ev else None),samples=n,floorStrike=fs,expirationValue=ev,
                      startWindow=opn[0]['ticker'] if opn else None,endWindow=st[0]['ticker'] if st else None,
                      endResult=st[0].get('result') if st else None,endStrike=st[0].get('floor_strike') if st else None,
                      errStart=(avg-fs if avg and fs else None),errEnd=(avg-ev if avg and ev else None),venues=dict(ST['venues']))
@@ -129,8 +161,10 @@ def start(db,owner=lambda:True):
         _col['books']=db['books']; _col['idxcmp']=db['idxcmp']
         try: _col['books'].create_index([('window',1),('ms',1)]); _col['books'].create_index('ms',expireAfterSeconds=None) if False else None; _col['idxcmp'].create_index('boundary',unique=True)
         except Exception as e: ST['idxErr']=f'index: {e}'
-    _ws('coinbase','wss://ws-feed.exchange.coinbase.com',{'type':'subscribe','product_ids':['BTC-USD'],'channels':['ticker']},_p_cb)
-    _ws('kraken','wss://ws.kraken.com/v2',{'method':'subscribe','params':{'channel':'ticker','symbol':['BTC/USD']}},_p_kr)
+    _ws('coinbase','wss://ws-feed.exchange.coinbase.com',{'type':'subscribe','product_ids':['BTC-USD'],'channels':['level2_batch']},_p_cb)
+    _ws('kraken','wss://ws.kraken.com/v2',{'method':'subscribe','params':{'channel':'book','symbol':['BTC/USD'],'depth':10}},_p_kr)
     _ws('bitstamp','wss://ws.bitstamp.net',{'event':'bts:subscribe','data':{'channel':'order_book_btcusd'}},_p_bs)
     _ws('gemini','wss://api.gemini.com/v2/marketdata',{'type':'subscribe','subscriptions':[{'name':'l2','symbols':['BTCUSD']}]},_p_gm2)
+    _ws('cryptocom','wss://stream.crypto.com/exchange/v1/market',{'id':1,'method':'subscribe','params':{'channels':['book.BTC_USD.50']}},_p_cdc)
+    _ws('bullish','wss://api.exchange.bullish.com/trading-api/v1/market-data/tick/BTCUSD',None,_p_bl)
     for f,a in ((_sampler,()),(_book_loop,(owner,)),(_idx_loop,(owner,))): threading.Thread(target=f,args=a,daemon=True).start()
