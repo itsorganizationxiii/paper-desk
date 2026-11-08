@@ -105,8 +105,8 @@ class Tests(unittest.TestCase):
             return 2,0.17,0,'stop',None
         L.stop_sell=stop; L.book=lambda pnl:event.set()
         g=dict(time=time,threading=threading,lock=state_lock,LV=L,pt=P,stop_pct=lambda:0.6,
-               lock_active=lambda:False,LOCK_PEAK_BY_ASSET={},LOCK_PEAK=0.8,lock_arm=lambda t:0.12,
-               lock_drop=lambda t:0.05,LOCK_HOLD_P=0.9,kalshi_fee=lambda c,p:0)
+               lock_active=lambda:False,LOCK_PEAK_BY_ASSET={},LOCK_PEAK=0.8,lock_arm=lambda t:0.18,
+               lock_drop=lambda t:0.08,LOCK_HOLD_P=0.9,kalshi_fee=lambda c,p:0)
         code='\n'.join(ast.get_source_segment(SRC,n) for n in TREE.body if getattr(n,'name',None) in ('PaperTrader','_ws_quote'))
         exec(code,g)
         P.__class__=g['PaperTrader']

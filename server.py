@@ -30,10 +30,11 @@ WHALE_CFG={'BTC':dict(floor=float(os.environ.get('WHALE_FLOOR_BTC','100000')),ca
 # or at the old fixed peaks, whichever comes first. LOCK_ARM_C=0 disables the entry-relative arm.
 LOCK_PEAK=0.80; LOCK_DROP=0.10; BIG_RUN=float(os.environ.get('LOCK_BIG_RUN','0.20')); BIG_DROP=float(os.environ.get('LOCK_BIG_DROP','0.05')); LOCK_HOLD_P=0.90
 LOCK_ARM_C=float(os.environ.get('LOCK_ARM_C','0.10'))
-WKND_LOCK_ARM_C=float(os.environ.get('WKND_LOCK_ARM_C','0.15'))  # Fri 5PM-Mon 9AM ET
-WKND_DROP=float(os.environ.get('WKND_LOCK_DROP','0.04'))  # weekend: flat 4c giveback, big-run off (7-weekend grid best, user Nov 7)
+# Weekend lock thresholds are code constants, not deployment overrides.
+WKND_LOCK_ARM_C=0.20
+WKND_DROP=0.07
 WKND_MODE=os.environ.get('WKND_MODE','volatile')  # 'volatile' (thin weekend: Up bets lock early) or 'normal'
-WKND_UP_ARM=float(os.environ.get('WKND_UP_ARM','0.12')); WKND_UP_DROP=float(os.environ.get('WKND_UP_DROP','0.05'))
+WKND_UP_ARM=0.18; WKND_UP_DROP=0.08
 def wknd_up(t): return t is not None and WKND_MODE=='volatile' and wknd_night() and t.get('side')=='YES'
 def tp_bid(): return (WKND_TP if WKND_TP>0 else 9.0) if (WKND_MODE=='volatile' and wknd_night()) else TP_BID
 def stop_pct(): return WKND_STOP if (WKND_STOP>0 and wknd_night()) else STOP
@@ -817,7 +818,9 @@ class H(SimpleHTTPRequestHandler):
                 d['ticks']=dict(TICKS,queued=len(_tq))
                 d['leadlag']=LL.snapshot(pt.trades)
                 d['reconcile']=dict(RECON.state)
-                d['deployment']='position-sync-v1'
+                d['deployment']='looser-lock-fast-stop-v2'
+                d['profitLock']=dict(weekend=wknd_night(),mode=WKND_MODE,upArmC=round(WKND_UP_ARM*100),upDropC=round(WKND_UP_DROP*100),downArmC=round(WKND_LOCK_ARM_C*100),downDropC=round(WKND_DROP*100),fixedPeakC=round(LOCK_PEAK*100))
+                d['stopExecution']=dict(limitAttempts=1,confirmation='single immediate order-status poll',confirmationWaitSec=0,aggressiveLimitC=1,preflightPosition=False)
                 _re=[t for t in pt.trades if t.get('reentry')]; _rc=[t for t in _re if t.get('status')!='open']
                 d['reentries']=dict(count=len(_re),open=len(_re)-len(_rc),closed=len(_rc),wins=len([t for t in _rc if (t.get('pnl') or 0)>0]),pnl=round(sum(t.get('pnl') or 0 for t in _rc),2))
                 try:
