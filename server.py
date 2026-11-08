@@ -116,12 +116,30 @@ class PaperTrader:
         if WKND_MAX_EDGE>0 and wknd_night() and edge>WKND_MAX_EDGE: return None
         return min(KELLY*edge/(1-ask),CAP)*(0.5 if nt else 1),edge,q
     def openLive(s,asset,side,fill,strike,close,ticker,meta,edge,q):
+        if meta.get('shadow') or meta.get('mode','live')!='live' or 'XRP' in str(ticker).upper():
+            raise ValueError('shadow metadata forbidden for live fill')
+        existing=next((t for t in s.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status')=='open' and t.get('ticker')==ticker and t.get('side')==side and (t.get('liveOrderId')==fill.get('orderId') or t.get('adopted'))),None)
+        if existing:
+            if LV: LV.pending_fills.pop(fill.get('orderId'),None)
+            return existing
+        meta={k:v for k,v in meta.items() if k!='mode'}
         stake=round(fill['cost']+fill['fee'],4)
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',asset=asset,side=side,price=fill['price'],stake=stake,stakePct=round(100*fill['frac'],2),
                contracts=fill['contracts'],entryFee=fill['fee'],liveOrderId=fill['orderId'],liveCashAtEntry=fill['cash'],
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
         t['perpPremium']=perp_premium(asset); t['regime']=regime(asset); t['flowAtEntry']=flow(asset)
-        s.trades.append(t); s.save(); print('OPEN LIVE',t['id'],ticker,side,fill['price'],fill['contracts'],flush=True); return t
+        s.trades.append(t); s.save()
+        if LV: LV.pending_fills.pop(fill.get('orderId'),None)
+        print('OPEN LIVE',t['id'],ticker,side,fill['price'],fill['contracts'],flush=True); return t
+    def adopt(s,asset,side,contracts,price,fee,ticker,strike,close,order_ids,fee_known):
+        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',shadow=False,adopted=True,
+               asset=asset,side=side,contracts=contracts,price=round(price,6),stake=round(contracts*price+fee,6),
+               stakePct=0,entryFee=round(fee,6),adoptionFeesKnown=fee_known,adoptedOrderIds=order_ids,
+               ticker=ticker,strike=strike,closesAt=close,openedAt=time.time(),status='open',
+               signalSource='portfolio-reconcile',priceSource='kalshi-position',edge=0,modelP=None)
+        s.trades.append(t); s.save()
+        print('ADOPT LIVE',t['id'],ticker,side,contracts,price,flush=True)
+        return t
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
         sz=s.size(side,ask,p_yes)
         if not sz: return None
@@ -136,7 +154,7 @@ class PaperTrader:
         return t
     def close(s,t,win,how,val=None):
         payout=t['contracts'] if win else 0
-        if t.get('mode')=='live':
+        if t.get('mode')=='live' and not t.get('shadow'):
             pnl=round(payout-t['stake'],2); t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(pnl+(t.get('partialPnl') or 0),2),closedAt=time.time())
             if LV: LV.book(pnl); LV.log(action='settle',ticker=t['ticker'],side=t['side'],count=t['contracts'],result=t['status'],pnl=pnl)
         else:
@@ -144,7 +162,7 @@ class PaperTrader:
             if not t.get('shadow'): s.balance+=payout
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
     def exit(s,t,bid,reason,fee=0.0):
-        if t.get('mode')=='live': return s.exitLive(t,bid,reason)
+        if t.get('mode')=='live' and not t.get('shadow'): return s.exitLive(t,bid,reason)
         proceeds=t['contracts']*bid-fee
         t.update(status='exited',exitPrice=round(bid,4),exitReason=reason,exitFee=round(fee,2),settledBy='early-exit@bid',pnl=round(proceeds-t['stake'],2),closedAt=time.time())
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
@@ -152,11 +170,13 @@ class PaperTrader:
         s.save(); print('EXIT',t['id'],reason,bid,flush=True)
     def exitLive(s,t,bid,reason):
         # real sell runs off the lock; trade stays 'open' (flagged exiting) until the fill is known
-        if not (LV and LV.allowed()): t['liveSellError']='live disabled (env/keys); holding to settlement'; return
+        if t.get('shadow') or t.get('mode')!='live' or 'XRP' in str(t.get('ticker')).upper(): return
+        if not (LV and LV.allowed() and LV.owner()): t['liveSellError']='live disabled (env/keys); holding to settlement'; return
         if t.get('exiting'): return
         t['exiting']=reason; t['exitTrigAt']=time.time(); t['exitTrigBid']=round(bid,4)
         threading.Thread(target=s._sellLive,args=(t,bid,reason),daemon=True).start()
     def _sellLive(s,t,bid,reason):
+        if t.get('shadow') or t.get('mode')!='live' or 'XRP' in str(t.get('ticker')).upper(): return
         floor=round(t['price']+0.01,2) if str(reason).lower().startswith(('profitlock','take','tp','breakeven')) is True and not str(reason).lower().startswith('breakeven') else None  # profit exits never sell below entry
         isstop=str(reason).lower().startswith('stop')
         stl=round(stop_pct()*t['price'],4)
@@ -246,22 +266,10 @@ def _live_save(st):
     if MCOL is not None: MCOL.replace_one({'_id':'live'},dict(st,_id='live'),upsert=True)
 try:
     import live as _live; LV=_live.Live(_live_load,_live_save)
-    # single-owner lease: Render runs old+new instances together during a deploy; only the newest boot may trade or write the live doc
-    INSTANCE=f'{os.getpid()}-{uuid.uuid4().hex[:8]}-{int(time.time())}'; _lease={'at':0,'ok':True}
-    if MCOL is not None:
-        try: MCOL.replace_one({'_id':'lease'},{'_id':'lease','inst':INSTANCE,'at':time.time(),'hb':time.time()},upsert=True)
-        except Exception as e: print('lease claim err',e,flush=True)
-        def _lease_ok():
-            if time.time()-_lease['at']<3: return _lease['ok']
-            try:
-                d=MCOL.find_one({'_id':'lease'}); now=time.time()
-                if (not d) or d.get('inst')==INSTANCE or now-float(d.get('hb',d.get('at',0)))>45:
-                    # owner heartbeats; a holder that stopped heartbeating (crashed/removed deploy) is taken over after 45s
-                    MCOL.replace_one({'_id':'lease'},{'_id':'lease','inst':INSTANCE,'at':d.get('at',now) if d and d.get('inst')==INSTANCE else now,'hb':now},upsert=True); _lease['ok']=True
-                else: _lease['ok']=False
-            except Exception: pass
-            _lease['at']=time.time(); return _lease['ok']
-        LV.lease_ok=_lease_ok
+    from trader_lease import TraderLease
+    INSTANCE=f'{os.getpid()}-{uuid.uuid4().hex[:8]}-{int(time.time())}'
+    LEASE=TraderLease(MCOL,INSTANCE)
+    LV.lease_ok=LEASE.check
     LV.entry_block=lambda asset,ticker:shadow_asset(str(asset).upper()) or 'XRP' in str(ticker).upper()
     print('live mode:', 'LIVE' if LV.enabled() else ('paused' if LV.allowed() else 'off'),flush=True)
 except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print('live init err',LIVE_INIT_ERR,flush=True)
@@ -331,19 +339,21 @@ def wknd_night(ts=None):
     # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
     d=datetime.fromtimestamp(ts or time.time(),ET); wd,h=d.weekday(),d.hour
     return (wd==4 and h>=17) or wd in (5,6) or (wd==0 and h<9)
+COOLDOWNS_ENABLED=False
 COOL_LOSSES=3; COOL_SEC=3600; SHARED_COOL_LOSSES=2; SHARED_COOL_SEC=1800; _cool={'at':0,'map':{}}; _cool_logged=set()
 def cooldowns(now=None):
     # per-coin loss-streak cooldown, derived from closed live trades so restarts keep it
     now=now or time.time()
     if now-_cool['at']<5 and _cool['map'] is not None: return _cool['map']
     tr=sorted([t for t in pt.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status') in ('won','lost','exited') and t.get('closedAt')],key=lambda t:t['closedAt'])
-    st={}; out={}; shared_streak=0; shared_until=0
+    st={}; out={}; shared_streak=0; shared_until=0; loss_streaks={}
     for t in tr:
         if (t.get('pnl') or 0)<0:
             shared_streak+=1
             if shared_streak>=SHARED_COOL_LOSSES: shared_until=t['closedAt']+SHARED_COOL_SEC
         else: shared_streak=0
-        a=t.get('asset'); s=st.setdefault(a,{'streak':0,'until':0})
+        a=t.get('asset'); loss_streaks[a]=loss_streaks.get(a,0)+1 if (t.get('pnl') or 0)<0 else 0
+        s=st.setdefault(a,{'streak':0,'until':0})
         if (t.get('pnl') or 0)<0:
             s['streak']+=1
             if s['streak']>=COOL_LOSSES: s['until']=t['closedAt']+COOL_SEC; s['streak']=0
@@ -351,10 +361,11 @@ def cooldowns(now=None):
     for a,s in st.items():
         if s['until']>now:
             out[a]=dict(until=round(s['until']),minsLeft=round((s['until']-now)/60,1))
-            if (a,round(s['until'])) not in _cool_logged: _cool_logged.add((a,round(s['until']))); print('COOLDOWN',a,'shadow-only until',datetime.fromtimestamp(s['until'],ET).strftime('%H:%M ET'),flush=True)
+            if COOLDOWNS_ENABLED and (a,round(s['until'])) not in _cool_logged: _cool_logged.add((a,round(s['until']))); print('COOLDOWN',a,'shadow-only until',datetime.fromtimestamp(s['until'],ET).strftime('%H:%M ET'),flush=True)
     if shared_until>now:
         out['ALL']=dict(until=round(shared_until),minsLeft=round((shared_until-now)/60,1),reason='2 consecutive closed live losses across coins; all new live entries cooling down')
-    _cool.update(at=now,map=out); return out
+    _cool.update(at=now,map=out if COOLDOWNS_ENABLED else {},streaks=dict(ALL=shared_streak,**loss_streaks))
+    return _cool['map']
 def shadow_asset(a,ts=None):
     # paper-only shadow: XRP always; any coin in a loss-streak cooldown. Never a live entry.
     cd=cooldowns()
@@ -503,7 +514,7 @@ def leadlag_entry(k):
             LL.attempted={x for x in LL.attempted if x==tk}
             LL.attempted.add(tk)
             LL.last_error=None
-            fill=LV.buy('BTC',tk,side,sz[0],ask,sizer=size_at)
+            fill=LV.buy('BTC',tk,side,sz[0],ask,sizer=size_at,shadow=False,mode='live')
             if fill:
                 meta=dict(priceSource='kalshi',signalSource='leadlag',leadlag=True,
                           leadlagTriggerCoin=ev['triggerCoin'],leadlagMove=ev['move'],
@@ -623,7 +634,7 @@ def tick_once():
                             sz=pt.size(rd,rask,rmp)
                             if sz:
                                 _rs=lambda px,d=rd:None if px>REV_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
-                                fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_rs)
+                                fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_rs,shadow=bool(rmeta.get('shadow')),mode=rmeta.get('mode','live'))
                                 if fill:
                                     with lock: t=pt.openLive(a,rd,fill,k['strike'],k['close'],k['ticker'],rmeta,sz[1],sz[2])
                     else:
@@ -642,7 +653,7 @@ def tick_once():
                             sz=pt.size(rd,rask,rmp)
                             if sz:
                                 _as=lambda px,d=rd:None if px>ALT_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
-                                fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_as)
+                                fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_as,shadow=bool(rmeta.get('shadow')),mode=rmeta.get('mode','live'))
                                 if fill:
                                     with lock: t=pt.openLive(a,rd,fill,k['strike'],k['close'],k['ticker'],rmeta,sz[1],sz[2])
                     else:
@@ -683,13 +694,13 @@ def tick_once():
                     if k['ticker'] in LV.tried or k['ticker'] in LV.resting: sg['action']='live: order working / already tried this window'; sigs[a]=sg; continue
                     _sz=lambda px,d=dirn,m=mp:None if (WKND_MAX>0 and wknd_night() and px>WKND_MAX) else (pt.size(d,px,m) or [None])[0]
                     LV.lastBuy=None
-                    fill=LV.buy(a,k['ticker'],dirn,sz[0],ask,sizer=_sz)  # real order; edge re-checked at the live ask
+                    fill=LV.buy(a,k['ticker'],dirn,sz[0],ask,sizer=_sz,shadow=bool(meta.get('shadow')),mode=meta.get('mode','live'))
                     if fill:
                         with lock: t=pt.openLive(a,dirn,fill,k['strike'],k['close'],k['ticker'],meta,sz[1],sz[2])
                     elif LV.lastBuy in ('edge','nofill') and REST_SEC>0 and left>REST_SEC+60:
                         # missed at the live price: rest a limit at the signal price for REST_SEC, like XIII did
                         def _rest(a=a,tk=k['ticker'],d=dirn,ref=ask,szf=_sz,st=k['strike'],cl=k['close'],meta=meta,e=sz[1],q2=sz[2]):
-                            f=LV.rest_buy(a,tk,d,ref,szf,wait=REST_SEC,close_at=cl-30)
+                            f=LV.rest_buy(a,tk,d,ref,szf,wait=REST_SEC,close_at=cl-30,shadow=bool(meta.get('shadow')),mode=meta.get('mode','live'))
                             if f:
                                 with lock: pt.openLive(a,d,f,st,cl,tk,meta,e,q2)
                         threading.Thread(target=_rest,daemon=True).start(); sg['action']=f'live: resting limit @{ask:.2f} for {REST_SEC}s'; sigs[a]=sg; continue
@@ -752,9 +763,9 @@ def _ws_quote(tk,q):
     except Exception: pass
     try: tick_rec(tk,q)
     except Exception: pass
-    if not (LV and LV.enabled()): return
-    ts=[t for t in list(pt.trades) if t.get('mode')=='live' and t.get('status')=='open' and t.get('ticker')==tk and not t.get('exiting')]
-    if not ts: return
+    if not (LV and LV.allowed()): return
+    ts=[t for t in list(pt.trades) if not t.get('shadow') and t.get('mode')=='live' and t.get('status')=='open' and t.get('ticker')==tk and not t.get('exiting')]
+    if not ts or not LV.owner(): return
     if not lock.acquire(timeout=0.2): return
     try:
         now=time.time()
@@ -805,9 +816,14 @@ class H(SimpleHTTPRequestHandler):
                 if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
                 d['ticks']=dict(TICKS,queued=len(_tq))
                 d['leadlag']=LL.snapshot(pt.trades)
+                d['reconcile']=dict(RECON.state)
+                d['deployment']='position-sync-v1'
                 _re=[t for t in pt.trades if t.get('reentry')]; _rc=[t for t in _re if t.get('status')!='open']
                 d['reentries']=dict(count=len(_re),open=len(_re)-len(_rc),closed=len(_rc),wins=len([t for t in _rc if (t.get('pnl') or 0)>0]),pnl=round(sum(t.get('pnl') or 0 for t in _rc),2))
-                try: d['live']['cooldowns']=cooldowns()
+                try:
+                    d['live']['cooldowns']=cooldowns()
+                    d['live']['cooldownsEnabled']=COOLDOWNS_ENABLED
+                    d['live']['lossStreaks']=dict(_cool.get('streaks',{}))
                 except Exception as e: d['live']['cooldowns']={'error':str(e)}
                 b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
@@ -864,6 +880,27 @@ class H(SimpleHTTPRequestHandler):
             b=json.dumps({'before':before,'after':n,'balance':round(pt.balance,2)}).encode(); s.send_response(200)
         except Exception as e: b=json.dumps({'error':str(e)}).encode(); s.send_response(400)
         s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
+from reconcile import Reconciler
+RECON=Reconciler(LV,pt,lock)
+def _reconcile_loop():
+    while True:
+        RECON.run()
+        if LV and LV.allowed() and LV.owner():
+            # Reuse the exact websocket stop/lock checks immediately after adoption.
+            for t in list(pt.trades):
+                if t.get('mode')!='live' or t.get('shadow') or t.get('status')!='open': continue
+                try:
+                    q=LV.wsq(t['ticker'])
+                    if not q:
+                        m=LV.market(t['ticker'])
+                        if m.get('yes_bid_dollars') is None or m.get('yes_ask_dollars') is None: continue
+                        q=dict(yesBid=fnum(m,'yes_bid_dollars'),yesAsk=fnum(m,'yes_ask_dollars'))
+                    _ws_quote(t['ticker'],q)
+                except Exception as e: RECON.state['lastError']='adoption monitor: '+type(e).__name__
+        time.sleep(15)
+# Reconcile before the first strategy tick, not after it submits a new entry.
+RECON.run()
+threading.Thread(target=_reconcile_loop,daemon=True).start()
 threading.Thread(target=loop,daemon=True).start()
 print('Paper Desk (mode '+('LIVE' if LV and LV.enabled() else 'paper')+') on port',PORT,'data',TF,flush=True)
 ThreadingHTTPServer(('0.0.0.0',PORT),H).serve_forever()

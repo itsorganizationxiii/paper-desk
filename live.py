@@ -1,4 +1,5 @@
 import math
+from urllib.parse import urlencode
 # Live Kalshi execution for Paper Desk. ONE bot: when live (env LIVE_TRADING=1 + keys + not paused) the strategy
 # trades the real Kalshi cash directly; otherwise it paper-trades. This module never touches the paper balance.
 # Keeps its own small state doc ('live'): paused flag, realized-pnl daily kill switch, order log.
@@ -73,7 +74,9 @@ class Live:
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
         s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.entry_block=None
         s.cash=None; s.cashAt=None; s.lastError=None; s.ws=None
-        s.lease_ok=None  # set by server: False when a newer deploy instance owns live trading (Render overlap, Nov 7 #1033)
+        s.lease_ok=None
+        s.instance=uuid.uuid4().hex[:12]; s.own_orders={}; s.submitted_orders={}; s._lost_cleanup=False
+        s.pending_fills={}; s.active_orders=set(); s.position_generation=0; s._activity=threading.RLock()
         if s.allowed():
             try:
                 import kws
@@ -90,8 +93,12 @@ class Live:
         return None
     def allowed(s): return ENV_ALLOW and keys_present()
     def owner(s):
-        try: return s.lease_ok is None or bool(s.lease_ok())
-        except Exception: return True
+        try: ok=s.lease_ok is not None and bool(s.lease_ok())
+        except Exception: ok=False
+        if not ok and s.own_orders and not s._lost_cleanup:
+            s._lost_cleanup=True
+            threading.Thread(target=s.cancel_owned,daemon=True).start()
+        return ok
     def enabled(s): return s.allowed() and not s.paused and s.owner()
     def position(s,ticker):
         """Net Kalshi position for a ticker: >0 YES contracts, <0 NO contracts, None if unknown."""
@@ -150,7 +157,7 @@ class Live:
         if SWEEP and SHARD!=0 and main>=0.50: s.sweep(main)  # move main-pool cash into the crypto pool, like the Kalshi app does
         s.cash=round(v,2); s.cashAt=time.time(); return s.cash
     def sweep(s,amt):
-        if time.time()-getattr(s,'_sweepAt',0)<60: return
+        if not s.owner() or time.time()-getattr(s,'_sweepAt',0)<60: return
         s._sweepAt=time.time()
         try:
             cc=int(math.floor(amt*100))*100  # centicents, whole cents
@@ -178,46 +185,122 @@ class Live:
             m=s.market(ticker); k=f"{side.lower()}_{kind}"; v=m.get(k+'_dollars'); v=float(v) if v not in (None,'') else (m[k]/100 if m.get(k) is not None else None)
             return v if v and v>0 else None
         except Exception: return None
-    def _order(s,ticker,side,action,count,px,confirm=(3,0.6)):
-        if xrp_blocked(ticker): return 0,0,None,0.0,None,'blocked: XRP is shadow-only, never live'
-        # V2 single YES book: buy YES=bid@p, buy NO=ask@(1-p); sell YES=ask@p, sell NO=bid@(1-p)
+    def entry_allowed(s,asset,ticker,shadow=False,mode='live'):
+        return (not shadow and mode=='live' and not xrp_blocked(ticker) and not xrp_blocked(asset)
+                and s.enabled() and not s.killed and not (s.entry_block and s.entry_block(asset,ticker)))
+    def cancel_order(s,oid,ticker):
+        # Cleanup exception: a lost owner may cancel ONLY IDs submitted by this process.
+        if oid not in s.submitted_orders or s.submitted_orders[oid]['ticker']!=ticker:
+            return False
+        path=f'/portfolio/events/orders/{oid}?'+urlencode(dict(market_ticker=ticker,exchange_index=SHARD))
+        try:
+            c,d=api('DELETE',path)
+            s.log(action='cancel-own',orderId=oid,ticker=ticker,http=c,error=None if c in (200,204) else 'cancel not confirmed')
+            return c in (200,204)
+        except Exception as e:
+            s.log(action='cancel-own',orderId=oid,ticker=ticker,error=type(e).__name__)
+            return False
+    def cancel_owned(s):
+        for oid,info in list(s.own_orders.items()):
+            s.cancel_order(oid,info['ticker'])
+            try: s.order_result(oid,info['side'],info['price'])
+            except Exception: pass
+    @staticmethod
+    def fill_count(o):
+        return max([0.0]+[float(o.get(k) or 0) for k in ('fill_count','fill_count_fp','taker_fill_count','taker_fill_count_fp','filled_count')])
+    def pages(s,path,key):
+        rows=[]; cursor=None; seen=set()
+        while True:
+            url=path+('&' if '?' in path else '?')+urlencode(dict(cursor=cursor)) if cursor else path
+            c,d=api('GET',url)
+            if c!=200: raise RuntimeError(f'{key} HTTP {c}')
+            if key not in d: raise RuntimeError(f'{key} response missing')
+            rows.extend(d[key] or []); cursor=d.get('cursor')
+            if not cursor: return rows
+            if cursor in seen: raise RuntimeError('pagination cursor repeated')
+            seen.add(cursor)
+    @staticmethod
+    def order_fields(o,side,px):
+        fc=Live.fill_count(o); avg=o.get('average_fill_price_dollars') or o.get('average_fill_price')
+        fpx=px
+        if avg not in (None,''):
+            v=float(avg); fpx=v if side=='YES' else 1-v
+            if side=='NO' and abs(v-px)<abs(fpx-px): fpx=v
+        fee=float(o['average_fee_paid'])*fc if o.get('average_fee_paid') not in (None,'') else float(o.get('fees_dollars') or (float(o.get('taker_fees_dollars') or 0)+float(o.get('maker_fees_dollars') or 0)))
+        return fc,fpx,fee
+    def order_result(s,oid,side,px,initial=None,check_fills=True):
+        o=initial or {}; status_known=False
+        try:
+            c,d=api('GET',f'/portfolio/orders/{oid}?exchange_index={SHARD}')
+            if c==200 and d.get('order'):
+                o={**o,**d['order']}; status_known=True
+        except Exception: pass
+        fc,fpx,fee=s.order_fields(o,side,px)
+        if s.fill_count(initial or {})>fc: fc,fpx,fee=s.order_fields(initial,side,px)
+        try:
+            if not check_fills: raise LookupError('status-only confirmation')
+            fills=s.pages('/portfolio/fills?'+urlencode(dict(order_id=oid,exchange_index=SHARD,subaccount=0,limit=1000)),'fills')
+            fills=[f for f in fills if f.get('order_id')==oid]
+            qty=sum(float(f.get('count_fp') or f.get('count') or 0) for f in fills)
+            if qty>0 and qty>=fc-0.001:
+                costs=[]
+                for f in fills:
+                    v=f.get(side.lower()+'_price_dollars')
+                    if v is None:
+                        other=f.get(('no' if side=='YES' else 'yes')+'_price_dollars')
+                        if other is not None: v=1-float(other)
+                    if v is None: raise ValueError('fill price missing')
+                    costs.append(float(f.get('count_fp') or f.get('count') or 0)*float(v))
+                fc=qty; fpx=sum(costs)/qty; fee=sum(float(f.get('fee_cost') or 0) for f in fills)
+        except Exception: pass
+        terminal=status_known and str(o.get('status','')).lower() in ('executed','canceled','cancelled')
+        if terminal: s.own_orders.pop(oid,None)
+        return fc,fpx,round(fee,4),terminal
+    def pending(s,ticker,side,fc,price,fee,oid):
+        if fc>0:
+            s.pending_fills[oid]=dict(ticker=ticker,side=side,contracts=fc,price=price,fee=fee,at=time.time())
+    def _order(s,ticker,side,action,count,px,confirm=(3,0.6),shadow=False,mode='live'):
+        if shadow or mode!='live' or xrp_blocked(ticker): return 0,0,None,0.0,None,'blocked: shadow-only, never live'
+        asset=ticker.split('15M',1)[0].removeprefix('KX')
         book='bid' if (action=='buy')==(side=='YES') else 'ask'; yes=px if side=='YES' else 1-px
-        body=dict(ticker=ticker,client_order_id=f'pd-{uuid.uuid4().hex[:20]}',side=book,count=f'{count:.2f}',price=f'{max(0.01,min(0.99,yes)):.4f}',
+        client=f'pd-{s.instance}-{uuid.uuid4().hex[:12]}'
+        body=dict(ticker=ticker,client_order_id=client,side=book,count=f'{count:.2f}',price=f'{max(0.01,min(0.99,yes)):.4f}',
                   time_in_force='immediate_or_cancel',self_trade_prevention_type='taker_at_cross')
         if action=='sell': body['reduce_only']=True
-        if not s.owner(): return 0,0,None,0.0,None,'stale instance: newer deploy owns live trading'
-        c,d=api('POST','/portfolio/events/orders',body); o=d.get('order',d) if isinstance(d,dict) else {}
-        def _fc(o):
-            best=0.0
-            for k in ('fill_count','fill_count_fp','taker_fill_count','taker_fill_count_fp','filled_count'):
-                try: best=max(best,float(o.get(k) or 0))
-                except Exception: pass
-            return best
-        fc=_fc(o); oid0=o.get('order_id') or o.get('id')
-        if c in (200,201) and fc==0 and oid0:
-            # IOC responses can return before fills are reported (a real 1-contract fill was missed); confirm from the order
-            for _ in range(confirm[0]):
-                time.sleep(confirm[1])
-                try:
-                    c2,d2=api('GET',f'/portfolio/orders/{oid0}'); o2=(d2 or {}).get('order') or {}
-                    if o2: o={**o,**o2}; fc=_fc(o)
-                    if fc>0 or str(o2.get('status','')) in ('canceled','cancelled','executed'): break
-                except Exception: pass
-        avg=o.get('average_fill_price') or o.get('average_fill_price_dollars')
-        fpx=None
-        if fc>0:
-            if avg in (None,''): fpx=px
-            else:
-                a=float(avg); fpx=a if side=='YES' else 1-a
-                # V2 prices are YES-book; if the side-price reading is far off our limit, the API returned side terms
-                if side!='YES' and abs(a-px)<abs(fpx-px): fpx=a
-        fee=float(o['average_fee_paid'])*fc if o.get('average_fee_paid') not in (None,'') else float(o.get('taker_fees_dollars') or o.get('fees_dollars') or 0)
-        return c,fc,fpx,round(fee,4),o.get('order_id') or oid0,(None if c in (200,201) else json.dumps(d)[:200])
-    def buy(s,asset,ticker,side,frac,ref,sizer=None):
+        if not s.owner(): return 0,0,None,0.0,None,'stale instance: no lease'
+        if action=='buy' and not s.entry_allowed(asset,ticker,shadow,mode): return 0,0,None,0.0,None,'entry blocked'
+        with s._activity: s.active_orders.add(ticker); s.position_generation+=1
+        try:
+            c,d=api('POST','/portfolio/events/orders',body); o=d.get('order',d) if isinstance(d,dict) else {}
+            oid=o.get('order_id') or o.get('id'); fc,fpx,fee=s.order_fields(o,side,px)
+            if oid:
+                s.own_orders[oid]=dict(ticker=ticker,side=side,price=px,action=action,clientId=client)
+                s.submitted_orders[oid]=s.own_orders[oid]
+                s.log(action='order-submitted',ticker=ticker,side=side,orderId=oid,clientId=client,http=c)
+                terminal=False
+                for _ in range(confirm[0]):
+                    if action=='sell' and fc>0: break
+                    time.sleep(confirm[1]); fc,fpx,fee,terminal=s.order_result(oid,side,px,o,check_fills=action=='buy')
+                    if fc>=count-0.001 or terminal: break
+                if action=='buy' and fc<count-0.001:
+                    s.cancel_order(oid,ticker)
+                    # A cancel acknowledgment never proves zero fill. Re-read BOTH status and fills.
+                    for _ in range(3):
+                        f2,p2,fe2,terminal=s.order_result(oid,side,px,o)
+                        if f2>=fc: fc,fpx,fee=f2,p2,fe2
+                        if fc>=count-0.001: break
+                        time.sleep(0.2)
+                    if oid in s.own_orders:
+                        s.lastError='buy cancellation/status unresolved; reconciliation will retry'
+                if action=='buy': s.pending(ticker,side,fc,fpx,fee,oid)
+            return c,fc,fpx if fc else None,fee,oid,('buy cancel unresolved' if action=='buy' and oid in s.own_orders and fc<count-0.001 else (None if c in (200,201) else f'order HTTP {c}'))
+        finally:
+            with s._activity: s.active_orders.discard(ticker); s.position_generation+=1
+    def buy(s,asset,ticker,side,frac,ref,sizer=None,shadow=False,mode='live'):
         """Synchronous real buy. Returns dict(contracts,price,fee,cost,orderId,cash) when anything filled, else None (logged)."""
         a=dict(asset=asset,ticker=ticker,side=side)
         if xrp_blocked(ticker) or xrp_blocked(asset): s.lastBuy='blocked'; return None
-        if s.entry_block and s.entry_block(asset,ticker): s.lastBuy='blocked'; return None
+        if not s.entry_allowed(asset,ticker,shadow,mode): s.lastBuy='blocked'; return None
         with s.lock: s._rollday()
         if ASSETS is not None and asset not in ASSETS: return None
         if ticker in s.tried: return None
@@ -266,24 +349,15 @@ class Live:
         s.log(action='buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=round(cost/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc else 'no fill'),**a)
         if not fc: s.lastBuy='nofill' if (c in (200,201) or not err) else 'error'; return None
         s.cashAt=None
-        # Kalshi often fills below our limit and the order may not report its average price; trust the real cash change
-        try:
-            time.sleep(0.8); nc=s.balance(); spent=round(cash-nc,4)
-            if 0<spent<(cost+fee)*1.05 and spent>(cost+fee)*0.3:
-                s.log(action='fill-fix',error=f'cash-based cost {spent} vs limit-based {round(cost+fee,4)}',**a)
-                cost=max(0.0,spent-fee)
-        except Exception: pass
-        hs,hn=s.verify(ticker,side,fc,a)
-        if hs!=side or hn<=0: return None  # never record a position Kalshi doesn't show on our side (logged as position-mismatch)
-        if hn<fc: cost=cost*hn/fc; fee=fee*hn/fc; fc=hn
+        s.verify(ticker,side,fc,a)
         return dict(contracts=fc,price=round(cost/fc,4),fee=round(fee,4),cost=round(cost,4),orderId=oid,cash=cash,frac=frac,side=side)
-    def rest_buy(s,asset,ticker,side,ref,sizer,wait=30,close_at=None):
-        """Resting limit buy at the signal price: waits up to `wait`s for Kalshi to fill, then cancels the rest."""
+    def rest_buy(s,asset,ticker,side,ref,sizer,wait=30,close_at=None,shadow=False,mode='live'):
         a=dict(asset=asset,ticker=ticker,side=side)
-        if xrp_blocked(ticker) or xrp_blocked(asset): return None
-        if s.entry_block and s.entry_block(asset,ticker): return None
-        if ticker in s.resting or s.killed: return None
-        s.resting.add(ticker)
+        if not s.entry_allowed(asset,ticker,shadow,mode): return None
+        with s.lock:
+            if ticker in s.resting: return None
+            s.resting.add(ticker)
+        oid=None
         try:
             px=round(ref,2); f=sizer(px)
             if not f: return None
@@ -292,69 +366,41 @@ class Live:
             n=round(math.floor(usd/px*100)/100,2) if s.fracOK is not False else int(usd//px)
             if n<(0.01 if s.fracOK is not False else 1): return None
             book='bid' if side=='YES' else 'ask'; yes=px if side=='YES' else 1-px
-            body=dict(ticker=ticker,client_order_id=f'pd-{uuid.uuid4().hex[:20]}',side=book,count=f'{n:.2f}',price=f'{max(0.01,min(0.99,yes)):.4f}',
+            client=f'pd-{s.instance}-{uuid.uuid4().hex[:12]}'
+            body=dict(ticker=ticker,client_order_id=client,side=book,count=f'{n:.2f}',price=f'{max(0.01,min(0.99,yes)):.4f}',
                       time_in_force='good_till_canceled',self_trade_prevention_type='taker_at_cross',expiration_ts=int(time.time()+wait+2))
-            if not s.owner(): s.log(action='rest-buy',error='stale instance: newer deploy owns live trading',**a); return None
+            if not s.entry_allowed(asset,ticker,shadow,mode): return None
+            with s._activity: s.position_generation+=1
             c,d=api('POST','/portfolio/events/orders',body); o=(d or {}).get('order',d) if isinstance(d,dict) else {}
             oid=o.get('order_id') or o.get('id')
-            s.log(action='rest-buy-placed',orderId=oid,want=n,limit=px,http=c,error=None if c in (200,201) else json.dumps(d)[:200],**a)  # log at placement, not only at the end (thread may die on restart)
-            if c not in (200,201) or not oid:
-                s.log(action='rest-buy',want=n,limit=px,filled=0,http=c,error=json.dumps(d)[:200],**a); return None
-            fc=0.0; o2={}
-            t0=time.time()
-            while time.time()-t0<wait:
-                time.sleep(3)
-                try:
-                    c2,d2=api('GET',f'/portfolio/orders/{oid}'); o2=(d2 or {}).get('order') or {}
-                    fc=max([fc]+[float(o2.get(k) or 0) for k in ('fill_count','fill_count_fp','filled_count')])
-                    if fc>=n-1e-9 or str(o2.get('status','')) in ('executed','canceled','cancelled'): break
-                except Exception: pass
-            cancel=[]
-            if fc<n-1e-9:
-                for p in (f'/portfolio/orders/{oid}',f'/portfolio/events/orders/{oid}'):
-                    try:
-                        cc,dd=api('DELETE',p); cancel.append(f'{p.split("/")[2]}:{cc}')
-                        if cc in (200,201,204): break
-                    except Exception as e: cancel.append(f'err {e}')
-                # never lose track of an order: if it is still resting, keep watching until it fills/cancels/expires or the window ends
-                end=time.time()+max(0,close_at-time.time()) if close_at else time.time()+5
-                while True:
-                    time.sleep(0.5 if not cancel or time.time()<t0+wait+3 else 5)
-                    try:
-                        c2,d2=api('GET',f'/portfolio/orders/{oid}'); o2=(d2 or {}).get('order') or o2
-                        fc=max([fc]+[float(o2.get(k) or 0) for k in ('fill_count','fill_count_fp','filled_count')])
-                    except Exception: pass
-                    stt=str(o2.get('status',''))
-                    if stt!='resting' or fc>=n-1e-9 or time.time()>end: break
-                    if time.time()>t0+wait+3:
-                        try: api('DELETE',f'/portfolio/orders/{oid}')
-                        except Exception: pass
-            avg=o2.get('average_fill_price') or o2.get('average_fill_price_dollars'); fpx=px
-            if fc and avg not in (None,''):
-                v=float(avg); fpx=v if side=='YES' else 1-v
-                if side!='YES' and abs(v-px)<abs(fpx-px): fpx=v
-            fee=float(o2['average_fee_paid'])*fc if o2.get('average_fee_paid') not in (None,'') else float(o2.get('taker_fees_dollars') or o2.get('maker_fees_dollars') or o2.get('fees_dollars') or 0)
-            s.log(action='rest-buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=fpx if fc else None,fee=round(fee,4),http=c,error=((f'no fill in {wait}s' if not fc else 'filled while resting')+(f'; cancel {cancel} status {o2.get("status")}' if cancel else '')) if (not fc or cancel) else None,**a)
-            if not fc:  # cancel may race a fill: re-check Kalshi fills for this order before giving up (Nov 7 ETH ghost fill)
+            if oid:
+                s.own_orders[oid]=dict(ticker=ticker,side=side,price=px,action='buy',clientId=client)
+                s.submitted_orders[oid]=s.own_orders[oid]
+            s.log(action='rest-buy-placed',orderId=oid,clientId=client,want=n,limit=px,http=c,error=None if c in (200,201) else f'HTTP {c}',**a)
+            if not oid: return None
+            fc,fpx,fee,terminal=s.order_result(oid,side,px,o); end=time.time()+wait
+            while not terminal and fc<n-0.001 and time.time()<end and s.owner():
+                time.sleep(min(1,max(0,end-time.time())))
+                f2,p2,fe2,terminal=s.order_result(oid,side,px,o)
+                if f2>=fc: fc,fpx,fee=f2,p2,fe2
+            if fc<n-0.001:
+                s.cancel_order(oid,ticker)
                 for _ in range(3):
-                    try:
-                        time.sleep(1.5); cf,df=api('GET',f'/portfolio/fills?order_id={oid}')
-                        fl=(df or {}).get('fills') or []
-                        g=sum(float(x.get('count_fp') or x.get('count') or 0) for x in fl)
-                        if g>0:
-                            fc=round(g,2); pp=[float(x.get('yes_price_dollars') or x.get('no_price_dollars') or 0) for x in fl]
-                            fpx=px
-                            s.log(action='ghost-fill',orderId=oid,filled=fc,error='filled during cancel; now tracking',**a); break
-                    except Exception as e: s.log(action='ghost-fill',error=f'check err {e}',**a)
+                    f2,p2,fe2,terminal=s.order_result(oid,side,px,o)
+                    if f2>=fc: fc,fpx,fee=f2,p2,fe2
+                    if fc>=n-0.001: break
+                    time.sleep(0.2)
+            s.pending(ticker,side,fc,fpx,fee,oid)
+            s.log(action='rest-buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=fpx if fc else None,fee=fee,http=c,error=None if fc else ('no fill; canceled and rechecked' if terminal else 'no fill; cancellation unresolved'),**a)
             if not fc: return None
             s.tried.add(ticker); s.cashAt=None
-            hs,hn=s.verify(ticker,side,fc,a)
-            if hs!=side or hn<=0: return None
-            fc=min(fc,hn)
-            return dict(contracts=fc,price=round(fpx,4),fee=round(fee,4),cost=round(fc*fpx,4),orderId=oid,cash=cash,frac=f)
+            return dict(contracts=fc,price=round(fpx,4),fee=fee,cost=round(fc*fpx,4),orderId=oid,cash=cash,frac=f)
         except Exception as e:
-            s.log(action='rest-buy',error=f'{type(e).__name__}: {e}',**a); return None
-        finally: s.resting.discard(ticker)
+            if oid: s.cancel_order(oid,ticker)
+            s.log(action='rest-buy',orderId=oid,error=type(e).__name__,**a); return None
+        finally:
+            s.resting.discard(ticker)
+            with s._activity: s.position_generation+=1
     def sell(s,ticker,side,count,bid,floor=None,fast=False,skip_pos=False):
         """Synchronous real sell of up to count. Returns (filled, avg price, fee, orderId, error)."""
         if xrp_blocked(ticker): return 0,None,0.0,None,'blocked: XRP is shadow-only, never live'

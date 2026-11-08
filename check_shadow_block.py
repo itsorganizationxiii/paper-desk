@@ -7,7 +7,7 @@ calls=[]
 live._http=lambda *a,**k:(calls.append(a) or (200,{}))
 src=open('server.py').read(); tree=ast.parse(src)
 code=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if getattr(n,'name',None) in ('cooldowns','shadow_asset'))
-code+=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if isinstance(n,ast.Assign) and any(getattr(t,'id',None) in ('COOL_LOSSES','COOL_SEC','SHARED_COOL_LOSSES','SHARED_COOL_SEC','_cool','_cool_logged') for t in n.targets))
+code+=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if isinstance(n,ast.Assign) and any(getattr(t,'id',None) in ('COOLDOWNS_ENABLED','COOL_LOSSES','COOL_SEC','SHARED_COOL_LOSSES','SHARED_COOL_SEC','_cool','_cool_logged') for t in n.targets))
 class PT: trades=[]
 g=dict(time=time,datetime=datetime,ET=ET,pt=PT); exec(code,g)
 L=live.Live(); L.owner=lambda:True
@@ -26,6 +26,8 @@ reset(); chk('weekend-night ETH allowed (no cooldown)',not L.entry_block('ETH','
 now=time.time()
 mk=lambda a,p,ago:dict(mode='live',asset=a,status='lost' if p<0 else 'won',pnl=p,closedAt=now-ago)
 PT.trades=[mk('ETH',-0.5,900),mk('ETH',-0.4,600),mk('ETH',-0.3,300)]; reset()
+chk('cooldowns disabled by default; streaks tracked, no live block',not g['COOLDOWNS_ENABLED'] and not g['cooldowns']() and not L.entry_block('ETH','KXETH15M-X') and g['_cool']['streaks']['ETH']==3)
+g['COOLDOWNS_ENABLED']=True; reset()
 chk('ETH after 3 straight live losses refused',L.entry_block('ETH','KXETH15M-X') and L.buy('ETH','KXETH15M-X','YES',0.1,0.5) is None and L.lastBuy=='blocked')
 chk('cooldown ~55 min left',50<g['cooldowns']()['ETH']['minsLeft']<=60)
 chk('other coins have no per-coin cooldown but obey shared pause','BTC' not in g['cooldowns']() and 'SOL' not in g['cooldowns']() and 'ALL' in g['cooldowns']() and L.entry_block('BTC','KXBTC15M-X') and L.entry_block('SOL','KXSOL15M-X'))

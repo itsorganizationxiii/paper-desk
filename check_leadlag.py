@@ -60,7 +60,8 @@ class FakeLV:
         self.tried=set(); self.resting=set(); self.lastBuy=None; self.calls=[]
     def enabled(self): return True
     def wsq(self,tk): return quote(0.51,NOW)
-    def buy(self,asset,tk,side,frac,ask,sizer):
+    def buy(self,asset,tk,side,frac,ask,sizer,shadow=False,mode="live"):
+        assert not shadow and mode=="live"
         assert asset=='BTC' and tk.startswith('KXBTC15M-')
         assert sizer(ask) is not None
         self.calls.append((asset,tk,side))

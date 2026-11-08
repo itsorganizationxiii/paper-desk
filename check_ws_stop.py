@@ -35,6 +35,7 @@ want={'PaperTrader','_ws_quote'}
 code=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if getattr(n,'name',None) in want)
 calls=[]
 class FakeLV:
+    def owner(s): return True
     def enabled(s): return True
     def allowed(s): return True
     def stop_sell(s,*a):
