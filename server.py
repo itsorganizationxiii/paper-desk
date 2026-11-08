@@ -100,7 +100,7 @@ class PaperTrader:
         tr=sorted(m.values(),key=lambda t:(t.get('openedAt') or 0))
         for i,t in enumerate(tr,1): t['id']=i
         s.trades=tr
-        pp=[t for t in tr if t.get('mode')!='live']  # paper balance comes from paper trades only
+        pp=[t for t in tr if t.get('mode')!='live' and not t.get('shadow')]
         s.balance=s.start+sum(t.get('pnl') or 0 for t in pp if t.get('status')!='open')-sum(t.get('stake') or 0 for t in pp if t.get('status')=='open')
         s.save(); return len(tr)
     def save(s):
@@ -125,10 +125,11 @@ class PaperTrader:
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
         sz=s.size(side,ask,p_yes)
         if not sz: return None
-        f,edge,q=sz; bal=s.balance; stake=round(bal*f,2)
+        f,edge,q=sz; bal=s.balance; sh=bool(meta.get('shadow'))
+        stake=SHADOW_USD if sh else round(bal*f,2)
         if stake<0.05: return None
-        s.balance-=stake
-        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=round(100*stake/bal,2),contracts=round(stake/ask,3),
+        if not sh: s.balance-=stake
+        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=0 if sh else round(100*stake/bal,2),contracts=round(stake/ask,3),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
         t['perpPremium']=perp_premium(asset); t['regime']=regime(asset); t['flowAtEntry']=flow(asset)
         s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True)
@@ -139,14 +140,16 @@ class PaperTrader:
             pnl=round(payout-t['stake'],2); t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(pnl+(t.get('partialPnl') or 0),2),closedAt=time.time())
             if LV: LV.book(pnl); LV.log(action='settle',ticker=t['ticker'],side=t['side'],count=t['contracts'],result=t['status'],pnl=pnl)
         else:
-            t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(payout-t['stake'],2),closedAt=time.time()); s.balance+=payout
+            t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(payout-t['stake'],2),closedAt=time.time())
+            if not t.get('shadow'): s.balance+=payout
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
     def exit(s,t,bid,reason,fee=0.0):
         if t.get('mode')=='live': return s.exitLive(t,bid,reason)
         proceeds=t['contracts']*bid-fee
         t.update(status='exited',exitPrice=round(bid,4),exitReason=reason,exitFee=round(fee,2),settledBy='early-exit@bid',pnl=round(proceeds-t['stake'],2),closedAt=time.time())
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
-        s.balance+=proceeds; s.save(); print('EXIT',t['id'],reason,bid,flush=True)
+        if not t.get('shadow'): s.balance+=proceeds
+        s.save(); print('EXIT',t['id'],reason,bid,flush=True)
     def exitLive(s,t,bid,reason):
         # real sell runs off the lock; trade stays 'open' (flagged exiting) until the fill is known
         if not (LV and LV.allowed()): t['liveSellError']='live disabled (env/keys); holding to settlement'; return
@@ -218,13 +221,14 @@ class PaperTrader:
             c=[t for t in ts if t['status']!='open']; w=[t for t in c if t.get('pnl',0)>0]; o=[t for t in ts if t['status']=='open']
             return dict(trades=len(ts),closed=len(c),open=len(o),wins=len(w),winRate=round(len(w)/len(c),3) if c else 0,pnl=round(sum(t['pnl'] for t in c),2),
                 expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2))
-        pp=[t for t in s.trades if t.get('mode')!='live']; lt=[t for t in s.trades if t.get('mode')=='live']
-        P=st(pp); Lv=st(lt); A=st(s.trades); o=[t for t in pp if t['status']=='open']
+        pp=[t for t in s.trades if t.get('mode')!='live' and not t.get('shadow')]; lt=[t for t in s.trades if t.get('mode')=='live' and not t.get('shadow')]
+        P=st(pp); Lv=st(lt); A=st(pp+lt); o=[t for t in pp if t['status']=='open']
         sh={f'{x} shadow':st([t for t in s.trades if is_shadow(t) and t.get('asset')==x]) for x in ('ETH','XRP')}
         return dict(mode='paper',balance=round(s.balance,2),paperBalance=round(s.balance,2),startBalance=s.start,
             equity=round(s.balance+sum(t.get('markPrice',t['price'])*t['contracts'] for t in o),2),
             unrealizedPnl=P['unrealizedPnl'],winRate=P['winRate'],expectancy=P['expectancy'],paperStats=P,liveStats=Lv,shadowStats=sh,
             closed=A['closed'],open=A['open'],earlyExits=s.exitSummary(),trades=s.trades[::-1])
+SHADOW_USD=1.00
 LV=None
 lock=threading.Lock(); pt=PaperTrader()
 for _t in pt.trades:
