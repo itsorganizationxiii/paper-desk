@@ -15,9 +15,13 @@ MAX_RETRACE = 0.02
 MAX_LOG = 200
 # Owner request Nov 8 3:50 AM ET: require fresh EloEdge model p for our side >= this (None/missing skips)
 MIN_MODEL_P = 0.60
+# Owner request Nov 8 8:49 AM ET: pause lead-lag entries (set False to resume)
+LEADLAG_PAUSED = True
 
 
 def entry_skip(event, ticker, left, used=False, held=False, cooldown=False):
+    if LEADLAG_PAUSED:
+        return 'paused by user'
     if not ticker.startswith('KXBTC15M-') or event['ticker'] != ticker:
         return 'not matching BTC window'
     if left < MIN_LEFT:

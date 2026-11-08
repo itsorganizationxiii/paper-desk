@@ -1,4 +1,5 @@
 import leadlag as leadlag_mod
+leadlag_mod.LEADLAG_PAUSED = False
 """Offline deterministic lead-lag and server-entry tests. Never contacts Kalshi."""
 import ast
 import threading
