@@ -583,6 +583,7 @@ def ethlead_entry(k,model_p=None):
     try:
         now=time.time(); tk=k['ticker']; left=k['close']-now
         if not (LV and LV.enabled()): EL.last_reason='live disabled/paused/not lease owner'; return
+        if now<ethlead.ETHLEAD_RESUME_AT: EL.last_reason='paused by user until 8 AM ET'; return
         eq=LV.wsq('KXETH15M-'+tk.split('15M-',1)[1]); bq=LV.wsq(tk)
         side,ea,ba,gap,reason=el_eval(eq,bq,left,now)
         EL.last_reason=reason

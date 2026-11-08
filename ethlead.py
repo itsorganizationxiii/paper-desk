@@ -74,3 +74,6 @@ class EthLead:
                         lastCheckReason=self.last_reason, lastError=self.last_error,
                         thresholds=dict(gapC=[ETHLEAD_GAP[0]*100, ETHLEAD_GAP[1]*100], minLeftSec=ETHLEAD_MIN_LEFT,
                                         ethMinC=ETHLEAD_ETH_MIN*100, bandC=[BAND[0]*100, BAND[1]*100]))
+
+# User asked (Nov 8, 4:44 AM ET) to pause ethlead overnight; resumes 8:00 AM ET Nov 8 2026. Set 0 to disable the pause.
+ETHLEAD_RESUME_AT=1794142800

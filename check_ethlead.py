@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from pathlib import Path
 import ethlead
 from ethlead import evaluate, EthLead
+ethlead.ETHLEAD_RESUME_AT=0
 
 NOW=1000.0
 BTC='KXBTC15M-TEST'
