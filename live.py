@@ -12,7 +12,7 @@ def stake(usd,cash): return min(BET_USD,0.9*cash) if BET_USD>0 else usd
 MAX_USD=float(os.environ.get('LIVE_MAX_TRADE_USD','0')); DAILY_LOSS=float(os.environ.get('LIVE_DAILY_LOSS_USD','5'))
 _assets=os.environ.get('LIVE_ASSETS','').strip()
 ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for a in _assets.split(',') if a.strip()}
-SHARD=int(os.environ.get('LIVE_EXCHANGE_INDEX','2')); SWEEP=os.environ.get('LIVE_SWEEP','1')=='1'; BUY_SLIP=0.02; SELL_BUF=0.02; STOP_LIMIT_BUF=0.02; STOP_LIMIT_TRIES=3; STOP_RETRY_SEC=0.8; MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
+SHARD=int(os.environ.get('LIVE_EXCHANGE_INDEX','2')); SWEEP=os.environ.get('LIVE_SWEEP','1')=='1'; BUY_SLIP=0.02; SELL_BUF=0.02; STOP_LIMIT_BUF=0.02; STOP_LIMIT_TRIES=1; STOP_RETRY_SEC=0.0; STOP_CONFIRM=(1,0.4); MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
 def _key_id(): return os.environ.get('KALSHI_API_KEY_ID','').strip()
 def load_pem():
     b=os.environ.get('KALSHI_PRIVATE_KEY_B64','').strip()
@@ -178,7 +178,7 @@ class Live:
             m=s.market(ticker); k=f"{side.lower()}_{kind}"; v=m.get(k+'_dollars'); v=float(v) if v not in (None,'') else (m[k]/100 if m.get(k) is not None else None)
             return v if v and v>0 else None
         except Exception: return None
-    def _order(s,ticker,side,action,count,px):
+    def _order(s,ticker,side,action,count,px,confirm=(3,0.6)):
         if xrp_blocked(ticker): return 0,0,None,0.0,None,'blocked: XRP is shadow-only, never live'
         # V2 single YES book: buy YES=bid@p, buy NO=ask@(1-p); sell YES=ask@p, sell NO=bid@(1-p)
         book='bid' if (action=='buy')==(side=='YES') else 'ask'; yes=px if side=='YES' else 1-px
@@ -196,8 +196,8 @@ class Live:
         fc=_fc(o); oid0=o.get('order_id') or o.get('id')
         if c in (200,201) and fc==0 and oid0:
             # IOC responses can return before fills are reported (a real 1-contract fill was missed); confirm from the order
-            for _ in range(3):
-                time.sleep(0.6)
+            for _ in range(confirm[0]):
+                time.sleep(confirm[1])
                 try:
                     c2,d2=api('GET',f'/portfolio/orders/{oid0}'); o2=(d2 or {}).get('order') or {}
                     if o2: o={**o,**o2}; fc=_fc(o)
@@ -355,11 +355,11 @@ class Live:
         except Exception as e:
             s.log(action='rest-buy',error=f'{type(e).__name__}: {e}',**a); return None
         finally: s.resting.discard(ticker)
-    def sell(s,ticker,side,count,bid,floor=None):
+    def sell(s,ticker,side,count,bid,floor=None,fast=False,skip_pos=False):
         """Synchronous real sell of up to count. Returns (filled, avg price, fee, orderId, error)."""
         if xrp_blocked(ticker): return 0,None,0.0,None,'blocked: XRP is shadow-only, never live'
         c=fc=0; fee=0.0; oid=None; err=None; px=None; proceeds=0.0
-        p=s.position(ticker)
+        p=None if skip_pos else s.position(ticker)
         if p is not None:
             have=p if side=='YES' else -p
             if have<=0.0:
@@ -373,10 +373,10 @@ class Live:
             if floor is not None and px<floor:
                 if attempt==0 and q<floor: err=f'live bid {q} below floor {floor} (entry+1c); holding instead of selling at a loss'; break
                 px=floor
-            c,f1,p1,fe1,oid,err=s._order(ticker,side,'sell',left,px)
+            c,f1,p1,fe1,oid,err=s._order(ticker,side,'sell',left,px,confirm=(1,0.4) if fast else (3,0.6))
             if f1>0: proceeds+=f1*(p1 if p1 is not None else px); fc+=f1; fee+=fe1
             if err: break
-            if fc<count: time.sleep(0.7)
+            if fc<count: time.sleep(0.15 if fast else 0.7)
         if err: s.lastError=f'sell HTTP {c}: {err}'
         if fc: s.cashAt=None
         s.log(action='sell',ticker=ticker,side=side,orderId=oid,want=count,limit=px,filled=fc,fillPrice=round(proceeds/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc>=count else 'partial/no fill; rest held'))
@@ -398,14 +398,14 @@ class Live:
             q=s._quote(ticker,side,'bid') if attempt else bid
             if q is not None and q>=lim:
                 tries+=1
-                c,f1,p1,fe1,oid1,e1=s._order(ticker,side,'sell',left,lim)
+                c,f1,p1,fe1,oid1,e1=s._order(ticker,side,'sell',left,lim,confirm=STOP_CONFIRM)
                 if f1>0: proceeds+=f1*(p1 if p1 is not None else lim); fc+=f1; fee+=fe1; oid=oid1
                 if e1 and 'stale instance' in str(e1): err=e1; break
-            if fc<count-0.001 and attempt<STOP_LIMIT_TRIES-1: time.sleep(STOP_RETRY_SEC)
+            if fc<count-0.001 and attempt<STOP_LIMIT_TRIES-1 and STOP_RETRY_SEC>0: time.sleep(STOP_RETRY_SEC)
         lim_fc=fc; fb=False
         if fc<count-0.001 and not err:
             fb=True
-            f2,p2,fe2,o2,e2=s.sell(ticker,side,round(count-fc,2),s._quote(ticker,side,'bid') or bid)
+            f2,p2,fe2,o2,e2=s.sell(ticker,side,round(count-fc,2),s._quote(ticker,side,'bid') or bid,fast=True,skip_pos=True)
             if f2: proceeds+=f2*p2; fc+=f2; fee+=fe2; oid=o2 or oid
             err=e2
         fpx=round(proceeds/fc,4) if fc else None

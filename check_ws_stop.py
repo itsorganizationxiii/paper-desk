@@ -11,7 +11,7 @@ def chk(n,c):
 def mkLive(fill_limit, bids):
     L=live.Live(); L.owner=lambda:True; L.position=lambda tk:-2.0
     it=iter(bids); L._quote=lambda tk,sd,k:next(it,bids[-1])
-    def order(tk,side,action,count,px):
+    def order(tk,side,action,count,px,confirm=None):
         sent.append((tk,side,action,count,px))
         if fill_limit and px==fill_limit: return 201,count,px,0.01,'o1',None
         if not fill_limit and px!=0.34: return 201,count,px,0.01,"o2",None
@@ -24,7 +24,7 @@ lg=L.orders[-1]; chk('slippage fields logged',all(k in lg for k in ('stopLevel',
 sent.clear(); L=mkLive(None,[0.35,0.35,0.35,0.30,0.30])
 r=L.stop_sell('KXBTC15M-T','NO',2.0,0.359,0.35,time.time())
 lims=[s for s in sent if s[4]==0.34]
-chk('3 limit tries then aggressive fallback',len(lims)==3 and len(sent)>3 and r[0]==2.0 and L.orders[-1]['fallback'] is True)
+chk('1 limit try then aggressive fallback',len(lims)==1 and len(sent)>=2 and r[0]==2.0 and L.orders[-1]['fallback'] is True)
 sent.clear(); L=mkLive(None,[0.10])
 r=L.stop_sell('KXBTC15M-T','NO',2.0,0.359,0.10,time.time())
 chk('blown-through: no limit sent, falls back so never left unsold',not [s for s in sent if s[4]==0.34] and r[0]==2.0)
@@ -71,4 +71,11 @@ pt2.save=lambda:None; g2['pt']=pt2
 g2['_ws_quote']('KXBTC15M-U',dict(yesBid=0.25,yesAsk=0.27))
 time.sleep(0.5)
 chk('recorder exception -> stop still fires once',len(calls)==1 and pt2.trades[0]['status']=='exited')
+sent.clear(); L=mkLive(None,[0.35]); t0=time.time()
+live_sleep=[]; _ts=time.sleep
+import live as _lv
+_lv.time.sleep=lambda x:live_sleep.append(x)
+r=L.stop_sell('KXBTC15M-T','NO',2.0,0.359,0.35,time.time())
+_lv.time.sleep=_ts
+chk('worst-case built-in waits under 2s (limit miss + fallback)',sum(live_sleep)<2.0 and r[0]==2.0)
 raise SystemExit(0 if ok else 1)
