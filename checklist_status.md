@@ -94,3 +94,20 @@ Second parse bug: Kalshi fills are YES-book relative, a NO BUY shows as action=s
 Bot P&L (Kalshi records, bot tickers) -12.60; bot's own figure -13.96 (bot understates by 1.36, mostly #1034 +0.67, #988 -0.56, #1033 +0.44, #886, #989-992).
 Bot -12.60 + manual +3.46 = -9.13 vs balance-minus-deposits -9.15 -> leftover $0.02. PASS.
 Evaluation uses bot trades only.
+
+## Fill detection, fees, Kalshi-verified exit vs hold (Nov 08 12:25 PM ET, commit 704998b)
+(1) #1070 root cause: the bot's own order (client id pd-ba765f8f4a9f-..., an earlier instance) sold 1.44 NO at 42c at 3:52 AM ET; this instance never recorded it, then at 3:59 its stop found no position and booked 'external' at 0.7c. Fix: before any 'no fill'/external booking, _sellLive reads Kalshi fills on the ticker (non-entry orders since entry; price = held side's field) and books the real fill (fillRecovered=True). Non-stop sales also re-read with fills before reporting zero. Stops keep their fast path. Test: check_fill_recover.py (#1070 -> 1.44 @0.42, fee 0.0246, pnl -0.435; #1001 YES-sale case).
+(2) Fees: bot-ticker Kalshi fees 5.0075 vs bot 4.9056 (diff 0.10; #963 +0.052, #988 +0.03, #1029 +0.008). Now every closed live trade gets entryFee/exitFee from Kalshi fills (feesVerified, old values kept in feesBot), via backfill + a 10-minute verifier loop (plain code).
+(3) Exit vs hold, Kalshi-verified (hold = contracts*win - contracts*entry - Kalshi entry fee):
+```
+LIVE (Kalshi-verified) n=198 exit=-12.60 hold=-15.58 diff=2.98
+  profit lock  n= 67 exit=   8.79 hold=  19.58 exit-hold=-10.79
+  flip         n=  4 exit=  -0.56 hold=   1.47 exit-hold= -2.03
+  settled      n=  9 exit=   0.56 hold=   0.56 exit-hold=  0.00
+  breakeven    n=  3 exit=  -0.02 hold=  -0.04 exit-hold=  0.02
+  external     n=  1 exit=  -0.44 hold=  -1.02 exit-hold=  0.58
+  whale        n=  5 exit=   1.26 hold=   0.29 exit-hold=  0.97
+  take profit  n= 37 exit=   9.74 hold=   8.73 exit-hold=  1.01
+  paircash     n=  3 exit=   1.23 hold=  -0.85 exit-hold=  2.09
+  stop         n= 69 exit= -33.16 hold= -44.30 exit-hold= 11.13
+```
