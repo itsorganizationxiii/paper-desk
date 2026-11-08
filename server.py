@@ -471,6 +471,12 @@ def trend_dir(series):
         if len(rs)==TREND_N and len(set(rs))==1 and rs[0] in ('yes','no'): d=rs[0].upper()
     except Exception: d=c[1] if c else None
     _trend[series]=(time.time(),d); return d
+import uptilt
+def up_tilt_skip(a,ticker,side,edge,path):
+    if not uptilt.blocked(side,edge,need_edge(),wknd_night()): return False
+    print(f'up-tilt skip {path} {a} {ticker} edge={edge}',flush=True)
+    if LV: LV.log(defer=True,action='up-tilt-skip',ticker=ticker,side=side,path=path,reason='up-tilt',edge=None if edge is None else round(edge,3),need=round(need_edge()+uptilt.UP_TILT,3))
+    return True
 def need_edge(): return WKND_EDGE if wknd_night() else (NIGHT_EDGE if night() else MIN_EDGE)
 def metals_closed(ts=None):
     # Kalshi GOLD/SILVER closed: daily 17:00-18:00 ET, and Fri 17:00 ET -> Sun 18:00 ET (DST-aware)
@@ -504,6 +510,7 @@ def leadlag_entry(k):
             if reason=='BTC loss cooldown' and 'ALL' in cd: reason='ALL shared loss cooldown'
             if reason is None and now-ev['at']>LL_MAX_AGE: reason='stale trigger'
             if reason is None and not (LV and LV.enabled()): reason='live disabled/paused/not lease owner'
+            if reason is None and up_tilt_skip('BTC',tk,side,None,'leadlag'): reason='up-tilt'
             if reason is None and (tk in LV.tried or tk in LV.resting): reason='BTC order already working/tried'
             if reason is None and any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!='BTC' and t.get('closesAt')==k['close'] and t.get('side')!=side for t in trades):
                 reason='opposite live coin position this window'
@@ -649,7 +656,7 @@ def tick_once():
                     if shadow_asset(a): rmeta=dict(rmeta,shadow=True,mode='shadow')
                     t=None
                     if LV and LV.enabled() and not shadow_asset(a):
-                        if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
+                        if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting and not up_tilt_skip(a,k['ticker'],rd,None,'reversal'):
                             sz=pt.size(rd,rask,rmp)
                             if sz:
                                 _rs=lambda px,d=rd:None if px>REV_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
@@ -668,7 +675,7 @@ def tick_once():
                     rmeta=dict(priceSource='kalshi',signalSource='alt-consensus',fade=True,altConsensus=True,altVotes=av)
                     t=None
                     if LV and LV.enabled():
-                        if alt_cap_allow(k['ticker']) and k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
+                        if alt_cap_allow(k['ticker']) and k['ticker'] not in LV.tried and k['ticker'] not in LV.resting and not up_tilt_skip(a,k['ticker'],rd,None,'alt-consensus'):
                             sz=pt.size(rd,rask,rmp)
                             if sz:
                                 _as=lambda px,d=rd:None if px>ALT_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
@@ -708,10 +715,12 @@ def tick_once():
                 sg['action']='skip: opposite side of another coin open this window (BTC/ETH settle together ~84%)'; sigs[a]=sg; continue
             if WKND_MAX>0 and wknd_night() and ask>WKND_MAX: sg['action']=f'skip: weekend-night price cap ({ask:.2f} > {WKND_MAX:.2f})'; sigs[a]=sg; continue
             if LV and LV.enabled() and not shd:
+                if up_tilt_skip(a,k['ticker'],dirn,q-ask,'reentry' if meta.get('reentry') else 'eloedge'):
+                    sg['action']=f'skip: up-tilt (weekend-night Up edge {q-ask:+.3f} < {need_edge()+uptilt.UP_TILT:.2f})'; sigs[a]=sg; continue
                 sz=pt.size(dirn,ask,mp); t=None
                 if sz:
                     if k['ticker'] in LV.tried or k['ticker'] in LV.resting: sg['action']='live: order working / already tried this window'; sigs[a]=sg; continue
-                    _sz=lambda px,d=dirn,m=mp:None if (WKND_MAX>0 and wknd_night() and px>WKND_MAX) else (pt.size(d,px,m) or [None])[0]
+                    _sz=lambda px,d=dirn,m=mp:None if (WKND_MAX>0 and wknd_night() and px>WKND_MAX) or uptilt.blocked(d,(m if d=='YES' else 1-m)-px,need_edge(),wknd_night()) else (pt.size(d,px,m) or [None])[0]
                     LV.lastBuy=None
                     fill=LV.buy(a,k['ticker'],dirn,sz[0],ask,sizer=_sz,shadow=bool(meta.get('shadow')),mode=meta.get('mode','live'))
                     if fill:

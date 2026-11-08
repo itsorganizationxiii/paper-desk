@@ -78,7 +78,7 @@ def harness(ll=None,left=400,trades=None,cool=False):
     g=dict(LL=ll or scenario(),LV=L,pt=pt,time=SimpleNamespace(time=lambda:NOW),lock=threading.Lock(),
            cooldowns=lambda now=None: {'BTC':{}} if cool else {},entry_skip=entry_skip,
            LL_MIN_LEFT=180,LL_MAX_AGE=20,LL_FRESH=10,LL_MOVE=0.08,LL_RETRACE=0.02,is_shadow=lambda t:False,shadow_asset=lambda a:cool,
-           WKND_MAX=0.69,wknd_night=lambda:True,need_edge=lambda:0.07)
+           WKND_MAX=0.69,wknd_night=lambda:True,need_edge=lambda:0.07,up_tilt_skip=lambda *a:False)
     exec(code,g)
     k=dict(ticker=BTC,close=NOW+left,strike=100)
     g['leadlag_entry'](k)

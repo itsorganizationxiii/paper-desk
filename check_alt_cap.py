@@ -66,7 +66,7 @@ L=SimpleNamespace(enabled=lambda:True,tried=set(),resting=set(),buy=lambda *a,**
 pt.size=lambda *a:(.1,.08,.58)
 g.update(ALT=True,ALT_MAX=.60,LV=L,left=600,k=dict(ticker='KXBTC15M-NEXT',yesAsk=.5,noAsk=.5,close=NOW+600,strike=1),
          alt_votes=lambda tk:dict(SOL='YES',DOGE='YES',XRP='YES'),need_edge=lambda:.07,
-         is_shadow=lambda t:False,lock=threading.RLock(),sigs={},sg={})
+         is_shadow=lambda t:False,lock=threading.RLock(),sigs={},sg={},up_tilt_skip=lambda *a:False)
 original_allow=g['alt_cap_allow']
 g['alt_cap_allow']=lambda ticker:original_allow(ticker,NOW)
 exec(wrapper,g)
