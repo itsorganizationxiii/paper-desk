@@ -13,6 +13,12 @@ def stake(usd,cash): return min(BET_USD,0.9*cash) if BET_USD>0 else usd
 MAX_USD=float(os.environ.get('LIVE_MAX_TRADE_USD','0')); DAILY_LOSS=float(os.environ.get('LIVE_DAILY_LOSS_USD','5'))
 _assets=os.environ.get('LIVE_ASSETS','').strip()
 ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for a in _assets.split(',') if a.strip()}
+# Owner checklist #6 (Nov 8): hard per-trade cap and stale-data kill switch, set in code.
+HARD_MAX_USD=2.0
+STALE_GUARD=True
+STALE_KILL_N=3
+HARD_DAILY_LOSS=3.0
+def _daily_cap(): return min(DAILY_LOSS,HARD_DAILY_LOSS) if DAILY_LOSS>0 else HARD_DAILY_LOSS
 SHARD=int(os.environ.get('LIVE_EXCHANGE_INDEX','2')); SWEEP=os.environ.get('LIVE_SWEEP','1')=='1'; BUY_SLIP=0.02; SELL_BUF=0.02; STOP_LIMIT_BUF=0.02; STOP_LIMIT_TRIES=1; STOP_RETRY_SEC=0.0; STOP_CONFIRM=(1,0); MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
 def _key_id(): return os.environ.get('KALSHI_API_KEY_ID','').strip()
 def load_pem():
@@ -135,7 +141,7 @@ class Live:
         # kill switch counts ONLY realized pnl from live fills/settlements; balance changes (withdrawals/deposits) are ignored
         with s.lock:
             s._rollday(); s.dayPnl=round(s.dayPnl+pnl,2); s.totalPnl=round(s.totalPnl+pnl,2)
-            if DAILY_LOSS>0 and s.dayPnl<=-DAILY_LOSS and not s.killed: s.killed=True; s.killReason=f'realized live loss ${-s.dayPnl:.2f} today >= ${DAILY_LOSS:.2f}'
+            if s.dayPnl<=-_daily_cap() and not s.killed: s.killed=True; s.killReason=f'realized live loss ${-s.dayPnl:.2f} today >= ${_daily_cap():.2f}'
             s.persist()
     def log(s,defer=False,**kw):
         with s.lock:
@@ -311,12 +317,18 @@ class Live:
         if ticker in s.tried: return None
         s.tried.add(ticker)
         if s.killed: s.log(action='buy-skip',error=f'kill switch: {s.killReason}',**a); return None
+        if STALE_GUARD and s.ws and not shadow and s.wsq(ticker) is None:
+            s.staleN=getattr(s,'staleN',0)+1
+            if s.staleN>=STALE_KILL_N and not s.killed: s.killed=True; s.killReason=f'stale Kalshi data on {s.staleN} straight buy attempts'; s.persist()
+            s.log(action='buy-skip',error='stale Kalshi quote',**a); return None
+        s.staleN=0
         try: cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
         except Exception as e: s.lastError=f'balance: {e}'; s.log(action='buy-skip',error=s.lastError,**a); return None
         maxpx=min(0.99,round(ref+MAX_CHASE,2)) if sizer is None else 0.99
         usd=frac*cash
         if MAX_USD>0: usd=min(usd,MAX_USD)
         usd=stake(usd,cash)
+        usd=min(usd,HARD_MAX_USD)
         c=fc=0; fee=0.0; oid=None; err=None; px=None; n=0; cost=0.0
         for attempt in range(2):
             ask=s._quote(ticker,side,'ask')
@@ -466,5 +478,5 @@ class Live:
                 if (s.lastError or '').startswith('balance'): s.lastError=None
             except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'; s.cashAt=time.time()-55  # retry in ~5s
         return dict(enabled=s.enabled(),leaseHeld=s.allowed() and s.owner(),envAllow=ENV_ALLOW,keysPresent=keys_present(),paused=s.paused,baseUrl=BASE,cash=s.cash,
-            todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=DAILY_LOSS),
+            todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=_daily_cap()),
             maxTradeUsd=MAX_USD,maxChase=MAX_CHASE,assets=sorted(ASSETS) if ASSETS else 'all',fractional=s.fracOK,ws=(s.ws.status() if s.ws else None),lastError=s.lastError,recentOrders=s.orders[-20:][::-1])
