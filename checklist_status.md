@@ -40,3 +40,8 @@ Result: FAILED.
 - Partial fills: 0 trades filled under 90% of stake. Cancels/no-fills are not trade rows; they live only in the order log, which the server keeps to the last 200 entries, so older cancels cannot be audited.
 - No logic or size changed (owner: collect data only).
 Collector: complete-window rule added (windowlog.py): a window counts toward 300 only if samples cover from 60s before open to close with no gap over 5s, 57+ samples in the closing 60s, and Kalshi expiration_value present; otherwise flagged complete=False with incompleteReason and excluded from stats.
+
+## Nov 8, 2026 10:40 AM ET items
+- Paper not evidence: DONE. Recorded as a standing rule; paper results are excluded from strategy decisions. Only live Kalshi fills and idxcmp/books window data count.
+- Paper fills at real ask/bid and real fees: DONE earlier (commit 516ad4f, 2df7d1e). Paper entry re-checks the Kalshi websocket ask at that moment and skips (PAPER NOFILL) if it moved >1c worse, else fills at that ask; entry fee = Kalshi fee ceil(0.07*C*P*(1-P)); paper stops/locks run on the same websocket bid as live and pay the Kalshi exit fee.
+- Hold-to-settlement P&L: DONE (already logged). Every exited trade carries counterfactualPnl (P&L if held to settlement), finalResult, wouldHaveWon and exitSavedPnl next to the actual pnl: 189/189 live exited, 813/813 paper exited. Settled trades: hold P&L = actual pnl.

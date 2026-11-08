@@ -1044,6 +1044,8 @@ class H(SimpleHTTPRequestHandler):
             with lock:
                 d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); d['persistence']=PERSIST; d['live']=lv
                 live_on=bool(lv.get('enabled')); d['mode']='live' if live_on else 'paper'; d['liveCash']=lv.get('cash')
+                _lt=[t for t in pt.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status')!='open']; d['livePnlSinceStart']=round(sum(t.get('pnl') or 0 for t in _lt),2); d['liveStartAt']=min((t['openedAt'] for t in _lt),default=None)
+                d['netDeposits']=round(d['liveCash']-d['livePnlSinceStart'],2) if d.get('liveCash') is not None else None
                 if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
                 d['ticks']=dict(TICKS,queued=len(_tq))
                 d['leadlag']=LL.snapshot(pt.trades)
