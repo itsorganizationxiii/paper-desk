@@ -69,3 +69,14 @@ paper TOTAL n=878 exit=2127.00 hold=1492.41
   take profit n=307 exit=2242.52 hold=2093.26 diff=149.26
 {'pnl': 0.17, 'hold_pnl': 0.587, 'finalResult': 'no', 'exitReason': 'profitlock: ws quote, peak 0.820 -> bid 0.740; fee $0.03', 'price': 0.6}
 ```
+
+## #3 reconciliation rerun (Nov 08 12:08 PM ET, commit 5ff8720)
+Cause on #1001: Kalshi reports a YES sell as action=sell side=no at the NO price (0.95); the parser booked 0.95 instead of 0.05. Settlement fee_cost also repeated the fill fees (double count). #1001 before: Kalshi-side +2.0544; after: -1.2908 (bot -1.29, match).
+Live sell path: uses order average_fill_price (YES-book), flipped for NO in order_fields; #1001 exitPrice 0.05 matches Kalshi -> bot side handling OK.
+Sanity bounds now on every stored P&L (server save + truthfix); flagged so far: none in bot rows.
+Net deposits since first live trade #878 (Nov 6 12:06 PM ET), from Kalshi /portfolio/deposits+withdrawals: +20.24 (fee 0.40) - 1.11 - 10.12 = +9.01 (8.61 after deposit fee).
+Balance change 15.66 -> 15.12 = -0.54. Trading P&L implied = -9.55 (-9.15 if fee taken from deposit).
+Kalshi per-ticker P&L (fixed parser) -7.93; bot -13.45 (pre-#1070 restore; #1070 now -0.435 from fills, was -1.01 estimate / +0.07 buggy).
+Leftover: bot vs balance-implied ~ -3.9; Kalshi-calc vs balance-implied ~ +1.6. NOT passed.
+Still out of bounds on Kalshi side: #1055 +2.24, #1044 +2.07, #1068 +2.00 on ~$1 stakes -> another parse case (likely lock-hold/multi-order tickers). Next: dump their raw fills.
+The -14.53 vs -13.45: same bot sum before vs after truthfix replaced estimated trades (#878, #988, #1070) with buggy Kalshi values; those are now redone.
