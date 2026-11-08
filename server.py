@@ -553,6 +553,49 @@ def leadlag_entry(k):
             LL.finish(ev,'entry error: '+type(e).__name__)
             print('leadlag entry error',type(e).__name__,flush=True)
 
+from ethlead import EthLead, evaluate as el_eval, ETHLEAD_MIN_LEFT as EL_MIN_LEFT
+EL=EthLead()
+def ethlead_entry(k):
+    # ETH-leads-BTC: buy BTC on ETH's >50c side when BTC is 7-10c cheaper; one per window.
+    try:
+        now=time.time(); tk=k['ticker']; left=k['close']-now
+        if not (LV and LV.enabled()): EL.last_reason='live disabled/paused/not lease owner'; return
+        eq=LV.wsq('KXETH15M-'+tk.split('15M-',1)[1]); bq=LV.wsq(tk)
+        side,ea,ba,gap,reason=el_eval(eq,bq,left,now)
+        EL.last_reason=reason
+        if reason: return
+        ev=dict(at=now,ticker=tk,side=side,ethAsk=ea,btcAsk=ba,gapC=round(gap*100,2),secsLeft=round(left),status='pending',skipReason=None)
+        with lock: trades=list(pt.trades)
+        if tk in EL.attempted or any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('signalSource')=='ethlead' for t in trades): reason='already traded ethlead this window'
+        elif any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('status')=='open' for t in trades): reason='BTC position already open'
+        elif shadow_asset('BTC'): reason='BTC shadow/cooldown'
+        elif tk in LV.tried or tk in LV.resting: reason='BTC order already working/tried'
+        elif any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!='BTC' and t.get('closesAt')==k['close'] and t.get('side')!=side for t in trades): reason='opposite live coin position this window'
+        elif WKND_MAX>0 and wknd_night() and ba>WKND_MAX: reason='weekend price cap'
+        if reason is None:
+            q=min(ba+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
+            def size_at(px):
+                if k['close']-time.time()<EL_MIN_LEFT or not LV.enabled() or shadow_asset('BTC'): return None
+                if WKND_MAX>0 and wknd_night() and px>WKND_MAX: return None
+                if not (0.40<=px<=0.69): return None
+                return (pt.size(side,px,mp) or [None])[0]
+            sz=pt.size(side,ba,mp)
+            if not sz or size_at(ba) is None: reason='normal entry price/edge filter'
+        if reason:
+            if not EL.events or EL.events[-1].get('ticker')!=tk or EL.events[-1].get('skipReason')!=reason:
+                ev.update(status='skipped',skipReason=reason); EL.log(ev)
+            return
+        EL.attempted={x for x in EL.attempted if x==tk}; EL.attempted.add(tk)
+        fill=LV.buy('BTC',tk,side,sz[0],ba,sizer=size_at,shadow=False,mode='live')
+        if fill:
+            meta=dict(priceSource='kalshi',signalSource='ethlead',ethlead=True,ethleadEthAsk=ea,ethleadBtcAsk=ba,ethleadGap=gap)
+            with lock: trade=pt.openLive('BTC',side,fill,k['strike'],k['close'],tk,meta,sz[1],sz[2])
+            ev.update(status='filled',tradeId=trade['id'])
+        else: ev.update(status='skipped',skipReason='no fill: '+str(LV.lastBuy or 'execution guard'))
+        EL.log(ev)
+    except Exception as e:
+        EL.last_error=type(e).__name__; print('ethlead entry error',type(e).__name__,flush=True)
+
 last_pyth=[0]
 def tick_once():
     src={}; spot={}; sigs={}
@@ -645,6 +688,7 @@ def tick_once():
         mp=fresh(k['ticker']); sg['modelP']=mp
         left=k['close']-time.time(); sg['secsToClose']=round(left)
         if a=='BTC': leadlag_entry(k)
+        if a=='BTC': ethlead_entry(k)
         if REV and 600<=left<=840 and not any(t.get('ticker')==k['ticker'] for t in pt.trades):
             # reversal bet (user test, Nov 7): after 3+ same-way settles, buy the other side early in the window; backtest 59% wins
             td=trend_dir(k['ticker'].split('-')[0])
@@ -884,6 +928,7 @@ class H(SimpleHTTPRequestHandler):
                 if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
                 d['ticks']=dict(TICKS,queued=len(_tq))
                 d['leadlag']=LL.snapshot(pt.trades)
+                d['ethlead']=EL.snapshot(pt.trades)
                 try: d['tradeFlow']=LV.ws.trade_flow() if (LV is not None and getattr(LV,'ws',None) is not None) else dict(enabled=False)
                 except Exception as e: d['tradeFlow']=dict(error=str(e)[:200])
                 d['reconcile']=dict(RECON.state)
