@@ -223,7 +223,7 @@ class PaperTrader:
                 expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2))
         pp=[t for t in s.trades if t.get('mode')!='live' and not t.get('shadow')]; lt=[t for t in s.trades if t.get('mode')=='live' and not t.get('shadow')]
         P=st(pp); Lv=st(lt); A=st(pp+lt); o=[t for t in pp if t['status']=='open']
-        sh={f'{x} shadow':st([t for t in s.trades if is_shadow(t) and t.get('asset')==x]) for x in ('ETH','XRP')}
+        sh={f'{x} shadow':st([t for t in s.trades if is_shadow(t) and t.get('asset')==x]) for x in ('BTC','ETH','SOL','XRP')}
         return dict(mode='paper',balance=round(s.balance,2),paperBalance=round(s.balance,2),startBalance=s.start,
             equity=round(s.balance+sum(t.get('markPrice',t['price'])*t['contracts'] for t in o),2),
             unrealizedPnl=P['unrealizedPnl'],winRate=P['winRate'],expectancy=P['expectancy'],paperStats=P,liveStats=Lv,shadowStats=sh,
@@ -262,7 +262,7 @@ try:
             except Exception: pass
             _lease['at']=time.time(); return _lease['ok']
         LV.lease_ok=_lease_ok
-    LV.entry_block=lambda asset,ticker:shadow_asset(str(asset).upper()) or 'XRP' in str(ticker).upper() or ('KXETH' in str(ticker).upper() and wknd_night())
+    LV.entry_block=lambda asset,ticker:shadow_asset(str(asset).upper()) or 'XRP' in str(ticker).upper()
     print('live mode:', 'LIVE' if LV.enabled() else ('paused' if LV.allowed() else 'off'),flush=True)
 except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print('live init err',LIVE_INIT_ERR,flush=True)
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
@@ -331,9 +331,27 @@ def wknd_night(ts=None):
     # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
     d=datetime.fromtimestamp(ts or time.time(),ET); wd,h=d.weekday(),d.hour
     return (wd==4 and h>=17) or wd in (5,6) or (wd==0 and h<9)
+COOL_LOSSES=3; COOL_SEC=3600; _cool={'at':0,'map':{}}; _cool_logged=set()
+def cooldowns(now=None):
+    # per-coin loss-streak cooldown, derived from closed live trades so restarts keep it
+    now=now or time.time()
+    if now-_cool['at']<5 and _cool['map'] is not None: return _cool['map']
+    tr=sorted([t for t in pt.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status') in ('won','lost','exited') and t.get('closedAt')],key=lambda t:t['closedAt'])
+    st={}; out={}
+    for t in tr:
+        a=t.get('asset'); s=st.setdefault(a,{'streak':0,'until':0})
+        if (t.get('pnl') or 0)<0:
+            s['streak']+=1
+            if s['streak']>=COOL_LOSSES: s['until']=t['closedAt']+COOL_SEC; s['streak']=0
+        else: s['streak']=0
+    for a,s in st.items():
+        if s['until']>now:
+            out[a]=dict(until=round(s['until']),minsLeft=round((s['until']-now)/60,1))
+            if (a,round(s['until'])) not in _cool_logged: _cool_logged.add((a,round(s['until']))); print('COOLDOWN',a,'shadow-only until',datetime.fromtimestamp(s['until'],ET).strftime('%H:%M ET'),flush=True)
+    _cool.update(at=now,map=out); return out
 def shadow_asset(a,ts=None):
-    # paper-only shadow (user Nov 7): XRP always; ETH on weekend nights. Never a live entry.
-    return a=='XRP' or (a=='ETH' and wknd_night(ts))
+    # paper-only shadow: XRP always; any coin in a loss-streak cooldown. Never a live entry.
+    return a=='XRP' or a in cooldowns()
 def is_shadow(t): return bool(t.get('shadow'))
 ALT=os.environ.get('ALT_CONSENSUS','1')!='0'; ALT_MAX=float(os.environ.get('ALT_MAX_PRICE','0.60')); _altc={}
 def alt_votes(btc_ticker):
@@ -698,6 +716,8 @@ class H(SimpleHTTPRequestHandler):
                 live_on=bool(lv.get('enabled')); d['mode']='live' if live_on else 'paper'; d['liveCash']=lv.get('cash')
                 if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
                 d['ticks']=dict(TICKS,queued=len(_tq))
+                try: d['live']['cooldowns']=cooldowns()
+                except Exception as e: d['live']['cooldowns']={'error':str(e)}
                 b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/trades.csv':
