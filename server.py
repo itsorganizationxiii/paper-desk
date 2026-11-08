@@ -13,6 +13,9 @@ APP=os.path.dirname(os.path.abspath(__file__))
 DATA=os.environ.get('DATA_DIR',APP); os.makedirs(DATA,exist_ok=True)
 TF=os.path.join(DATA,'trades.json'); SEED=os.path.join(APP,'seed_trades.json')
 PORT=int(os.environ.get('PORT','8080')); START=float(os.environ.get('START_BALANCE','10'))
+# Owner request Nov 8 9:12 AM ET: paper balance test at the real Kalshi balance. Pre-test paper balance was 2136.83. Set PAPER_TEST_AT=0 to restore (trades/logs kept).
+PAPER_TEST_AT=1794147162
+PAPER_TEST_START=15.12
 KEY=os.environ.get('ELOEDGE_API_KEY','')
 KALSHI='https://api.elections.kalshi.com/trade-api/v2'; CB='https://api.exchange.coinbase.com'
 ELO='https://eloedge.com/api/v1/windows'; HERMES='https://hermes.pyth.network'
@@ -103,7 +106,9 @@ class PaperTrader:
         for i,t in enumerate(tr,1): t['id']=i
         s.trades=tr
         pp=[t for t in tr if t.get('mode')!='live' and not t.get('shadow')]
-        s.balance=s.start+sum(t.get('pnl') or 0 for t in pp if t.get('status')!='open')-sum(t.get('stake') or 0 for t in pp if t.get('status')=='open')
+        st=s.start
+        if PAPER_TEST_AT: pp=[t for t in pp if (t.get('openedAt') or 0)>=PAPER_TEST_AT]; st=PAPER_TEST_START
+        s.balance=st+sum(t.get('pnl') or 0 for t in pp if t.get('status')!='open')-sum(t.get('stake') or 0 for t in pp if t.get('status')=='open')
         s.save(); return len(tr)
     def save(s):
         tmp=TF+'.tmp'; json.dump({'balance':round(s.balance,4),'startBalance':s.start,'trades':s.trades},open(tmp,'w'),indent=1); os.replace(tmp,TF)
