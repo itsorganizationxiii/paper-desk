@@ -146,6 +146,9 @@ class Live:
     def log(s,defer=False,**kw):
         with s.lock:
             s.orders.append(dict(at=time.time(),**kw)); s.orders=s.orders[-200:]
+            if getattr(s,'orderlog',None) is not None:
+                try: s.orderlog.insert_one(dict(at=time.time(),**kw))
+                except Exception as e: s.lastError=f'orderlog: {e}'
             if not defer: s.persist()
     def balance(s):
         # Kalshi balance endpoint: 1 call/sec, no burst. Space calls >=2s apart and reuse the last value in between.
