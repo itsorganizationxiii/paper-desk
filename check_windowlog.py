@@ -39,9 +39,29 @@ r,f=W.finalize(b,b+60,mk([t for t in full if not b-40<=t<b-30]),mkt); ck('gap in
 c=Col(); r,f=W.finalize(b,b+60,mk(full),mkt); a1=W.save_window(c,r); a2=W.save_window(c,dict(r)); a3=W.save_window(c,dict(r,status='INCOMPLETE'))
 ck('duplicate finalize: one record, first wins',a1 and not a2 and not a3 and len(c.d)==1 and c.d[b]['status']=='COMPLETE')
 # 5. missing market data
-r,f=W.finalize(b,b+60,[],mkt); ck('no data INCOMPLETE',r['status']=='INCOMPLETE' and not r['complete'])
-r,f=W.finalize(b,b+300,mk(full),nomkt); ck('settlement pending not finalized early',r is None and not f)
-r,f=W.finalize(b,b+1900,mk(full),nomkt); ck('settlement never posted INVALID',r['status']=='INVALID' and not r['complete'])
+r,f=W.finalize(b,b+60,[],mkt); ck('no data INVALID, not counted',r['status']=='INVALID' and not r['complete'])
+r,f=W.finalize(b,b+60,mk(range(b-300,b)),mkt); ck('partial data INCOMPLETE',r['status']=='INCOMPLETE' and not r['complete'])
+r,f=W.finalize(b,b+300,mk(full),nomkt); ck('settlement late: data still COMPLETE, settlement PENDING',r['status']=='COMPLETE' and r['complete'] and r['settlement']=='PENDING')
+class C2(Col):
+    def update_one(s,q,u,upsert=False):
+        if '$set' in u:
+            k=q['boundary']
+            if s.d.get(k,{}).get('settlement')==q.get('settlement'): s.d[k].update(u['$set'])
+            return Res(None)
+        return Col.update_one(s,q,u,upsert)
+c2=C2(); W.save_window(c2,r); W.backfill_settlement(c2,c2.d[b],b+900,mkt)
+ck('late settlement backfilled without touching validity',c2.d[b]['settlement']=='SETTLED' and c2.d[b]['expirationValue']==75001 and c2.d[b]['status']=='COMPLETE')
+r,f=W.finalize(b,b+1900,mk(full),nomkt); ck('settlement never posted MISSING, data still valid',r['settlement']=='MISSING' and r['complete'])
+# durable writes: failed insert keeps samples queued, retry succeeds, duplicates are acked
+class Flaky(Col):
+    fail=True
+    def insert_many(s,rows,ordered=False):
+        if s.fail: s.fail=False; raise Exception('network down')
+        Col.insert_many(s,rows)
+fl=Flaky(); W._col['idxsec']=fl; W._pend[:]=mk(range(b,b+10))
+ck('write failure keeps samples queued',W._flush() is False and len(W._pend)==10)
+ck('retry writes them and clears queue',W._flush() and len(W._pend)==0 and len(fl.d)==10)
+W._pend[:]=mk(range(b,b+3)); ck('duplicate samples treated as acked',W._flush() and len(W._pend)==0)
 # counter counts unique valid only
 W._col['idxcmp']=c; c.d[b-900]=dict(boundary=b-900,complete=False,status='INCOMPLETE'); s=W.stats(); ck('counter = unique valid (1)',s['n']==1 and s['excluded']==1)
 print('ALL PASS' if ok else 'SOME FAILED'); raise SystemExit(0 if ok else 1)

@@ -144,13 +144,23 @@ def _sampler():
         med,dm,n=consolidated(); t=int(time.time())
         if med:
             row=(t,dm or med,n,med); _sec.append(row); _pend.append(row)
-        if len(_pend)>=5 and _col.get('idxsec') is not None: _flush()
+PEND_MAX=7200
 def _flush():
+    """Write queued samples; a sample leaves the queue only once Mongo acked it (or it already exists). Failures retry next pass."""
     from datetime import datetime, timezone
-    rows,_pend[:]=list(_pend),[]
+    if not _pend or _col.get('idxsec') is None: return True
+    rows=list(_pend[:500])
     try: _col['idxsec'].insert_many([dict(_id=t,v=v,n=n,med=m,boot=BOOT,at=datetime.now(timezone.utc)) for t,v,n,m in rows],ordered=False)
     except Exception as e:
-        if 'E11000' not in str(e) and 'duplicate' not in str(e).lower(): ST['secErr']=f'{type(e).__name__}: {str(e)[:120]}'
+        errs=getattr(e,'details',{}).get('writeErrors') if hasattr(e,'details') else None
+        dup_only=(errs is not None and all(x.get('code')==11000 for x in errs)) or (errs is None and ('E11000' in str(e) or 'duplicate' in str(e).lower()))
+        if not dup_only: ST['secErr']=f'{type(e).__name__}: {str(e)[:120]}'; ST['secRetries']=ST.get('secRetries',0)+1; return False
+    del _pend[:len(rows)]; ST['secWritten']=ST.get('secWritten',0)+len(rows); return True
+def _writer():
+    while True:
+        time.sleep(2)
+        while _pend and _flush(): pass
+        if len(_pend)>PEND_MAX: ST['secDropped']=ST.get('secDropped',0)+len(_pend)-PEND_MAX; del _pend[:len(_pend)-PEND_MAX]
 def _restore(now=None):
     """On boot, reload the last 20 min of persisted samples so the open window resumes instead of being discarded."""
     c=_col.get('idxsec')
@@ -163,63 +173,68 @@ def _restore(now=None):
 def _avg60(end,sec=None):
     xs=[x[1] for x in (sec if sec is not None else _sec) if end-60<=x[0]<end]
     return (sum(xs)/len(xs),len(xs)) if xs else (None,0)
-# Counting rule (documented in WINDOWS.md):
-#   window = BTC 15-min market closing at boundary b; observed span = [b-960, b) (60s pre-open for floor_strike + 900s).
-#   expected = 960 one-second samples.
-#   COMPLETE : >=957 samples, max gap <=5s, >=57 samples in the closing 60s, Kalshi expiration_value present.
-#   RECOVERED: spanned a restart/deploy, >=912 samples (95%), max gap <=60s, >=57 in closing 60s AND >=57 in the opening 60s, expiration_value present.
-#   INCOMPLETE: settlement present but coverage below that. INVALID: no settlement after 30 min, or no data at all.
-#   Only COMPLETE and RECOVERED count toward 300. Nothing is interpolated; every window is kept with its reason.
+# Counting rule (WINDOWS.md). Data validity is decided from our own samples only; Kalshi settlement is tracked separately
+# (settlement=SETTLED/PENDING/MISSING) and a valid window keeps counting while settlement is late.
+#   span [b-960,b), expected 960 1s samples.
+#   COMPLETE : >=957 samples, max gap <=5s, >=57 in closing 60s.
+#   RECOVERED: >=912 samples, max gap <=60s, >=57 in closing 60s and >=57 in opening 60s (spanned a deploy / feed drop).
+#   INCOMPLETE: below that.  INVALID: no samples at all.
+#   Only COMPLETE and RECOVERED count. Nothing is interpolated; every window is kept with its reason.
 EXPECTED=960
-def classify(b,sec,ev,boot=0):
+def classify(b,sec,boot=0):
     ts=sorted({x[0] for x in sec if b-EXPECTED<=x[0]<b})
     gaps=[y-x for x,y in zip([b-EXPECTED-1]+ts,ts+[b])]
     gap=max(gaps) if ts else EXPECTED
     n60=sum(1 for t in ts if t>=b-60); o60=sum(1 for t in ts if t<b-900)
-    restart=boot>b-EXPECTED
-    q=dict(expected=EXPECTED,received=len(ts),maxGapSec=gap,closing60=n60,opening60=o60,spannedRestart=restart,firstSample=ts[0] if ts else None)
-    if ev is None: st,why='INVALID','no settlement' if ts else 'no data'
+    q=dict(expected=EXPECTED,received=len(ts),maxGapSec=gap,closing60=n60,opening60=o60,spannedRestart=boot>b-EXPECTED,firstSample=ts[0] if ts else None)
+    if not ts: st,why='INVALID','no data'
     elif len(ts)>=957 and gap<=5 and n60>=57: st,why='COMPLETE',None
     elif len(ts)>=912 and gap<=60 and n60>=57 and o60>=57: st,why='RECOVERED','gap %ss'%gap
-    else: st,why='INCOMPLETE',('no data' if not ts else 'closing 60s has %d'%n60 if n60<57 else 'opening 60s has %d'%o60 if o60<57 else 'gap %ss'%gap if gap>60 else '%d/%d samples'%(len(ts),EXPECTED))
+    else: st,why='INCOMPLETE',('closing 60s has %d'%n60 if n60<57 else 'opening 60s has %d'%o60 if o60<57 else 'gap %ss'%gap if gap>60 else '%d/%d samples'%(len(ts),EXPECTED))
     q.update(status=st,complete=st in ('COMPLETE','RECOVERED'),incompleteReason=why); return q
 def _mkt(close_ts):
     ms=_get(f'{KALSHI}/markets?series_ticker={IDX_SERIES}&min_close_ts={close_ts-5}&max_close_ts={close_ts+5}')['markets']
     return ms[0] if ms else None
-def finalize(b,now,sec,mkt,boot=0):
-    """Build the row for the window closing at b. Returns (row, final). Not final while settlement may still post (<30 min)."""
-    end=mkt(b); nxt=mkt(b+900)
+def settle_fields(b,now,end,avg,med):
     ev=float(end['expiration_value']) if end and end.get('expiration_value') else None
-    if ev is None and now-b<1800: return None,False
+    es=float(end['floor_strike']) if end and end.get('floor_strike') is not None else None
+    f=dict(expirationValue=ev,endWindow=end['ticker'] if end else None,endResult=(end.get('result') or None) if end else None,endStrike=es,
+           errEnd=(avg-ev if avg and ev else None),errEndMedian=(med-ev if med and ev else None),
+           settlement='SETTLED' if ev is not None else ('PENDING' if now-b<1800 else 'MISSING'))
+    if avg and es: f['rebuiltResult']='yes' if avg>=es else 'no'
+    return f
+def finalize(b,now,sec,mkt,boot=0):
+    """Row for the window closing at b, built as soon as the window closes; settlement may be PENDING and is filled later."""
+    end=mkt(b); nxt=mkt(b+900)
     fs=float(nxt['floor_strike']) if nxt and nxt.get('floor_strike') is not None else None
     avg,n=_avg60(b,sec); _m=[x[3] for x in sec if b-60<=x[0]<b]; med=sum(_m)/len(_m) if _m else None
-    row=dict(_id=f'{IDX_SERIES}-{b}',boundary=b,ms=int(now*1000),rebuilt=avg,rebuiltMedian=med,samples=n,floorStrike=fs,expirationValue=ev,
-             startWindow=nxt['ticker'] if nxt else None,endWindow=end['ticker'] if end else None,endResult=end.get('result') if end else None,
-             endStrike=float(end['floor_strike']) if end and end.get('floor_strike') is not None else None,
-             errStart=(avg-fs if avg and fs else None),errEnd=(avg-ev if avg and ev else None),
-             errStartMedian=(med-fs if med and fs else None),errEndMedian=(med-ev if med and ev else None),
+    row=dict(_id=f'{IDX_SERIES}-{b}',boundary=b,ms=int(now*1000),rebuilt=avg,rebuiltMedian=med,samples=n,floorStrike=fs,
+             startWindow=nxt['ticker'] if nxt else None,errStart=(avg-fs if avg and fs else None),errStartMedian=(med-fs if med and fs else None),
              venues=dict(ST['venues']),feeds={k:dict(v) for k,v in FEED.items()},boot=boot)
-    row.update(classify(b,sec,ev,boot))
-    if avg and row['endStrike']: row['rebuiltResult']='yes' if avg>=row['endStrike'] else 'no'
+    row.update(classify(b,sec,boot)); row.update(settle_fields(b,now,end,avg,med))
     return row,True
 def save_window(c,row):
-    """Idempotent: first final write wins; repeats (other instance, retry, redeploy) are no-ops."""
+    """Idempotent: first write wins; repeats (other instance, retry, redeploy) are no-ops."""
     r=c.update_one({'boundary':row['boundary']},{'$setOnInsert':row},upsert=True)
     return bool(getattr(r,'upserted_id',None))
+def backfill_settlement(c,row,now,mkt):
+    """Only touches settlement fields of a PENDING row; data validity is never changed."""
+    f=settle_fields(row['boundary'],now,mkt(row['boundary']),row.get('rebuilt'),row.get('rebuiltMedian'))
+    if f['settlement']=='PENDING': return False
+    c.update_one({'boundary':row['boundary'],'settlement':'PENDING'},{'$set':f}); return True
 def _idx_loop(owner):
     while True:
         time.sleep(5)
         if not owner(): continue
-        c=_col.get('idxcmp'); now=time.time(); last=int(now//900)*900
-        for b in range(last-1800,last+1,900):   # current boundary and the two before (settlement can lag)
-            if now-b<20: continue
-            try:
-                if c is not None and c.find_one({'boundary':b},{'_id':1}): continue
-                row,final=finalize(b,now,list(_sec),_mkt,BOOT)
-                if not final: continue
+        c=_col.get('idxcmp'); now=time.time(); b=int(now//900)*900
+        try:
+            if now-b>=20 and (c is None or not c.find_one({'boundary':b},{'_id':1})):
+                row,_=finalize(b,now,list(_sec),_mkt,BOOT)
                 if c is None or save_window(c,row): ST['idxRows']+=1
-                ST['lastWindow']=dict(boundary=b,status=row['status'],reason=row['incompleteReason'])
-            except Exception as e: ST['idxErr']=f'{type(e).__name__}: {str(e)[:120]}'
+                ST['lastWindow']=dict(boundary=b,status=row['status'],reason=row['incompleteReason'],settlement=row['settlement'])
+            if c is not None and int(now)%60<5:
+                for r in c.find({'settlement':'PENDING'},{'boundary':1,'rebuilt':1,'rebuiltMedian':1}): backfill_settlement(c,r,now,_mkt)
+        except Exception as e: ST['idxErr']=f'{type(e).__name__}: {str(e)[:120]}'
 def stats():
     c=_col.get('idxcmp')
     out=dict(ST,feeds={k:dict(v) for k,v in FEED.items()},boot=BOOT)
@@ -228,8 +243,8 @@ def stats():
     by=collections.Counter(r.get('status') or ('LEGACY-COMPLETE' if r.get('complete') else 'LEGACY-EXCLUDED') for r in allr)
     errs=[abs(e) for r in rows for e in (r.get('errStart'),r.get('errEnd')) if e is not None]
     dis=[r for r in rows if r.get('rebuiltResult') and r.get('endResult')]
-    out.update(n=len(rows),windows=len(rows),excluded=len(allr)-len(rows),byStatus=dict(by),errN=len(errs),
-               recent=[{k:r.get(k) for k in ('boundary','status','incompleteReason','received','maxGapSec','closing60','spannedRestart')} for r in sorted(allr,key=lambda r:r['boundary'])[-8:]])
+    out.update(pendingWrites=len(_pend),settlementPending=sum(1 for r in rows if r.get('settlement')=='PENDING'),n=len(rows),windows=len(rows),excluded=len(allr)-len(rows),byStatus=dict(by),errN=len(errs),
+               recent=[{k:r.get(k) for k in ('boundary','status','incompleteReason','settlement','received','maxGapSec','closing60','spannedRestart')} for r in sorted(allr,key=lambda r:r['boundary'])[-8:]])
     if errs:
         s=sorted(errs); out.update(meanAbsErr=round(sum(s)/len(s),3),stdErr=round(statistics.pstdev(s),3),p95AbsErr=round(s[min(len(s)-1,int(0.95*len(s)))],3))
     if dis: out['upDownDisagree']=round(sum(r['rebuiltResult']!=r['endResult'] for r in dis)/len(dis),4); out['disagreeN']=len(dis)
@@ -250,4 +265,4 @@ def start(db,owner=lambda:True):
     _ws('gemini','wss://api.gemini.com/v2/marketdata',{'type':'subscribe','subscriptions':[{'name':'l2','symbols':['BTCUSD']}]},_p_gm2)
     _ws('cryptocom','wss://stream.crypto.com/exchange/v1/market',{'id':1,'method':'subscribe','params':{'channels':['book.BTC_USD.50']}},_p_cdc)
     _ws('bullish','wss://api.exchange.bullish.com/trading-api/v1/market-data/tick/BTCUSD',None,_p_bl)
-    for f,a in ((_sampler,()),(_book_loop,(owner,)),(_idx_loop,(owner,))): threading.Thread(target=f,args=a,daemon=True).start()
+    for f,a in ((_sampler,()),(_writer,()),(_book_loop,(owner,)),(_idx_loop,(owner,))): threading.Thread(target=f,args=a,daemon=True).start()
