@@ -1,6 +1,7 @@
 # One strategy engine, two modes. PAPER (default): simulated trades/balance, exactly as before.
 # LIVE (env LIVE_TRADING=1 + Kalshi keys + dashboard not paused): same engine trades the real Kalshi cash; trades are
 # recorded only when contracts actually fill (mode='live'). Live never touches the paper balance (it stays frozen).
+import lockhold as LH
 import uuid,json, os, time, math, threading, urllib.request, shutil, csv, io
 from datetime import timezone, timedelta
 try:
@@ -656,6 +657,7 @@ def tick_once():
             with lock:
                 t.update(markPrice=round(bid,4),unrealizedPnl=round(t['contracts']*bid-t['stake'],2),signalsAgree=bool(agree),
                          flipWarning=bool(sig_against or (mp is not None and (mp>0.5)!=(t['side']=='YES'))),currentModelP=q)
+                if q is not None: t['currentModelPAt']=time.time()
                 wnet=cb['whale']['netFlowUsd']*(1 if t['side']=='YES' else -1); left_t=t['closesAt']-time.time()
                 whale_against=cb['whale']['strongDir'] not in (None,t['side'])
                 t.update(whaleFlowUsd=wnet,whaleAgainst=whale_against,whaleCount=cb['whale']['count'])
@@ -676,7 +678,7 @@ def tick_once():
                 if tp: pt.exit(t,bid,f'takeprofit: {tp[1]}; fee ${tp[0]:.2f}',fee=tp[0])
                 elif PAIR_TP>0 and bid>=t['price']+PAIR_TP and any(o is not t and o['status']=='open' and not o.get('exiting') and o.get('closesAt')==t.get('closesAt') and o['side']==t['side'] and is_shadow(o)==is_shadow(t) for o in pt.trades):
                     fp=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'paircash: up {bid-t["price"]:+.2f} with a same-side partner open; cash this one, partner rides the lock; fee ${fp:.2f}',fee=fp)
-                elif lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK), t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not (q is not None and q>=LOCK_HOLD_P):
+                elif lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK), t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not LH.should_hold(t,log=_lh_log) and not (q is not None and q>=LOCK_HOLD_P):
                     f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)); pt.exit(t,bid,f'profitlock: {"night" if night() else "day"}, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
                 elif t['asset'] in GUARD_ASSETS and t['peakBid']>=t['price']+0.10 and bid>0 and bid<=t['price']-GUARD_GIVEBACK and not (q is not None and q>=LOCK_HOLD_P):
                     f3=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'breakeven: {t["asset"]} peaked {t["peakBid"]:.3f} (>=entry+0.10), fell to bid {bid:.3f} vs entry {t["price"]:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f3:.2f}',fee=f3)
@@ -832,6 +834,8 @@ def _tick_writer():
                 TICKS['paused']=TICKS['storageMB']>=TICK_MAX_MB
             except Exception as e: TICKS['lastError']=f'stats: {e}'
 if TCOL is not None: threading.Thread(target=_tick_writer,daemon=True).start()
+def _lh_log(defer=True,**kw):
+    if LV is not None and not kw.get('shadow'): LV.log(defer=defer,**kw)
 def _ws_quote(tk,q):
     try: LL.observe(tk,q)
     except Exception: pass
@@ -849,7 +853,7 @@ def _ws_quote(tk,q):
             bid=yb if t['side']=='YES' else (None if ya is None else round(1-ya,4))
             if bid is None: continue
             t['peakBid']=round(max(t.get('peakBid') or 0,bid),4); mp=t.get('currentModelP')
-            if lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not (mp is not None and mp>=LOCK_HOLD_P):
+            if lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not LH.should_hold(t,log=_lh_log) and not (mp is not None and mp>=LOCK_HOLD_P):
                 f2=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'profitlock: ws quote, peak {t["peakBid"]:.3f} -> bid {bid:.3f}; fee ${f2:.2f}',fee=f2)
             elif bid>0 and bid<=stop_pct()*t['price']:
                 pt.exit(t,bid,f'stop: ws mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}')
@@ -958,6 +962,7 @@ class H(SimpleHTTPRequestHandler):
                 d['ticks']=dict(TICKS,queued=len(_tq))
                 d['leadlag']=LL.snapshot(pt.trades)
                 d['ethlead']=EL.snapshot(pt.trades)
+                d['lockHold']=LH.summary(pt.trades)
                 try: d['tradeFlow']=LV.ws.trade_flow() if (LV is not None and getattr(LV,'ws',None) is not None) else dict(enabled=False)
                 except Exception as e: d['tradeFlow']=dict(error=str(e)[:200])
                 d['reconcile']=dict(RECON.state)
