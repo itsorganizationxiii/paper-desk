@@ -27,6 +27,12 @@ def ticker_pnl(L,live,tk):
     rev=0.0; sfee=0.0; res=None
     for x in sets:
         rev+=float(x.get('revenue') or 0)/100; res=x.get('market_result') or res  # settlement fee_cost repeats the fill fees; not added again
+    # Kalshi's fill action/side are YES-book relative (a NO buy shows as action=sell side=no), so use the settlement record's
+    # aggregates: revenue + paired YES/NO contracts ($1 each) - total YES cost - total NO cost - fees.
+    if sets:
+        x=sets[0]; yc=float(x.get('yes_count_fp') or 0); nc=float(x.get('no_count_fp') or 0)
+        sp=float(x.get('revenue') or 0)/100+min(yc,nc)-float(x.get('yes_total_cost_dollars') or 0)-float(x.get('no_total_cost_dollars') or 0)-float(x.get('fee_cost') or 0)
+        return dict(pnl=round(sp,4),fees=round(float(x.get('fee_cost') or 0),4),buys=buys,sells=sells,avgBuy=None,avgSell=None,revenue=rev,result=res,nFills=len(fills),nSettlements=len(sets),method='settlement-aggregate')
     return dict(pnl=round(cash+rev-fees-sfee,4),fees=round(fees+sfee,4),buys=buys,sells=sells,avgBuy=(bcost/buys if buys else None),avgSell=(scash/sells if sells else None),revenue=rev,result=res,nFills=len(fills),nSettlements=len(sets))
 def run(pt,lock,L,live,col=None):
     try:
@@ -41,6 +47,8 @@ def run(pt,lock,L,live,col=None):
             except Exception as e: per.append(dict(ticker=tk,err=str(e)[:100])); ST['errs'].append(tk+': '+str(e)[:80]); continue
             bp=round(sum(t.get('pnl') or 0 for t in ts),4); botTot+=bp; kalTot+=k['pnl']
             per.append(dict(ticker=tk,ids=[t['id'] for t in ts],bot=bp,kalshi=k['pnl'],diff=round(bp-k['pnl'],4)))
+            with lock:
+                for t in ts: t['kalshiPnl']=k['pnl']
             with lock:
                 for t in ts:
                     if not t.get('finalResult') and k['result'] in ('yes','no'):
@@ -61,6 +69,16 @@ def run(pt,lock,L,live,col=None):
         except Exception: pass
         first=min(trades,key=lambda t:t['openedAt']) if trades else None
         start=first.get('liveCashAtEntry') if first else None
+        man=[]; manTot=0.0
+        try:
+            t0=int(first['openedAt']) if first else 0; bt=set(by)
+            for x in L.pages('/portfolio/settlements?'+urlencode(dict(min_ts=t0,limit=200)),'settlements'):
+                if x.get('ticker') in bt: continue
+                yc=float(x.get('yes_count_fp') or 0); nc=float(x.get('no_count_fp') or 0)
+                v=float(x.get('revenue') or 0)/100+min(yc,nc)-float(x.get('yes_total_cost_dollars') or 0)-float(x.get('no_total_cost_dollars') or 0)-float(x.get('fee_cost') or 0)
+                man.append(dict(ticker=x.get('ticker'),tag='manual',pnl=round(v,4))); manTot+=v
+        except Exception as e: ST['errs'].append('manual: '+str(e)[:80])
+        ST['manual']=dict(tickers=man,pnl=round(manTot,4))
         ST['recon']=dict(trades=len(trades),tickers=len(by),botPnl=round(botTot,4),kalshiPnl=round(kalTot,4),diffBotMinusKalshi=round(botTot-kalTot,4),
             startCash=start,startTradeId=first['id'] if first else None,cashNow=bal,balanceChange=(round(bal-start,4) if bal is not None and start is not None else None),
             diffKalshiPnlVsBalance=(round(kalTot-(bal-start),4) if bal is not None and start is not None else None),

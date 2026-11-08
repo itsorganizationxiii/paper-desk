@@ -80,3 +80,17 @@ Kalshi per-ticker P&L (fixed parser) -7.93; bot -13.45 (pre-#1070 restore; #1070
 Leftover: bot vs balance-implied ~ -3.9; Kalshi-calc vs balance-implied ~ +1.6. NOT passed.
 Still out of bounds on Kalshi side: #1055 +2.24, #1044 +2.07, #1068 +2.00 on ~$1 stakes -> another parse case (likely lock-hold/multi-order tickers). Next: dump their raw fills.
 The -14.53 vs -13.45: same bot sum before vs after truthfix replaced estimated trades (#878, #988, #1070) with buggy Kalshi values; those are now redone.
+
+## #3 aggregate reconciliation (Nov 08 ~12:30 PM ET)
+Window start: $15.66 = liveCashAtEntry of first live trade #878, Nov 6 12:06:51 PM ET.
+Before it: deposit Nov 6 10:29 AM $13.00 (not in window). After it: withdrawal Nov 6 10:58 PM $1.11, withdrawal 11:17 PM $10.12, deposit 11:19 PM $20.24 (Kalshi fee $0.40, credited $19.84). Net deposits after = +$8.61 credited (+$9.01 gross).
+Balance change 15.66 -> 15.12 = -0.54. Balance change minus net deposits = -9.15.
+(1) Fees: bot entry+exit fees $4.91 vs Kalshi $5.15 (all fills since #878, incl. manual).
+(3) Positions open at #878: 5 pre-window tickers (Nov 6 9:00-11:30 markets), all settled before 12:06 -> none carried in.
+(4) Fills with no bot trade, tagged manual (8 tickers): KXBTC15M-26NOV072145-45, KXETH15M-26NOV072145-45, KXETH15M-26NOV071745-45, KXETH15M-26NOV071445-45, KXBTC15M-26NOV061645-45, KXMVECROSSCATEGORY parlay (37.5 @0.07c), KXSOL15M-26NOV061415-15, KXSOL15M-26NOV061400-00. Manual P&L +$3.46.
+Second parse bug: Kalshi fills are YES-book relative, a NO BUY shows as action=sell side=no. Now using settlement aggregates: revenue + min(yes,no count) - yes cost - no cost - fees.
+#1055 Kalshi 2.24 -> 0.6085 (bot 0.61); #1044 -> ~0.54; #1068 -> ~0.49. All match bot now.
+#1070: bought NO 1.44 @0.69, stop sell actually filled @0.42 (bot logged no fill); Kalshi P&L -0.435.
+Bot P&L (Kalshi records, bot tickers) -12.60; bot's own figure -13.96 (bot understates by 1.36, mostly #1034 +0.67, #988 -0.56, #1033 +0.44, #886, #989-992).
+Bot -12.60 + manual +3.46 = -9.13 vs balance-minus-deposits -9.15 -> leftover $0.02. PASS.
+Evaluation uses bot trades only.
