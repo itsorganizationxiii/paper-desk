@@ -64,4 +64,12 @@ ck('retry writes them and clears queue',W._flush() and len(W._pend)==0 and len(f
 W._pend[:]=mk(range(b,b+3)); ck('duplicate samples treated as acked',W._flush() and len(W._pend)==0)
 # counter counts unique valid only
 W._col['idxcmp']=c; c.d[b-900]=dict(boundary=b-900,complete=False,status='INCOMPLETE'); s=W.stats(); ck('counter = unique valid (1)',s['n']==1 and s['excluded']==1)
+# duplicate timestamps: same second sampled twice -> one sample
+W._sec.clear(); W._pend[:]=[]; W.consolidated=lambda now=None:(75000.0,75000.0,5)
+a1=W.sample_once(b); a2=W.sample_once(b); a3=W.sample_once(b-1)
+ck('duplicate second blocked (one sample per second)',a1 and not a2 and not a3 and len(W._sec)==1 and W.ST.get('samplesDupBlocked')==2)
+# missing samples: no fresh venues -> no sample, counted, not fabricated
+W.consolidated=lambda now=None:(None,None,0); ck('no price -> no sample, counted',not W.sample_once(b+1) and len(W._sec)==1)
+def boom(now=None): raise RuntimeError('dictionary changed size during iteration')
+W.consolidated=boom; ck('book race -> skipped second, sampler survives',not W.sample_once(b+2) and W.ST.get('sampleErrN',0)>=1)
 print('ALL PASS' if ok else 'SOME FAILED'); raise SystemExit(0 if ok else 1)

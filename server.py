@@ -889,6 +889,8 @@ def tick_once():
                 with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],meta)
                 sg['action']=(f'OPENED {a} SHADOW #{t["id"]} (paper only)' if shd else f'OPENED #{t["id"]}') if t else (f'skip: weekend-night edge too big ({q-ask:+.3f} > {WKND_MAX_EDGE})' if WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE else f'skip: edge {q-ask:+.3f} < {need_edge()}')
         sigs[a]=sg
+    try: PL.observe(sigs,'live' if (LV and LV.enabled()) else 'paper')  # read-only prediction log; cannot raise
+    except Exception: pass
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
     fb=src.get('eloedge')!='live'
@@ -912,6 +914,12 @@ if LV is not None:
      except Exception as _e: print('truthfix start err',_e,flush=True)
 try: WL.start(MCOL.database if MCOL is not None else None,owner=lambda:(LV is None or LV.lease_ok is None or LV.owner()))
 except Exception as _e: print('windowlog start err',_e,flush=True)
+import predlog as PL
+def _pl_result(tk):
+    try: return (get(f"{KALSHI}/markets/{tk}")['market'].get('result') or None)
+    except Exception: return None
+try: PL.start(MCOL.database if MCOL is not None else None,regime=lambda a:regime(a),trend=lambda s:trend_dir(s),result=_pl_result,owner=lambda:(LV is None or LV.lease_ok is None or LV.owner()))
+except Exception as _e: print('predlog start err',_e,flush=True)
 def tick_rec(tk,q):
     if TCOL is None or TICKS['paused']: return
     row=(q.get('yesBid'),q.get('yesAsk'),q.get('noBid'),q.get('noAsk'),q.get('last'))
@@ -1153,6 +1161,7 @@ class H(SimpleHTTPRequestHandler):
                 except Exception as e: r=dict(err=str(e)[:200])
             b=json.dumps(r,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/truthfix': b=json.dumps(TFX.ST,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/predstats': b=json.dumps(PL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/idxstats': b=json.dumps(WL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p in('/','/index.html','/manifest.json'): super().do_GET()

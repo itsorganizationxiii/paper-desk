@@ -137,17 +137,25 @@ def consolidated(now=None):
     return med,((vb+va)/2 if vb and va else None),len(live)
 BOOT=int(time.time()); _pend=[]
 def _sampler():
-    """1 Hz rebuilt-index sample, kept in RAM and persisted (idxsec, _id=second) so a restart can resume the window.
-    Every instance writes (not only the lease owner): during a Render deploy old and new overlap, and _id dedupes."""
+    """1 Hz rebuilt-index sample on fixed one-second boundaries: sample for second s is taken at s and labeled s.
+    Exactly one sample per second (a second already sampled is never re-labeled); seconds overslept are counted as missed, never filled.
+    Kept in RAM and persisted (idxsec, _id=second) so a restart resumes the window. Every instance writes; _id dedupes."""
+    nxt=int(time.time())+1
     while True:
-        time.sleep(1-(time.time()%1))
-        try: med,dm,n=consolidated(); t=int(time.time())
-        except Exception as e:  # a feed thread mutated a book mid-read; skip this second, never kill the sampler
-            ST['sampleErr']=f'{type(e).__name__}: {str(e)[:80]}'; ST['sampleErrN']=ST.get('sampleErrN',0)+1; continue
-        ST['samplerAt']=t; ST['sampleTicks']=ST.get('sampleTicks',0)+1
-        if med:
-            row=(t,dm or med,n,med); _sec.append(row); _pend.append(row); ST['samplesGenerated']=ST.get('samplesGenerated',0)+1
-        else: ST['samplesNoPrice']=ST.get('samplesNoPrice',0)+1  # <2 fresh venues: no sample (never fabricated)
+        d=nxt-time.time()
+        if d>0: time.sleep(d)
+        cur=int(time.time())
+        if cur>nxt: ST['samplesMissed']=ST.get('samplesMissed',0)+(cur-nxt); nxt=cur   # overslept: skip, don't fabricate
+        t=nxt; nxt=t+1
+        sample_once(t)
+def sample_once(t):
+    if _sec and _sec[-1][0]>=t: ST['samplesDupBlocked']=ST.get('samplesDupBlocked',0)+1; return False
+    try: med,dm,n=consolidated()
+    except Exception as e:  # a feed thread mutated a book mid-read; skip this second, never kill the sampler
+        ST['sampleErr']=f'{type(e).__name__}: {str(e)[:80]}'; ST['sampleErrN']=ST.get('sampleErrN',0)+1; return False
+    ST['samplerAt']=t; ST['sampleTicks']=ST.get('sampleTicks',0)+1
+    if not med: ST['samplesNoPrice']=ST.get('samplesNoPrice',0)+1; return False  # <2 fresh venues: no sample (never fabricated)
+    row=(t,dm or med,n,med); _sec.append(row); _pend.append(row); ST['samplesGenerated']=ST.get('samplesGenerated',0)+1; return True
 PEND_MAX=7200
 def _flush():
     """Write queued samples; a sample leaves the queue only once Mongo acked it (or it already exists). Failures retry next pass."""
@@ -247,7 +255,7 @@ def stats():
     by=collections.Counter(r.get('status') or ('LEGACY-COMPLETE' if r.get('complete') else 'LEGACY-EXCLUDED') for r in allr)
     errs=[abs(e) for r in rows for e in (r.get('errStart'),r.get('errEnd')) if e is not None]
     dis=[r for r in rows if r.get('rebuiltResult') and r.get('endResult')]
-    out.update(pendingWrites=len(_pend),samplesQueued=len(_pend),samplesPersisted=ST.get('secWritten',0),samplesDropped=ST.get('secDropped',0),settlementPending=sum(1 for r in rows if r.get('settlement')=='PENDING'),n=len(rows),windows=len(rows),excluded=len(allr)-len(rows),byStatus=dict(by),errN=len(errs),
+    out.update(pendingWrites=len(_pend),samplesQueued=len(_pend),samplesMissed=ST.get('samplesMissed',0),samplesDupBlocked=ST.get('samplesDupBlocked',0),samplesPersisted=ST.get('secWritten',0),samplesDropped=ST.get('secDropped',0),settlementPending=sum(1 for r in rows if r.get('settlement')=='PENDING'),n=len(rows),windows=len(rows),excluded=len(allr)-len(rows),byStatus=dict(by),errN=len(errs),
                recent=[{k:r.get(k) for k in ('boundary','status','incompleteReason','settlement','received','maxGapSec','closing60','spannedRestart')} for r in sorted(allr,key=lambda r:r['boundary'])[-8:]])
     if errs:
         s=sorted(errs); out.update(meanAbsErr=round(sum(s)/len(s),3),stdErr=round(statistics.pstdev(s),3),p95AbsErr=round(s[min(len(s)-1,int(0.95*len(s)))],3))
