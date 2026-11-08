@@ -122,7 +122,7 @@ def _lag(n,iso):
 DEPTH_BTC=5.0
 def consolidated(now=None):
     """Consolidated L2 book across fresh venues -> (median of venue mids, depth-weighted mid at DEPTH_BTC, venues used)."""
-    now=now or time.time(); live={n:k for n,k in B.items() if now-k['t']<10 and k['bid'] and k['ask'] and max(k['bid'])<min(k['ask'])}
+    now=now or time.time(); live={n:dict(bid=dict(k['bid']),ask=dict(k['ask']),t=k['t']) for n,k in list(B.items())}; live={n:k for n,k in live.items() if now-k['t']<10 and k['bid'] and k['ask'] and max(k['bid'])<min(k['ask'])}
     if len(live)<2: return None,None,0
     mids=[(max(k['bid'])+min(k['ask']))/2 for k in live.values()]; med=statistics.median(mids)
     bids=sorted(((p,q) for k in live.values() for p,q in k['bid'].items() if p>med*0.995),reverse=True)
@@ -141,7 +141,10 @@ def _sampler():
     Every instance writes (not only the lease owner): during a Render deploy old and new overlap, and _id dedupes."""
     while True:
         time.sleep(1-(time.time()%1))
-        med,dm,n=consolidated(); t=int(time.time())
+        try: med,dm,n=consolidated(); t=int(time.time())
+        except Exception as e:  # a feed thread mutated a book mid-read; skip this second, never kill the sampler
+            ST['sampleErr']=f'{type(e).__name__}: {str(e)[:80]}'; ST['sampleErrN']=ST.get('sampleErrN',0)+1; continue
+        ST['samplerAt']=t
         if med:
             row=(t,dm or med,n,med); _sec.append(row); _pend.append(row)
 PEND_MAX=7200
