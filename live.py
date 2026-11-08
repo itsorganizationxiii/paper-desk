@@ -296,6 +296,13 @@ class Live:
                     if confirm[1]>0: time.sleep(confirm[1])
                     fc,fpx,fee,terminal=s.order_result(oid,side,px,o,check_fills=action=='buy')
                     if fc>=count-0.001 or terminal: break
+                if action=='sell' and fc<=0 and confirm!=STOP_CONFIRM:  # stops stay fast; _sellLive recovers their fills from Kalshi
+                    # never trust a zero-fill status read on a sale: re-read with fills before reporting no fill
+                    for _ in range(3):
+                        time.sleep(0.4)
+                        try: f2,p2,fe2,terminal=s.order_result(oid,side,px,o,check_fills=True)
+                        except Exception: continue
+                        if f2>0: fc,fpx,fee=f2,p2,fe2; break
                 if action=='buy' and fc<count-0.001:
                     s.cancel_order(oid,ticker)
                     # A cancel acknowledgment never proves zero fill. Re-read BOTH status and fills.
@@ -447,6 +454,19 @@ class Live:
         if fc: s.cashAt=None
         s.log(action='sell',ticker=ticker,side=side,orderId=oid,want=count,limit=px,filled=fc,fillPrice=round(proceeds/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc>=count else 'partial/no fill; rest held'))
         return fc,(round(proceeds/fc,4) if fc else None),round(fee,4),oid,err
+    @staticmethod
+    def closing_from_fills(fills,side,entry_oid,since=0):
+        """Kalshi fills are YES-book relative (a YES sale can show as action=sell side=no). A closing fill is any fill on the
+        ticker that is not the entry order, at/after entry; proceeds per contract = the HELD side's price field."""
+        q=0.0; cash=0.0; fee=0.0; oids=[]
+        for f in fills:
+            if f.get('order_id')==entry_oid or float(f.get('ts') or 0)<since-5: continue
+            n=float(f.get('count_fp') or f.get('count') or 0); p=float(f.get(('yes' if side=='YES' else 'no')+'_price_dollars') or 0)
+            q+=n; cash+=n*p; fee+=float(f.get('fee_cost') or 0); oids.append(f.get('order_id'))
+        return round(q,4),(round(cash/q,4) if q else None),round(fee,4),oids
+    def closing_fills(s,ticker,side,entry_oid,since=0):
+        fills=s.pages('/portfolio/fills?'+urlencode(dict(ticker=ticker,limit=200)),'fills')
+        return s.closing_from_fills(fills,side,entry_oid,since)
     def stop_sell(s,ticker,side,count,stop,bid,trig_at=None):
         """One protected IOC if the trigger bid permits; otherwise an immediate marketable IOC.
 

@@ -224,6 +224,18 @@ class PaperTrader:
                     p=LV.position(t['ticker'])
                     ext=p is not None and ((p if t['side']=='YES' else -p)<=0.001)
                 except Exception: ext=False
+                rec=None
+                try: rec=LV.closing_fills(t['ticker'],t['side'],t.get('liveOrderId'),t.get('openedAt') or 0)
+                except Exception as e: print('fill recover err',e,flush=True)
+                if rec and rec[0]>=t['contracts']-0.01:
+                    # The sale DID fill on Kalshi (possibly by an earlier order/instance): book the real fills, never "no fill"
+                    q,fpx2,fee2,oids=rec; t.pop('liveSellError',None)
+                    t.update(status='exited',exitPrice=fpx2,exitFee=fee2,exitReason=reason,settledBy='live-sell (recovered from Kalshi fills)',liveSellOrderId=oids[-1] if oids else None,
+                             pnl=round(q*fpx2-fee2-t['stake']+(t.get('partialPnl') or 0),4),closedAt=time.time(),fillRecovered=True)
+                    LV.log(action='sell-fill-recovered',ticker=t['ticker'],side=t['side'],filled=q,fillPrice=fpx2,fee=fee2,orderIds=oids)
+                    s.save(); 
+                    if isstop: LV.persist()
+                    return
                 if ext:
                     # Owner sold manually (or position otherwise gone): stop retrying, book at the trigger bid as an estimate
                     epx=round(t.get('exitTrigBid') or bid or 0,4)

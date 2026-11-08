@@ -34,6 +34,33 @@ def ticker_pnl(L,live,tk):
         sp=float(x.get('revenue') or 0)/100+min(yc,nc)-float(x.get('yes_total_cost_dollars') or 0)-float(x.get('no_total_cost_dollars') or 0)-float(x.get('fee_cost') or 0)
         return dict(pnl=round(sp,4),fees=round(float(x.get('fee_cost') or 0),4),buys=buys,sells=sells,avgBuy=None,avgSell=None,revenue=rev,result=res,nFills=len(fills),nSettlements=len(sets),method='settlement-aggregate')
     return dict(pnl=round(cash+rev-fees-sfee,4),fees=round(fees+sfee,4),buys=buys,sells=sells,avgBuy=(bcost/buys if buys else None),avgSell=(scash/sells if sells else None),revenue=rev,result=res,nFills=len(fills),nSettlements=len(sets))
+def verify_fees(L,t,k,fills=None):
+    """Set the bot's logged fees to Kalshi's: entry order's fill fees + all other fills on the ticker."""
+    t['kalshiPnl']=k['pnl']
+    try:
+        fills=fills if fills is not None else L.pages('/portfolio/fills?'+urlencode(dict(ticker=t['ticker'],limit=200)),'fills')
+        ef=sum(float(f.get('fee_cost') or 0) for f in fills if f.get('order_id')==t.get('liveOrderId'))
+        xf=sum(float(f.get('fee_cost') or 0) for f in fills if f.get('order_id')!=t.get('liveOrderId'))
+        if fills:
+            if abs(ef-(t.get('entryFee') or 0))>0.0005 or abs(xf-(t.get('exitFee') or 0))>0.0005: t['feesBot']=dict(entry=t.get('entryFee'),exit=t.get('exitFee'))
+            t['entryFee']=round(ef,4); t['exitFee']=round(xf,4); t['feesVerified']='kalshi-fills'
+    except Exception as e: t['feesVerifyErr']=str(e)[:80]
+def verifier(pt,lock,L,live,every=600):
+    """Ongoing: each newly closed live trade (after its market settles) gets Kalshi P&L + Kalshi fees. Plain code, no model calls."""
+    while True:
+        time.sleep(every)
+        try:
+            if L.lease_ok is not None and not L.owner(): continue
+            now=time.time()
+            todo=[t for t in pt.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status')!='open' and 'kalshiPnl' not in t and now>(t.get('closesAt') or now)+120][:20]
+            for t in todo:
+                k=ticker_pnl(L,live,t['ticker'])
+                if k.get('nSettlements'):
+                    with lock: verify_fees(L,t,k)
+                time.sleep(1)
+            if todo:
+                with lock: pt.save()
+        except Exception as e: print('verifier err',e,flush=True)
 def run(pt,lock,L,live,col=None):
     try:
         trades=[t for t in pt.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status')!='open']
@@ -48,7 +75,7 @@ def run(pt,lock,L,live,col=None):
             bp=round(sum(t.get('pnl') or 0 for t in ts),4); botTot+=bp; kalTot+=k['pnl']
             per.append(dict(ticker=tk,ids=[t['id'] for t in ts],bot=bp,kalshi=k['pnl'],diff=round(bp-k['pnl'],4)))
             with lock:
-                for t in ts: t['kalshiPnl']=k['pnl']
+                for t in ts: verify_fees(L,t,k)
             with lock:
                 for t in ts:
                     if not t.get('finalResult') and k['result'] in ('yes','no'):
@@ -93,3 +120,4 @@ def start(pt,lock,L,live,col=None,delay=60):
         while L.lease_ok is not None and not L.owner(): time.sleep(10)
         run(pt,lock,L,live,col)
     threading.Thread(target=go,daemon=True).start()
+    threading.Thread(target=verifier,args=(pt,lock,L,live),daemon=True).start()
