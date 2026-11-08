@@ -686,7 +686,7 @@ def tick_once():
                         with lock: t=pt.openTrade(a,rd,rask,rmp,k['strike'],k['close'],k['ticker'],rmeta)
                     if t: sg['action']=f'OPENED ALT-CONSENSUS #{t["id"]} {rd} (SOL/DOGE/XRP all {rd})'; sigs[a]=sg; continue
         reok=False
-        try: reok=bool(LV and LV.enabled()) and any(t.get('ticker')==k['ticker'] for t in pt.trades) and reentry_ok(a,k,dirn,cb,left)
+        try: reok=(bool(LV and LV.enabled()) and any(t.get('ticker')==k['ticker'] for t in pt.trades) and reentry_ok(a,k,dirn,cb,left)) or False
         except Exception as e: print('reentry err',e,flush=True)
         if not dirn: sg['action']='skip: momentum/CVD disagree'
         elif est=='live' and mp is None and a!='XRP': sg['action']='skip: no fresh EloEdge model_p'
@@ -702,7 +702,7 @@ def tick_once():
             q=mp if dirn=='YES' else 1-mp
             shd=shadow_asset(a)
             if reok and not shd:
-                meta=dict(meta,reentry=True,signalSource=used+'+reentry'); LV.tried.discard(k['ticker'])
+                meta=dict(meta,reentry=True,reentryAfter=reok if reok in ('lock','stop') else 'lock',signalSource=used+'+reentry'+('-stop' if reok=='stop' else '')); LV.tried.discard(k['ticker'])
             if shd: meta=dict(meta,shadow=True,mode='shadow',shadowTag=f'{a} shadow')
             if FADE and WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE:
                 # fade test: weekend-night 20c+ edges went 0/4, so buy the other side, sized as a minimum-edge bet
@@ -810,8 +810,43 @@ def _ws_quote(tk,q):
     finally: lock.release()
 if LV is not None and getattr(LV,'ws',None) is not None: LV.ws.on_quote=_ws_quote
 REENTRY_WAIT=60; REENTRY_MIN_LEFT=120
-def reentry_ok(a,k,dirn,cb,left,now=None):
-    # one live re-buy per window, same side, only after a profit-lock exit
+STOP_REENTRY_ENABLED=True
+STOP_REENTRY_WAIT=60
+STOP_REENTRY_MIN_LEFT=120
+STOP_REENTRY_BAND=(0.40,0.69)
+STOP_REENTRY_RECOVER=0.05
+STOP_REENTRY_FLOW_SEC=60
+def _side_trade_prices(tk,side,since,feed=None):
+    # our-side prices and taker counts from the kws trade feed (in-memory only)
+    if feed is None:
+        lv=globals().get('LV'); feed=getattr(lv,'ws',None) if lv is not None else None
+    out=[]
+    if feed is None: return out
+    try: tr=list(feed.trades)
+    except Exception: return out
+    for x in tr:
+        if x.get('market_ticker')!=tk or (x.get('ts_ms') or 0)<since*1000: continue
+        px=x.get('yes_price_dollars') if side=='YES' else x.get('no_price_dollars')
+        out.append(dict(px=px,taker=x.get('taker_side'),cnt=x.get('count_fp') or 0,ts=x.get('ts_ms')))
+    return out
+def stop_reentry_confirm(t,k,dirn,cb,now,feed=None):
+    # live confirmation the move flipped back our way after a stop
+    up=dirn=='YES'; ask=k.get('yesAsk') if up else k.get('noAsk'); bid=k.get('yesBid') if up else k.get('noBid')
+    if ask is None or not (STOP_REENTRY_BAND[0]<=ask<=STOP_REENTRY_BAND[1]): return False
+    mom=cb.get('momentum') or 0
+    if not (mom>0 if up else mom<0): return False
+    tr=_side_trade_prices(k.get('ticker'),dirn,t.get('closedAt') or now,feed)
+    lows=[x['px'] for x in tr if x['px'] is not None]
+    if t.get('exitPrice') is not None: lows.append(t['exitPrice'])
+    if not lows: return False
+    low=min(lows); cur=bid if bid is not None else ask-0.01
+    if cur-low<STOP_REENTRY_RECOVER-1e-9: return False
+    rec=[x for x in tr if (x['ts'] or 0)>=(now-STOP_REENTRY_FLOW_SEC)*1000]
+    ours=sum(x['cnt'] for x in rec if x['taker']==dirn.lower()); theirs=sum(x['cnt'] for x in rec if x['taker'] in ('yes','no') and x['taker']!=dirn.lower())
+    if rec and ours<theirs: return False
+    return True
+def reentry_ok(a,k,dirn,cb,left,now=None,feed=None):
+    # one live re-buy per window, same side, after a profit-lock exit ('lock') or a stop with live confirmation ('stop')
     now=now or time.time()
     if not dirn or left<REENTRY_MIN_LEFT or shadow_asset(a) or 'XRP' in str(k.get('ticker')): return False
     ts=[t for t in pt.trades if t.get('ticker')==k['ticker'] and not t.get('shadow')]
@@ -819,11 +854,16 @@ def reentry_ok(a,k,dirn,cb,left,now=None):
     lv=[t for t in ts if t.get('mode')=='live']
     if len(lv)!=1 or len(ts)!=1: return False
     t=lv[0]
-    if t.get('status')!='exited' or not str(t.get('exitReason','')).startswith('profitlock') or t.get('side')!=dirn: return False
+    if t.get('status')!='exited' or t.get('side')!=dirn: return False
+    why=str(t.get('exitReason','')).lower()
+    if why.startswith('stop'):
+        if not STOP_REENTRY_ENABLED or left<STOP_REENTRY_MIN_LEFT or now-(t.get('closedAt') or now)<STOP_REENTRY_WAIT: return False
+        return 'stop' if stop_reentry_confirm(t,k,dirn,cb,now,feed) else False
+    if not why.startswith('profitlock'): return False
     if now-(t.get('closedAt') or now)<REENTRY_WAIT: return False
     up=dirn=='YES'; st=k.get('strike'); sp=cb.get('spot'); mom=cb.get('momentum') or 0
     side_ok=(st is not None and sp is not None and (sp>st if up else sp<st)) or (mom>0 if up else mom<0)
-    return bool(side_ok)
+    return 'lock' if side_ok else False
 def loop():
     while True:
         if LV is not None and LV.lease_ok is not None and not LV.owner(): time.sleep(5); continue  # newer instance owns trading; stale one idles
@@ -853,6 +893,10 @@ class H(SimpleHTTPRequestHandler):
                 d['stopExecution']=dict(limitAttempts=1,confirmation='single immediate order-status poll',confirmationWaitSec=0,aggressiveLimitC=1,preflightPosition=False)
                 _re=[t for t in pt.trades if t.get('reentry')]; _rc=[t for t in _re if t.get('status')!='open']
                 d['reentries']=dict(count=len(_re),open=len(_re)-len(_rc),closed=len(_rc),wins=len([t for t in _rc if (t.get('pnl') or 0)>0]),pnl=round(sum(t.get('pnl') or 0 for t in _rc),2))
+                for _ty in ('lock','stop'):
+                    _r2=[t for t in _re if (t.get('reentryAfter') or 'lock')==_ty]; _c2=[t for t in _r2 if t.get('status')!='open']
+                    d['reentries'][_ty]=dict(count=len(_r2),open=len(_r2)-len(_c2),closed=len(_c2),wins=len([t for t in _c2 if (t.get('pnl') or 0)>0]),pnl=round(sum(t.get('pnl') or 0 for t in _c2),2))
+                d['reentries']['stopReentry']=dict(enabled=STOP_REENTRY_ENABLED,waitSec=STOP_REENTRY_WAIT,minLeftSec=STOP_REENTRY_MIN_LEFT,band=list(STOP_REENTRY_BAND),recoverC=round(STOP_REENTRY_RECOVER*100),flowSec=STOP_REENTRY_FLOW_SEC)
                 try:
                     d['live']['cooldowns']=cooldowns()
                     d['live']['cooldownsEnabled']=COOLDOWNS_ENABLED

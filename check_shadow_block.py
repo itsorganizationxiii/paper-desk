@@ -39,8 +39,8 @@ PT.trades=[mk('SOL',-0.5,4800),mk('SOL',-0.4,4500),mk('SOL',-0.3,4000),mk('SOL',
 chk('one loss after expired per-coin cooldown does not re-trigger SOL; consecutive losses still trigger shared','SOL' not in g['cooldowns']() and 'ALL' in g['cooldowns']())
 
 # ---- profit-lock re-entry ----
-code3=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if getattr(n,'name',None)=='reentry_ok')
-code3+=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if isinstance(n,ast.Assign) and any(getattr(t,'id',None) in ('REENTRY_WAIT','REENTRY_MIN_LEFT') for t in n.targets))
+code3=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if getattr(n,'name',None) in ('reentry_ok','stop_reentry_confirm','_side_trade_prices'))
+code3+=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if isinstance(n,ast.Assign) and any(str(getattr(t,'id','')).startswith(('REENTRY_','STOP_REENTRY_')) for t in n.targets))
 exec(code3,g); R=g['reentry_ok']
 k=dict(ticker='KXBTC15M-W',strike=100.0); cb=dict(spot=101.0,momentum=0.001); now=time.time()
 ex=lambda **kw:dict(dict(mode='live',asset='BTC',ticker='KXBTC15M-W',side='YES',status='exited',exitReason='profitlock: peak',closedAt=now-90,pnl=0.2),**kw)
@@ -51,7 +51,7 @@ chk('re-entry refused with <2 min left',not R('BTC',k,'YES',cb,100,now))
 chk('re-entry refused on opposite side',not R('BTC',k,'NO',dict(spot=99,momentum=-1),400,now))
 chk('re-entry refused when spot and momentum against',not R('BTC',k,'YES',dict(spot=99,momentum=-0.001),400,now))
 PT.trades=[ex(exitReason='stop: mark 0.2',pnl=-0.4)]; reset()
-chk('re-entry refused after stop',not R('BTC',k,'YES',cb,400,now))
+chk('re-entry refused after unconfirmed stop',not R('BTC',k,'YES',cb,400,now))
 PT.trades=[ex(exitReason='takeprofit: bid')]; reset()
 chk('re-entry refused after take-profit',not R('BTC',k,'YES',cb,400,now))
 PT.trades=[ex(exitReason='paircash: up')]; reset()
