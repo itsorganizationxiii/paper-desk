@@ -478,5 +478,5 @@ class Live:
                 if (s.lastError or '').startswith('balance'): s.lastError=None
             except Exception as e: s.lastError=f'balance: {type(e).__name__}: {e}'; s.cashAt=time.time()-55  # retry in ~5s
         return dict(enabled=s.enabled(),leaseHeld=s.allowed() and s.owner(),envAllow=ENV_ALLOW,keysPresent=keys_present(),paused=s.paused,baseUrl=BASE,cash=s.cash,
-            todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=_daily_cap()),
+            todayPnl=s.dayPnl,totalPnl=s.totalPnl,day=s.day,killSwitch=dict(tripped=s.killed,reason=s.killReason,dailyLossLimit=(0 if _daily_cap()==float("inf") else _daily_cap())),
             maxTradeUsd=MAX_USD,maxChase=MAX_CHASE,assets=sorted(ASSETS) if ASSETS else 'all',fractional=s.fracOK,ws=(s.ws.status() if s.ws else None),lastError=s.lastError,recentOrders=s.orders[-20:][::-1])
