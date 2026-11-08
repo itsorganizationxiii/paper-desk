@@ -557,6 +557,7 @@ def leadlag_entry(k):
             print('leadlag entry error',type(e).__name__,flush=True)
 
 from ethlead import EthLead, evaluate as el_eval, ETHLEAD_MIN_LEFT as EL_MIN_LEFT
+import ethlead
 EL=EthLead()
 def ethlead_entry(k):
     # ETH-leads-BTC: buy BTC on ETH's >50c side when BTC is 7-10c cheaper; one per window.
@@ -575,6 +576,7 @@ def ethlead_entry(k):
         elif tk in LV.tried or tk in LV.resting: reason='BTC order already working/tried'
         elif any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!='BTC' and t.get('closesAt')==k['close'] and t.get('side')!=side for t in trades): reason='opposite live coin position this window'
         elif WKND_MAX>0 and wknd_night() and ba>WKND_MAX: reason='weekend price cap'
+        elif ethlead.flow_against(side,flow('BTC')): reason='flow against'
         if reason is None:
             q=min(ba+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
             def size_at(px):

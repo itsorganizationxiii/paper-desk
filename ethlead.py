@@ -9,6 +9,16 @@ ETHLEAD_MIN_LEFT = 300
 ETHLEAD_ETH_MIN = 0.50
 BAND = (0.40, 0.69)
 FRESH = 10
+# Skip when Coinbase flow imbalance is this strongly against our side (owner request Nov 8)
+ETHLEAD_FLOW_FILTER = True
+ETHLEAD_MAX_AGAINST_IMB = 0.5
+
+
+def flow_against(side, fl):
+    if not ETHLEAD_FLOW_FILTER or not fl or fl.get('imb') is None:
+        return False
+    imb = fl['imb']
+    return imb <= -ETHLEAD_MAX_AGAINST_IMB if side == 'YES' else imb >= ETHLEAD_MAX_AGAINST_IMB
 
 
 def side_asks(q):

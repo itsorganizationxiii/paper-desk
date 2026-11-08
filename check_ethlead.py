@@ -46,10 +46,10 @@ class FakePT:
     def size(s,side,ask,mp): return (0.05,0.07,mp) if 0.40<=ask<=0.69 else None
     def openLive(s,asset,side,fill,strike,close,tk,meta,e,qq):
         t=dict(id=len(s.trades)+1,asset=asset,side=side,mode='live',status='open',ticker=tk,closesAt=close,**meta); s.trades.append(t); return t
-def harness(trades=None,shadow=False,cap=0.69,lv=None):
+def harness(trades=None,shadow=False,cap=0.69,lv=None,fl=None):
     L=lv or FakeLV(); pt=FakePT(); pt.trades=list(trades or [])
     g=dict(EL=EthLead(),LV=L,pt=pt,time=SimpleNamespace(time=lambda:NOW),lock=threading.Lock(),el_eval=evaluate,EL_MIN_LEFT=300,
-           shadow_asset=lambda a:shadow,is_shadow=lambda t:False,WKND_MAX=cap,wknd_night=lambda:True,need_edge=lambda:0.07)
+           shadow_asset=lambda a:shadow,is_shadow=lambda t:False,WKND_MAX=cap,wknd_night=lambda:True,need_edge=lambda:0.07,ethlead=ethlead,flow=lambda a:fl)
     exec(code,g); k=dict(ticker=BTC,close=NOW+400,strike=1)
     g['ethlead_entry'](k); return g,L,pt,k
 g,L,pt,k=harness()
@@ -62,4 +62,8 @@ for kw in (dict(shadow=True),dict(cap=0.50),dict(trades=[dict(ticker=BTC,mode='l
     g,L,pt,k=harness(**kw); assert not L.calls, kw
     assert g['EL'].events[-1]['status']=='skipped'
 print('PASS shadow/cooldown, weekend cap, open position, prior ethlead skip with reasons')
+g,L,pt,k=harness(fl=dict(imb=-0.967)); assert not L.calls and g['EL'].events[-1]['skipReason']=='flow against'
+g,L,pt,k=harness(fl=dict(imb=-0.3)); assert len(L.calls)==1
+g,L,pt,k=harness(fl=dict(imb=0.9)); assert len(L.calls)==1
+print('PASS flow-against filter skips YES into heavy selling only')
 print('ALL ETHLEAD TESTS PASSED')
