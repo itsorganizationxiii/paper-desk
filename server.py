@@ -611,7 +611,49 @@ def tick_once():
     fb=src.get('eloedge')!='live'
     status.update(metalsClosed=metals_closed(),nightMode=night(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
         signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
+TICK_TTL_DAYS=14; TICK_MAX_MB=350; TICK_FLUSH_SEC=2; TICK_BATCH=500; TICK_MAXQ=20000
+import collections
+_tq=collections.deque(maxlen=TICK_MAXQ); _tlast={}
+TICKS=dict(enabled=False,recorded=0,dropped=0,deduped=0,flushErrors=0,lastFlush=None,lastError=None,count=None,sizeMB=None,storageMB=None,paused=False,ttlDays=TICK_TTL_DAYS,maxMB=TICK_MAX_MB,ratePerMin=None)
+TCOL=MCOL.database['ticks'] if MCOL is not None else None
+def tick_rec(tk,q):
+    if TCOL is None or TICKS['paused']: return
+    row=(q.get('yesBid'),q.get('yesAsk'),q.get('noBid'),q.get('noAsk'),q.get('last'))
+    if _tlast.get(tk)==row: TICKS['deduped']+=1; return
+    _tlast[tk]=row
+    if len(_tq)>=TICK_MAXQ: TICKS['dropped']+=1
+    ts=q.get('ts') or q.get('rx') or time.time()
+    _tq.append(dict(t=tk,ms=int(ts*1000),yb=row[0],ya=row[1],nb=row[2],na=row[3],lp=row[4]))
+def _tick_writer():
+    from datetime import timezone as _tz
+    try:
+        TCOL.create_index([('t',1),('ms',1)]); TCOL.create_index('at',expireAfterSeconds=TICK_TTL_DAYS*86400); TICKS['enabled']=True
+    except Exception as e: TICKS['lastError']=f'index: {e}'
+    last_stat=0; win=collections.deque()
+    while True:
+        time.sleep(TICK_FLUSH_SEC if len(_tq)<TICK_BATCH else 0.2)
+        if LV is not None and LV.lease_ok is not None and not LV.owner(): _tq.clear(); continue
+        rows=[]
+        while _tq and len(rows)<TICK_BATCH*4: rows.append(_tq.popleft())
+        if rows:
+            now=datetime.now(_tz.utc)
+            for x in rows: x['at']=now
+            try:
+                TCOL.with_options(write_concern=__import__('pymongo').WriteConcern(w=1,wtimeout=3000)).insert_many(rows,ordered=False)
+                TICKS['recorded']+=len(rows); TICKS['lastFlush']=time.time(); win.append((time.time(),len(rows)))
+            except Exception as e: TICKS['flushErrors']+=1; TICKS['dropped']+=len(rows); TICKS['lastError']=f'{type(e).__name__}: {str(e)[:160]}'
+        while win and time.time()-win[0][0]>600: win.popleft()
+        TICKS['ratePerMin']=round(sum(n for _,n in win)/10,1) if win else 0
+        if time.time()-last_stat>120:
+            last_stat=time.time()
+            try:
+                st=MCOL.database.command('collStats','ticks'); TICKS.update(count=st.get('count'),sizeMB=round(st.get('size',0)/1e6,2),storageMB=round((st.get('storageSize',0)+st.get('totalIndexSize',0))/1e6,2))
+                TICKS['paused']=TICKS['storageMB']>=TICK_MAX_MB
+            except Exception as e: TICKS['lastError']=f'stats: {e}'
+if TCOL is not None: threading.Thread(target=_tick_writer,daemon=True).start()
 def _ws_quote(tk,q):
+    try: tick_rec(tk,q)
+    except Exception: pass
     if not (LV and LV.enabled()): return
     ts=[t for t in list(pt.trades) if t.get('mode')=='live' and t.get('status')=='open' and t.get('ticker')==tk and not t.get('exiting')]
     if not ts: return
@@ -648,6 +690,7 @@ class H(SimpleHTTPRequestHandler):
                 d=pt.getStats(); d['signalStatus']=status; d['eloedge']=status['eloedge']; d['serverTime']=time.time(); d['persistence']=PERSIST; d['live']=lv
                 live_on=bool(lv.get('enabled')); d['mode']='live' if live_on else 'paper'; d['liveCash']=lv.get('cash')
                 if live_on and lv.get('cash') is not None: d['balance']=lv['cash']
+                d['ticks']=dict(TICKS,queued=len(_tq))
                 b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/trades.csv':
@@ -658,6 +701,23 @@ class H(SimpleHTTPRequestHandler):
             for t in tr: w.writerow([t.get('id'),t.get('mode','paper'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl','')])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')
             s.send_header('Content-Disposition',f'attachment; filename="paper-desk-trades-{datetime.now(ET).strftime("%Y%m%d-%H%M")}.csv"'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/ticks':
+            from urllib.parse import parse_qs
+            qs={k:v[0] for k,v in parse_qs(s.path.split('?',1)[1] if '?' in s.path else '').items()}
+            if TCOL is None: b=json.dumps({'error':'tick store unavailable (no mongo)','rows':[]}).encode()
+            else:
+                try:
+                    flt={}
+                    if qs.get('ticker'): flt['t']=qs['ticker']
+                    rng={}
+                    if qs.get('from'): rng['$gte']=int(float(qs['from']))
+                    if qs.get('to'): rng['$lte']=int(float(qs['to']))
+                    if rng: flt['ms']=rng
+                    lim=max(1,min(int(qs.get('limit') or 5000),20000))
+                    rows=list(TCOL.find(flt,{'_id':0,'at':0}).sort([('t',1),('ms',1)]).limit(lim))
+                    b=json.dumps({'count':len(rows),'limit':lim,'rows':rows}).encode()
+                except Exception as e: b=json.dumps({'error':str(e)[:200],'rows':[]}).encode()
+            s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
         elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p in('/','/index.html','/manifest.json'): super().do_GET()
         else: s.send_error(404)

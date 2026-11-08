@@ -56,4 +56,19 @@ chk('ws quote crossing stop triggers exactly one sell',len(calls)==1 and t['stat
 chk('used limit-protected stop_sell with stop level 0.3586',abs(calls[0][3]-0.3586)<1e-3)
 chk('trade logs stop slippage fields',all(k in t for k in ('stopLevel','stopBidAtTrigger','stopTriggerAt','stopFillPrice','stopFillAt','stopSlipC')))
 calls.clear(); g['_ws_quote']('KXBTC15M-T',dict(yesBid=0.67,yesAsk=0.68)); chk('closed position not re-sold',not calls)
+
+# ---- tick recording failure must not break the stop path ----
+want2={'PaperTrader','_ws_quote','tick_rec'}
+code2=''.join(ast.get_source_segment(src,n)+'\n' for n in tree.body if getattr(n,'name',None) in want2)
+class Boom:
+    def append(s,*a): raise RuntimeError('mongo down')
+    def __len__(s): raise RuntimeError('mongo down')
+g2=dict(g); g2.update(_tq=Boom(),_tlast={},TICKS=dict(paused=False,deduped=0,dropped=0),TCOL=object(),TICK_MAXQ=10,lock=threading.Lock())
+exec('import math\n'+code2,g2)
+calls.clear()
+pt2=g2['PaperTrader'].__new__(g2['PaperTrader']); pt2.trades=[dict(id=2,mode='live',asset='BTC',side='YES',price=0.5,contracts=2,stake=1.0,ticker='KXBTC15M-U',closesAt=time.time()+300,status='open')]
+pt2.save=lambda:None; g2['pt']=pt2
+g2['_ws_quote']('KXBTC15M-U',dict(yesBid=0.25,yesAsk=0.27))
+time.sleep(0.5)
+chk('recorder exception -> stop still fires once',len(calls)==1 and pt2.trades[0]['status']=='exited')
 raise SystemExit(0 if ok else 1)

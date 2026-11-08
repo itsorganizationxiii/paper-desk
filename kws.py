@@ -46,7 +46,9 @@ class Feed:
         old=s.q.get(tk) or {}
         yb=f('yes_bid'); ya=f('yes_ask')
         ts=m.get('ts_ms'); ts=ts/1000 if isinstance(ts,(int,float)) else (m.get('ts') if isinstance(m.get('ts'),(int,float)) else None)
-        s.q[tk]=dict(yesBid=yb if yb is not None else old.get('yesBid'),yesAsk=ya if ya is not None else old.get('yesAsk'),ts=ts,rx=time.time())
+        lp=f('price')
+        s.q[tk]=dict(yesBid=yb if yb is not None else old.get('yesBid'),yesAsk=ya if ya is not None else old.get('yesAsk'),ts=ts,rx=time.time(),last=lp if lp is not None else old.get('last'),
+                     noBid=f('no_bid'),noAsk=f('no_ask'))
         cb=s.on_quote
         if cb:
             try: cb(tk,s.q[tk])
