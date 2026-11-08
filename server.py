@@ -447,6 +447,19 @@ def flow(asset,mins=2):
     ks=sorted(_flow[sym])[-mins:]; b=sum(_flow[sym][k]['buy'] for k in ks); se=sum(_flow[sym][k]['sell'] for k in ks)
     return {'buy':round(b),'sell':round(se),'imb':round((b-se)/(b+se),3) if b+se else 0,'liqLong':round(sum(_flow[sym][k]['liqLong'] for k in ks)),'liqShort':round(sum(_flow[sym][k]['liqShort'] for k in ks))}
 threading.Thread(target=_flow_poller,daemon=True).start()
+# Shared live entry flow gate (Nov 8): Kraken taker flow against our side lost (28% win vs 55% with flow). Set FLOW_GATE_MIN=None to disable.
+FLOW_GATE_MIN=0.0
+FLOW_GATE_MIN_USD=1000
+def flow_blocked(asset,side):
+    if FLOW_GATE_MIN is None: return False
+    fl=flow(asset)
+    if not fl or fl.get('imb') is None or (fl.get('buy',0)+fl.get('sell',0))<FLOW_GATE_MIN_USD: return False
+    s_imb=fl['imb'] if side=='YES' else -fl['imb']
+    return s_imb<FLOW_GATE_MIN
+def _gbuy(asset,tk,side,*a,**kw):
+    if not kw.get('shadow') and kw.get('mode','live')=='live' and flow_blocked(asset,side):
+        LV.lastBuy='flow'; print('FLOW GATE skip',asset,tk,side,flush=True); return None
+    return LV.buy(asset,tk,side,*a,**kw)
 _perp={}
 def perp_premium(asset):
     # log-only (Nov 7): Kraken perp last vs spot index, as a fraction; cached 15s
@@ -552,6 +565,8 @@ def leadlag_entry(k,model_p=None):
             if reason:
                 LL.finish(ev,reason); continue
             ask=quote['yesAsk'] if side=='YES' else round(1-quote['yesBid'],4)
+            if _qs is not None and _qs-ask<need_edge():
+                LL.finish(ev,'real EloEdge edge below minimum'); continue
             # This is a directional hypothesis, not an EloEdge probability estimate.
             # Use the existing minimum-edge sizing adapter, exactly as alt-consensus does.
             q=min(ask+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
@@ -565,7 +580,7 @@ def leadlag_entry(k,model_p=None):
             LL.attempted={x for x in LL.attempted if x==tk}
             LL.attempted.add(tk)
             LL.last_error=None
-            fill=LV.buy('BTC',tk,side,sz[0],ask,sizer=size_at,shadow=False,mode='live')
+            fill=_gbuy('BTC',tk,side,sz[0],ask,sizer=size_at,shadow=False,mode='live')
             if fill:
                 meta=dict(priceSource='kalshi',signalSource='leadlag',leadlag=True,
                           leadlagTriggerCoin=ev['triggerCoin'],leadlagMove=ev['move'],
@@ -601,6 +616,8 @@ def ethlead_entry(k,model_p=None):
         elif any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!='BTC' and t.get('closesAt')==k['close'] and t.get('side')!=side for t in trades): reason='opposite live coin position this window'
         elif WKND_MAX>0 and wknd_night() and ba>WKND_MAX: reason='weekend price cap'
         elif ethlead.flow_against(side,flow('BTC')): reason='flow against'
+        elif ev['eloP'] is None: reason='no fresh EloEdge model p'
+        elif ev['eloP']-ba<need_edge(): reason='real EloEdge edge below minimum'
         if reason is None:
             q=min(ba+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
             def size_at(px):
@@ -615,7 +632,7 @@ def ethlead_entry(k,model_p=None):
                 ev.update(status='skipped',skipReason=reason); EL.log(ev)
             return
         EL.attempted={x for x in EL.attempted if x==tk}; EL.attempted.add(tk)
-        fill=LV.buy('BTC',tk,side,sz[0],ba,sizer=size_at,shadow=False,mode='live')
+        fill=_gbuy('BTC',tk,side,sz[0],ba,sizer=size_at,shadow=False,mode='live')
         if fill:
             meta=dict(priceSource='kalshi',signalSource='ethlead',ethlead=True,ethleadEthAsk=ea,ethleadBtcAsk=ba,ethleadGap=gap,ethleadEloP=ev.get('eloP'),ethleadSecsIn=round(900-left))
             with lock: trade=pt.openLive('BTC',side,fill,k['strike'],k['close'],tk,meta,sz[1],sz[2])
@@ -734,7 +751,7 @@ def tick_once():
                             sz=pt.size(rd,rask,rmp)
                             if sz:
                                 _rs=lambda px,d=rd:None if px>REV_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
-                                fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_rs,shadow=bool(rmeta.get('shadow')),mode=rmeta.get('mode','live'))
+                                fill=_gbuy(a,k['ticker'],rd,sz[0],rask,sizer=_rs,shadow=bool(rmeta.get('shadow')),mode=rmeta.get('mode','live'))
                                 if fill:
                                     with lock: t=pt.openLive(a,rd,fill,k['strike'],k['close'],k['ticker'],rmeta,sz[1],sz[2])
                     else:
@@ -753,7 +770,7 @@ def tick_once():
                             sz=pt.size(rd,rask,rmp)
                             if sz:
                                 _as=lambda px,d=rd:None if px>ALT_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
-                                fill=LV.buy(a,k['ticker'],rd,sz[0],rask,sizer=_as,shadow=bool(rmeta.get('shadow')),mode=rmeta.get('mode','live'))
+                                fill=_gbuy(a,k['ticker'],rd,sz[0],rask,sizer=_as,shadow=bool(rmeta.get('shadow')),mode=rmeta.get('mode','live'))
                                 if fill:
                                     with lock: t=pt.openLive(a,rd,fill,k['strike'],k['close'],k['ticker'],rmeta,sz[1],sz[2])
                     else:
@@ -796,7 +813,7 @@ def tick_once():
                     if k['ticker'] in LV.tried or k['ticker'] in LV.resting: sg['action']='live: order working / already tried this window'; sigs[a]=sg; continue
                     _sz=lambda px,d=dirn,m=mp:None if (WKND_MAX>0 and wknd_night() and px>WKND_MAX) or uptilt.blocked(d,(m if d=='YES' else 1-m)-px,need_edge(),wknd_night()) else (pt.size(d,px,m) or [None])[0]
                     LV.lastBuy=None
-                    fill=LV.buy(a,k['ticker'],dirn,sz[0],ask,sizer=_sz,shadow=bool(meta.get('shadow')),mode=meta.get('mode','live'))
+                    fill=_gbuy(a,k['ticker'],dirn,sz[0],ask,sizer=_sz,shadow=bool(meta.get('shadow')),mode=meta.get('mode','live'))
                     if fill:
                         with lock: t=pt.openLive(a,dirn,fill,k['strike'],k['close'],k['ticker'],meta,sz[1],sz[2])
                     elif LV.lastBuy in ('edge','nofill') and REST_SEC>0 and left>REST_SEC+60:

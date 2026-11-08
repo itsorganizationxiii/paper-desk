@@ -82,6 +82,7 @@ def harness(ll=None,left=400,trades=None,cool=False,mp=0.7):
            LL_MIN_LEFT=180,LL_MAX_AGE=20,LL_FRESH=10,LL_MOVE=0.08,LL_RETRACE=0.02,is_shadow=lambda t:False,shadow_asset=lambda a:cool,
            WKND_MAX=0.69,wknd_night=lambda:True,need_edge=lambda:0.07,up_tilt_skip=lambda *a:False)
     g['leadlag']=leadlag_mod
+    g['_gbuy']=lambda *a,**kw: L.buy(*a,**kw)
     exec(code,g)
     _e=g['leadlag_entry']; g['leadlag_entry']=lambda kk,_e=_e,_m=mp: _e(kk,_m)
     k=dict(ticker=BTC,close=NOW+left,strike=100)

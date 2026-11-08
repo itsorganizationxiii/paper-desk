@@ -50,7 +50,7 @@ pt.trades=[]
 assert g['alt_cap_allow']('KXBTC15M-TEST',NOW)
 part=src[src.index("        if ALT and a=='BTC'"):src.index('        reok=False')]
 assert "if alt_cap_allow(k['ticker']) and" in part
-assert part.index('alt_cap_allow(')<part.index('fill=LV.buy(')
+assert part.index('alt_cap_allow(')<part.index('fill=_gbuy(')
 assert "d['altCap']=dict(alt_cap_state(pt.trades)" in src
 print('PASS live alt branch guard, deduplicated reason logs, and status wiring; no HTTP/orders')
 
@@ -69,6 +69,7 @@ g.update(ALT=True,ALT_MAX=.60,LV=L,left=600,k=dict(ticker='KXBTC15M-NEXT',yesAsk
          is_shadow=lambda t:False,lock=threading.RLock(),sigs={},sg={},up_tilt_skip=lambda *a:False)
 original_allow=g['alt_cap_allow']
 g['alt_cap_allow']=lambda ticker:original_allow(ticker,NOW)
+g["_gbuy"]=lambda *a,**kw: g["LV"].buy(*a,**kw)
 exec(wrapper,g)
 pt.trades=[loss];g['run_branch']();assert not buys
 pt.trades=[];g['run_branch']();assert len(buys)==1

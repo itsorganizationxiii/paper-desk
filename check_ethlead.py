@@ -51,7 +51,8 @@ def harness(trades=None,shadow=False,cap=0.69,lv=None,fl=None):
     L=lv or FakeLV(); pt=FakePT(); pt.trades=list(trades or [])
     g=dict(EL=EthLead(),LV=L,pt=pt,time=SimpleNamespace(time=lambda:NOW),lock=threading.Lock(),el_eval=evaluate,EL_MIN_LEFT=300,
            shadow_asset=lambda a:shadow,is_shadow=lambda t:False,WKND_MAX=cap,wknd_night=lambda:True,need_edge=lambda:0.07,ethlead=ethlead,flow=lambda a:fl)
-    exec(code,g); k=dict(ticker=BTC,close=NOW+400,strike=1)
+    g['_gbuy']=lambda *a,**kw: L.buy(*a,**kw)
+    exec(code,g); _e=g['ethlead_entry']; g['ethlead_entry']=lambda kk,_e=_e: _e(kk,0.8); k=dict(ticker=BTC,close=NOW+400,strike=1)
     g['ethlead_entry'](k); return g,L,pt,k
 g,L,pt,k=harness()
 assert len(L.calls)==1 and pt.trades[0]['signalSource']=='ethlead'
