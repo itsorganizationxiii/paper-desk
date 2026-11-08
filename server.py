@@ -521,7 +521,6 @@ def tick_once():
                 elif not t.get('fade') and sig_against and elo_against and q is not None and bid-q>=EXIT_EDGE:
                     pt.exit(t,bid,f'flip: momentum/CVD {dirn} + {"EloEdge" if est=="live" else "fallback"} p={q:.3f} vs bid {bid:.3f}')
         if not k: sg['action']='skip: no real Kalshi market'; sigs[a]=sg; continue
-        if a=='SOL' and night(): sg['action']='skip: SOL paused at night (5 PM-9 AM ET, thin volume)'; sigs[a]=sg; continue
         if a in METALS and (metals_closed() or metals_closed(k['close']-1)): sg['action']='skip: metals session closed (Kalshi 5-6 PM ET daily, Fri 5 PM-Sun 6 PM ET)'; sigs[a]=sg; continue
         mp=fresh(k['ticker']); sg['modelP']=mp
         left=k['close']-time.time(); sg['secsToClose']=round(left)
