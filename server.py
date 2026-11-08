@@ -190,7 +190,20 @@ class PaperTrader:
             t.pop('exiting',None)
             if isstop and fc>0: t.update(stopLevel=stl,stopBidAtTrigger=t.get('exitTrigBid'),stopTriggerAt=t.get('exitTrigAt'),stopFillPrice=fpx,stopFillAt=time.time(),stopSlipC=round((stl-fpx)*100,1) if fpx is not None else None)
             if fc<=0:
-                t.update(liveSellError=err or 'no fill',liveSellAt=time.time()); s.save()
+                t.update(liveSellError=err or 'no fill',liveSellAt=time.time())
+                ext=False
+                try:
+                    p=LV.position(t['ticker'])
+                    ext=p is not None and ((p if t['side']=='YES' else -p)<=0.001)
+                except Exception: ext=False
+                if ext:
+                    # Owner sold manually (or position otherwise gone): stop retrying, book at the trigger bid as an estimate
+                    epx=round(t.get('exitTrigBid') or bid or 0,4)
+                    t.update(status='exited',exitPrice=epx,exitReason=f'closed outside bot (no Kalshi position) during: {reason}',settledBy='external',pnlEstimated=True,
+                             pnl=round(t['contracts']*epx-t['stake']+(t.get('partialPnl') or 0),2),closedAt=time.time())
+                    LV.log(action='external-close',ticker=t['ticker'],side=t['side'],estPrice=epx)
+                    print('EXIT EXTERNAL',t['id'],flush=True)
+                s.save()
                 if isstop: LV.persist()
                 return
             share=min(1.0,fc/t['contracts']); realized=round(fc*fpx-fee-t['stake']*share,2)
