@@ -116,6 +116,7 @@ class PaperTrader:
         if edge<need_edge() or not (0<ask<1): return None
         if MIN_ENTRY>0 and ask<MIN_ENTRY: return None  # entry floor: sub-40c entries lost in live + 7-weekend backtest (all signals, paper+live)
         if WKND_MAX_EDGE>0 and wknd_night() and edge>WKND_MAX_EDGE: return None
+        if WKND_MIN>0 and wknd_night() and ask<WKND_MIN: return None
         return min(KELLY*edge/(1-ask),CAP)*(0.5 if nt else 1),edge,q
     def openLive(s,asset,side,fill,strike,close,ticker,meta,edge,q):
         if meta.get('shadow') or meta.get('mode','live')!='live' or 'XRP' in str(ticker).upper():
@@ -352,6 +353,8 @@ elo_com=dict(at=0,wins={},err=None)
 def night(ts=None):
     h=datetime.fromtimestamp(ts or time.time(),ET).hour
     return h>=17 or h<9
+# Weekend-night entry floor (Nov 8 5 AM ET): live since Fri 5 PM, entries under 60c went 8-16 (-$3.46), 60-69c went 8-3 (+$1.81). Set 0 to disable.
+WKND_MIN=0.60
 WKND_MAX=float(os.environ.get('WKND_NIGHT_MAX_PRICE','0.69'))  # 0 disables
 def wknd_night(ts=None):
     # Fri 5 PM ET -> Mon 9 AM ET (thin weekend volume)
