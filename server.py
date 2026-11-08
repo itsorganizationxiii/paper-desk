@@ -2,7 +2,11 @@
 # LIVE (env LIVE_TRADING=1 + Kalshi keys + dashboard not paused): same engine trades the real Kalshi cash; trades are
 # recorded only when contracts actually fill (mode='live'). Live never touches the paper balance (it stays frozen).
 import lockhold as LH
-TRUTHFIX_AUTO=False  # one-shot Kalshi-record P&L job; off until fill parsing is fixed
+TRUTHFIX_AUTO=True  # one-shot Kalshi-record P&L job (fill parsing fixed Nov 8)
+def pnl_bounds_ok(t,pnl,tol=0.02):
+    st=float(t.get('stake') or 0); px=float(t.get('price') or 0); fees=float(t.get('entryFee') or 0)+float(t.get('exitFee') or 0)
+    lo=-(st+fees); hi=(st*(1/px-1)-fees) if px>0 else float('inf')
+    return (lo-tol<=pnl<=hi+tol+abs(float(t.get('partialPnl') or 0))),round(lo,4),round(hi,4)
 import uuid,json, os, time, math, threading, urllib.request, shutil, csv, io
 from datetime import timezone, timedelta
 try:
@@ -117,6 +121,11 @@ class PaperTrader:
         s.balance=st+sum(t.get('pnl') or 0 for t in pp if t.get('status')!='open')-sum(t.get('stake') or 0 for t in pp if t.get('status')=='open')
         s.save(); return len(tr)
     def save(s):
+        # P&L sanity check: -(stake+fees) <= pnl <= stake*(1/price-1)-fees; outside -> flagged, not stored
+        for t in s.trades:
+            if t.get('status') in('won','lost','exited') and 'pnlChecked' not in t and t.get('pnl') is not None:
+                ok,lo,hi=pnl_bounds_ok(t,t['pnl']); t['pnlChecked']=True
+                if not ok: t.update(pnlRaw=t['pnl'],pnl=None,pnlFlagged=dict(lo=lo,hi=hi,at=time.time())); print('PNL FLAG',t.get('id'),t['pnlRaw'],lo,hi,flush=True)
         tmp=TF+'.tmp'; json.dump({'balance':round(s.balance,4),'startBalance':s.start,'trades':s.trades},open(tmp,'w'),indent=1); os.replace(tmp,TF)
         if MCOL is not None: _dirty.set()
     @staticmethod
@@ -255,7 +264,7 @@ class PaperTrader:
                     m=get(f"{KALSHI}/markets/{t['ticker']}")['market']
                     if m.get('result') in('yes','no'):
                         win=(m['result']=='yes')==(t['side']=='YES'); hold=round((t['contracts'] if win else 0)-t['stake'],2)
-                        t.update(finalResult=m['result'],wouldHaveWon=win,counterfactualPnl=hold,exitSavedPnl=round(t['pnl']-hold,2)); ch=True
+                        t.update(finalResult=m['result'],wouldHaveWon=win,counterfactualPnl=hold,exitSavedPnl=round((t.get('pnl') or 0)-hold,2)); ch=True
                 except Exception as e: print('cf err',e,flush=True)
         # hold_pnl: after-fee P&L if held to settlement from the same entry (backfills any trade with a known result)
         for t in s.trades:
@@ -263,13 +272,13 @@ class PaperTrader:
             if t['status'] in('won','lost'): w=t['status']=='won'
             elif t['status']=='exited' and 'wouldHaveWon' in t: w=t['wouldHaveWon']
             else: continue
-            t['hold_pnl']=t['pnl'] if t['status'] in('won','lost') else round((t.get('contracts') or 0)*(1 if w else 0)-(t.get('stake') or 0)-(t.get('entryFee') or 0),4); ch=True
+            t['hold_pnl']=(t.get('pnl') or 0) if t['status'] in('won','lost') else round((t.get('contracts') or 0)*(1 if w else 0)-(t.get('stake') or 0)-(t.get('entryFee') or 0),4); ch=True
         if ch: s.save()
     def exitSummary(s):
         ex=[t for t in s.trades if t['status']=='exited']; done=[t for t in ex if 'wouldHaveWon' in t]
         def agg(ts):
             return dict(count=len(ts),resolved=len([t for t in ts if 'wouldHaveWon' in t]),wouldHaveWon=len([t for t in ts if t.get('wouldHaveWon')]),
-                exitPnl=round(sum(t['pnl'] for t in ts),2),holdPnl=round(sum(t.get('counterfactualPnl',0) for t in ts if 'wouldHaveWon' in t),2),
+                exitPnl=round(sum((t.get('pnl') or 0) for t in ts),2),holdPnl=round(sum(t.get('counterfactualPnl',0) for t in ts if 'wouldHaveWon' in t),2),
                 netSaved=round(sum(t.get('exitSavedPnl',0) for t in ts),2),
                 savedOnLosers=round(sum(t['exitSavedPnl'] for t in ts if 'wouldHaveWon' in t and not t['wouldHaveWon']),2),
                 lostOnWinners=round(-sum(t['exitSavedPnl'] for t in ts if t.get('wouldHaveWon')),2))
@@ -277,14 +286,14 @@ class PaperTrader:
         for t in ex: by.setdefault((t.get('exitReason') or 'other').split(':')[0],[]).append(t)
         hd=[t for t in s.trades if t.get('tpHeld') and t['status'] in('won','lost')]
         held=dict(count=len([t for t in s.trades if t.get('tpHeld')]),resolved=len(hd),won=len([t for t in hd if t['status']=='won']),
-            lost=len([t for t in hd if t['status']=='lost']),holdPnl=round(sum(t['pnl'] for t in hd),2),
-            tpPnlIfSold=round(sum(t.get('tpSellPnl',0) for t in hd),2),holdGain=round(sum(t['pnl']-t.get('tpSellPnl',0) for t in hd),2))
+            lost=len([t for t in hd if t['status']=='lost']),holdPnl=round(sum((t.get('pnl') or 0) for t in hd),2),
+            tpPnlIfSold=round(sum(t.get('tpSellPnl',0) for t in hd),2),holdGain=round(sum((t.get('pnl') or 0)-t.get('tpSellPnl',0) for t in hd),2))
         return dict(all=agg(ex),byReason={k:agg(v) for k,v in by.items()},pending=len(ex)-len(done),takeProfitHolds=held)
     def getStats(s):
         def st(ts):
             c=[t for t in ts if t['status']!='open']; w=[t for t in c if t.get('pnl',0)>0]; o=[t for t in ts if t['status']=='open']
-            return dict(trades=len(ts),closed=len(c),open=len(o),wins=len(w),winRate=round(len(w)/len(c),3) if c else 0,pnl=round(sum(t['pnl'] for t in c),2),
-                expectancy=round(sum(t['pnl'] for t in c)/len(c),3) if c else 0,unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2))
+            return dict(trades=len(ts),closed=len(c),open=len(o),wins=len(w),winRate=round(len(w)/len(c),3) if c else 0,pnl=round(sum((t.get('pnl') or 0) for t in c),2),
+                expectancy=round(sum((t.get('pnl') or 0) for t in c)/len(c),3) if c else 0,unrealizedPnl=round(sum(t.get('unrealizedPnl',0) for t in o),2))
         pp=[t for t in s.trades if t.get('mode')!='live' and not t.get('shadow')]; lt=[t for t in s.trades if t.get('mode')=='live' and not t.get('shadow')]
         P=st(pp); Lv=st(lt); A=st(pp+lt); o=[t for t in pp if t['status']=='open']
         sh={f'{x} shadow':st([t for t in s.trades if is_shadow(t) and t.get('asset')==x]) for x in ('BTC','ETH','SOL','XRP')}
@@ -880,6 +889,7 @@ TICKS=dict(enabled=False,recorded=0,dropped=0,deduped=0,flushErrors=0,lastFlush=
 TCOL=MCOL.database['ticks'] if MCOL is not None else None
 import windowlog as WL
 import truthfix as TFX
+TFX.SANE=pnl_bounds_ok
 # Owner #3 fix: permanent append-only order log (every order/cancel/skip event) and one-shot Kalshi-record P&L truth fix.
 if LV is not None and MCOL is not None:
     try: LV.orderlog=MCOL.database['orderlog']

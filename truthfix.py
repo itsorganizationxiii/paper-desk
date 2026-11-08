@@ -4,6 +4,7 @@
 # (4) Reconcile total bot after-fee P&L against Kalshi's per-ticker P&L and the account balance change; log the difference.
 import time, threading, traceback
 from urllib.parse import urlencode
+SANE=None
 ST=dict(ran=False,at=None,err=None,fixed=[],backfilled=[],recon=None)
 def _n(f,k): v=f.get(k+'_fp') if f.get(k+'_fp') not in (None,'') else f.get(k); return float(v or 0)
 def _px(f,side):
@@ -20,11 +21,12 @@ def ticker_pnl(L,live,tk):
     for f in fills:
         side=str(f.get('side') or '').upper(); q=_n(f,'count'); p=_px(f,side); fee=float(f.get('fee_cost') or 0)
         fees+=fee
-        if f.get('action')=='sell': cash+=q*p; sells+=q; scash+=q*p
+        # Kalshi reports a sell of YES as action=sell side=no at the NO price (and vice versa): proceeds are the OTHER side's price
+        if f.get('action')=='sell': sp=1-p; cash+=q*sp; sells+=q; scash+=q*sp
         else: cash-=q*p; buys+=q; bcost+=q*p
     rev=0.0; sfee=0.0; res=None
     for x in sets:
-        rev+=float(x.get('revenue') or 0)/100; sfee+=float(x.get('fee_cost') or 0); res=x.get('market_result') or res
+        rev+=float(x.get('revenue') or 0)/100; res=x.get('market_result') or res  # settlement fee_cost repeats the fill fees; not added again
     return dict(pnl=round(cash+rev-fees-sfee,4),fees=round(fees+sfee,4),buys=buys,sells=sells,avgBuy=(bcost/buys if buys else None),avgSell=(scash/sells if sells else None),revenue=rev,result=res,nFills=len(fills),nSettlements=len(sets))
 def run(pt,lock,L,live,col=None):
     try:
@@ -43,7 +45,11 @@ def run(pt,lock,L,live,col=None):
                 for t in ts:
                     if not t.get('finalResult') and k['result'] in ('yes','no'):
                         t['finalResult']=k['result']; t['finalResultBackfilled']=True; ST['backfilled'].append(t['id'])
+                    if t.get('pnlSource')=='kalshi-fills' and len(ts)==1:   # redo earlier overwrite made with the buggy parser
+                        t['pnl']=t.get('pnlBotEstimate'); t['pnlEstimated']=True; t.pop('pnlSource',None)
                     if len(ts)==1 and (t.get('pnlEstimated') or (t.get('status')=='exited' and t.get('exitFee') in (None,''))):
+                        ok,lo,hi=SANE(t,k['pnl']) if SANE else (True,None,None)
+                        if not ok: t['pnlFlagged']=dict(kalshi=k['pnl'],lo=lo,hi=hi); ST.setdefault('flagged',[]).append(t['id']); continue
                         old=t.get('pnl'); t['pnlBotEstimate']=old; t['pnl']=k['pnl']; t['pnlSource']='kalshi-fills'; t.pop('pnlEstimated',None)
                         t['exitFee']=round(k['fees']-(t.get('entryFee') or 0),4)
                         if k['avgSell'] is not None: t['exitPrice']=round(k['avgSell'],4)
