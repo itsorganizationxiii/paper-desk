@@ -578,7 +578,7 @@ def leadlag_entry(k,model_p=None):
 from ethlead import EthLead, evaluate as el_eval, ETHLEAD_MIN_LEFT as EL_MIN_LEFT
 import ethlead
 EL=EthLead()
-def ethlead_entry(k):
+def ethlead_entry(k,model_p=None):
     # ETH-leads-BTC: buy BTC on ETH's >50c side when BTC is 7-10c cheaper; one per window.
     try:
         now=time.time(); tk=k['ticker']; left=k['close']-now
@@ -587,7 +587,8 @@ def ethlead_entry(k):
         side,ea,ba,gap,reason=el_eval(eq,bq,left,now)
         EL.last_reason=reason
         if reason: return
-        ev=dict(at=now,ticker=tk,side=side,ethAsk=ea,btcAsk=ba,gapC=round(gap*100,2),secsLeft=round(left),status='pending',skipReason=None)
+        ev=dict(at=now,ticker=tk,side=side,ethAsk=ea,btcAsk=ba,gapC=round(gap*100,2),secsLeft=round(left),status='pending',skipReason=None,
+                eloP=None if model_p is None else round(model_p if side=='YES' else 1-model_p,4))
         with lock: trades=list(pt.trades)
         if tk in EL.attempted or any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('signalSource')=='ethlead' for t in trades): reason='already traded ethlead this window'
         elif any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('status')=='open' for t in trades): reason='BTC position already open'
@@ -612,7 +613,7 @@ def ethlead_entry(k):
         EL.attempted={x for x in EL.attempted if x==tk}; EL.attempted.add(tk)
         fill=LV.buy('BTC',tk,side,sz[0],ba,sizer=size_at,shadow=False,mode='live')
         if fill:
-            meta=dict(priceSource='kalshi',signalSource='ethlead',ethlead=True,ethleadEthAsk=ea,ethleadBtcAsk=ba,ethleadGap=gap)
+            meta=dict(priceSource='kalshi',signalSource='ethlead',ethlead=True,ethleadEthAsk=ea,ethleadBtcAsk=ba,ethleadGap=gap,ethleadEloP=ev.get('eloP'),ethleadSecsIn=round(900-left))
             with lock: trade=pt.openLive('BTC',side,fill,k['strike'],k['close'],tk,meta,sz[1],sz[2])
             ev.update(status='filled',tradeId=trade['id'])
         else: ev.update(status='skipped',skipReason='no fill: '+str(LV.lastBuy or 'execution guard'))
@@ -713,7 +714,7 @@ def tick_once():
         mp=fresh(k['ticker']); sg['modelP']=mp
         left=k['close']-time.time(); sg['secsToClose']=round(left)
         if a=='BTC': leadlag_entry(k,mp)
-        if a=='BTC': ethlead_entry(k)
+        if a=='BTC': ethlead_entry(k,mp)
         if REV and 600<=left<=840 and not any(t.get('ticker')==k['ticker'] for t in pt.trades):
             # reversal bet (user test, Nov 7): after 3+ same-way settles, buy the other side early in the window; backtest 59% wins
             td=trend_dir(k['ticker'].split('-')[0])
