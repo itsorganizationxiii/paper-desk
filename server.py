@@ -256,6 +256,13 @@ class PaperTrader:
                         win=(m['result']=='yes')==(t['side']=='YES'); hold=round((t['contracts'] if win else 0)-t['stake'],2)
                         t.update(finalResult=m['result'],wouldHaveWon=win,counterfactualPnl=hold,exitSavedPnl=round(t['pnl']-hold,2)); ch=True
                 except Exception as e: print('cf err',e,flush=True)
+        # hold_pnl: after-fee P&L if held to settlement from the same entry (backfills any trade with a known result)
+        for t in s.trades:
+            if 'hold_pnl' in t: continue
+            if t['status'] in('won','lost'): w=t['status']=='won'
+            elif t['status']=='exited' and 'wouldHaveWon' in t: w=t['wouldHaveWon']
+            else: continue
+            t['hold_pnl']=t['pnl'] if t['status'] in('won','lost') else round((t.get('contracts') or 0)*(1 if w else 0)-(t.get('stake') or 0)-(t.get('entryFee') or 0),4); ch=True
         if ch: s.save()
     def exitSummary(s):
         ex=[t for t in s.trades if t['status']=='exited']; done=[t for t in ex if 'wouldHaveWon' in t]
@@ -1074,11 +1081,11 @@ class H(SimpleHTTPRequestHandler):
                 b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/trades.csv':
-            cols=['id','mode','opened ET','closed ET','asset','ticker','side','entry','stake','stakePct','edge','signalSource','status','exitPrice','exitReason','settle','pnl']
+            cols=['id','mode','opened ET','closed ET','asset','ticker','side','entry','stake','stakePct','edge','signalSource','status','exitPrice','exitReason','settle','pnl','hold_pnl']
             et=lambda x:datetime.fromtimestamp(x,ET).strftime('%Y-%m-%d %H:%M:%S') if x else ''
             buf=io.StringIO(); w=csv.writer(buf); w.writerow(cols)
             with lock: tr=list(pt.trades)
-            for t in tr: w.writerow([t.get('id'),t.get('mode','paper'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl','')])
+            for t in tr: w.writerow([t.get('id'),t.get('mode','paper'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl',''),t.get('hold_pnl','')])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')
             s.send_header('Content-Disposition',f'attachment; filename="paper-desk-trades-{datetime.now(ET).strftime("%Y%m%d-%H%M")}.csv"'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/kxtrades':
