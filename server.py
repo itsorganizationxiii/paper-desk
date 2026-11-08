@@ -611,7 +611,7 @@ def tick_once():
     fb=src.get('eloedge')!='live'
     status.update(metalsClosed=metals_closed(),nightMode=night(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
         signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
-TICK_TTL_DAYS=14; TICK_MAX_MB=350; TICK_FLUSH_SEC=2; TICK_BATCH=500; TICK_MAXQ=20000
+TICK_TTL_DAYS=5; TICK_MAX_MB=350; TICK_FLUSH_SEC=2; TICK_BATCH=500; TICK_MAXQ=20000
 import collections
 _tq=collections.deque(maxlen=TICK_MAXQ); _tlast={}
 TICKS=dict(enabled=False,recorded=0,dropped=0,deduped=0,flushErrors=0,lastFlush=None,lastError=None,count=None,sizeMB=None,storageMB=None,paused=False,ttlDays=TICK_TTL_DAYS,maxMB=TICK_MAX_MB,ratePerMin=None)
@@ -627,7 +627,11 @@ def tick_rec(tk,q):
 def _tick_writer():
     from datetime import timezone as _tz
     try:
-        TCOL.create_index([('t',1),('ms',1)]); TCOL.create_index('at',expireAfterSeconds=TICK_TTL_DAYS*86400); TICKS['enabled']=True
+        TCOL.create_index([('t',1),('ms',1)]); TCOL.create_index('ms')
+        try: TCOL.create_index('at',expireAfterSeconds=TICK_TTL_DAYS*86400)
+        except Exception: MCOL.database.command('collMod','ticks',index={'keyPattern':{'at':1},'expireAfterSeconds':TICK_TTL_DAYS*86400})
+        TICKS['ttlActual']=[i.get('expireAfterSeconds') for i in TCOL.list_indexes() if i.get('key',{}).get('at')]
+        TICKS['enabled']=True
     except Exception as e: TICKS['lastError']=f'index: {e}'
     last_stat=0; win=collections.deque()
     while True:
@@ -712,9 +716,10 @@ class H(SimpleHTTPRequestHandler):
                     rng={}
                     if qs.get('from'): rng['$gte']=int(float(qs['from']))
                     if qs.get('to'): rng['$lte']=int(float(qs['to']))
+                    if qs.get('after'): rng['$gt']=int(float(qs['after']))
                     if rng: flt['ms']=rng
                     lim=max(1,min(int(qs.get('limit') or 5000),20000))
-                    rows=list(TCOL.find(flt,{'_id':0,'at':0}).sort([('t',1),('ms',1)]).limit(lim))
+                    rows=list(TCOL.find(flt,{'_id':0,'at':0}).sort([('t',1),('ms',1)] if qs.get('ticker') else [('ms',1),('t',1)]).limit(lim))
                     b=json.dumps({'count':len(rows),'limit':lim,'rows':rows}).encode()
                 except Exception as e: b=json.dumps({'error':str(e)[:200],'rows':[]}).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
