@@ -137,8 +137,10 @@ class Live:
             s._rollday(); s.dayPnl=round(s.dayPnl+pnl,2); s.totalPnl=round(s.totalPnl+pnl,2)
             if DAILY_LOSS>0 and s.dayPnl<=-DAILY_LOSS and not s.killed: s.killed=True; s.killReason=f'realized live loss ${-s.dayPnl:.2f} today >= ${DAILY_LOSS:.2f}'
             s.persist()
-    def log(s,**kw):
-        with s.lock: s.orders.append(dict(at=time.time(),**kw)); s.orders=s.orders[-200:]; s.persist()
+    def log(s,defer=False,**kw):
+        with s.lock:
+            s.orders.append(dict(at=time.time(),**kw)); s.orders=s.orders[-200:]
+            if not defer: s.persist()
     def balance(s):
         # Kalshi balance endpoint: 1 call/sec, no burst. Space calls >=2s apart and reuse the last value in between.
         with s.lock:
@@ -278,7 +280,7 @@ class Live:
             if oid:
                 s.own_orders[oid]=dict(ticker=ticker,side=side,price=px,action=action,clientId=client)
                 s.submitted_orders[oid]=s.own_orders[oid]
-                s.log(action='order-submitted',ticker=ticker,side=side,orderId=oid,clientId=client,http=c)
+                s.log(defer=action=='sell' and confirm==STOP_CONFIRM,action='order-submitted',ticker=ticker,side=side,orderId=oid,clientId=client,http=c)
                 terminal=False
                 for _ in range(confirm[0]):
                     if action=='sell' and fc>0: break
@@ -452,7 +454,8 @@ class Live:
         if fc: s.cashAt=None
         if err: s.lastError=f'stop sell: {err}'
         fpx=round(proceeds/fc,4) if fc else None
-        s.log(action='stop-sell',ticker=ticker,side=side,want=count,stopLevel=round(stop,4),limit=lim,bidAtTrigger=bid,triggerAt=round(trig_at,3),limitTries=tries,limitFilled=lim_fc,
+        # PaperTrader books/persists these logs after recording the actual fill.
+        s.log(defer=True,action='stop-sell',ticker=ticker,side=side,want=count,stopLevel=round(stop,4),limit=lim,bidAtTrigger=bid,triggerAt=round(trig_at,3),limitTries=tries,limitFilled=lim_fc,
               fallback=fb,fallbackSubmitAt=round(fallback_at,3) if fallback_at else None,elapsedMs=round((time.time()-trig_at)*1000),filled=fc,fillPrice=fpx,fillAt=round(time.time(),3),slipC=round((stop-fpx)*100,1) if fpx is not None else None,fee=round(fee,4),error=err)
         return fc,fpx,round(fee,4),oid,err
     def status(s):

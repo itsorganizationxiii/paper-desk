@@ -37,7 +37,7 @@ try:
         L=live.Live(); L.owner=lambda:True
         L.position=lambda *a:(_ for _ in ()).throw(AssertionError('position preflight'))
         L._quote=lambda *a:(_ for _ in ()).throw(AssertionError('quote preflight'))
-        L.log=lambda **kw:calls.append(('log',kw))
+        saved=[]; L._save=lambda st:saved.append(st)
         orders={}; counter=[0]
         def api(method,path,body=None):
             clock.now+=.3
@@ -62,7 +62,10 @@ try:
         posts=[c for c in network if c[0]=='POST']
         if partial: assert posts[-1][2]['count']=='1.50'
         assert posts[-1][2]['price']=='0.9900'
-        log=[c[1] for c in calls if c[0]=='log' and c[1]['action']=='stop-sell'][-1]
+        log=L.orders[-1]
+        assert not saved,'synchronous persistence delayed a stop'
+        L.persist()
+        assert saved and any(o['action']=='stop-sell' for o in saved[-1]['orders'])
         assert log['fallback'] and log['elapsedMs'] in (600,1200)
         assert {'slipC','fallbackSubmitAt','fillAt'}<=log.keys()
         print(f'PASS bid={bid}, partial={partial}: {len(network)} mocked 300ms HTTP calls, {log["elapsedMs"]}ms, no sleeps/preflights, reduce-only remaining size')

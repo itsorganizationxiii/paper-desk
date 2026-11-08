@@ -188,7 +188,10 @@ class PaperTrader:
         with lock:
             t.pop('exiting',None)
             if isstop and fc>0: t.update(stopLevel=stl,stopBidAtTrigger=t.get('exitTrigBid'),stopTriggerAt=t.get('exitTrigAt'),stopFillPrice=fpx,stopFillAt=time.time(),stopSlipC=round((stl-fpx)*100,1) if fpx is not None else None)
-            if fc<=0: t.update(liveSellError=err or 'no fill',liveSellAt=time.time()); s.save(); return
+            if fc<=0:
+                t.update(liveSellError=err or 'no fill',liveSellAt=time.time()); s.save()
+                if isstop: LV.persist()
+                return
             share=min(1.0,fc/t['contracts']); realized=round(fc*fpx-fee-t['stake']*share,2)
             if share>=0.999:
                 t.update(status='exited',exitPrice=fpx,exitReason=reason,exitFee=round(fee,4),liveSellOrderId=oid,settledBy='live-sell',pnl=round(realized+(t.get('partialPnl') or 0),2),closedAt=time.time())
@@ -373,6 +376,21 @@ def shadow_asset(a,ts=None):
     return a=='XRP' or a in cd or 'ALL' in cd
 def is_shadow(t): return bool(t.get('shadow'))
 ALT=os.environ.get('ALT_CONSENSUS','1')!='0'; ALT_MAX=float(os.environ.get('ALT_MAX_PRICE','0.60')); _altc={}
+from altcap import state as alt_cap_state
+_alt_cap_skips=[]; _alt_cap_seen=set()
+def alt_cap_allow(ticker,now=None):
+    cap=alt_cap_state(pt.trades,now)
+    if not cap['blocked']: return True
+    key=(ticker,cap['blockedUntil'],cap['reason'])
+    if key not in _alt_cap_seen:
+        _alt_cap_seen.add(key)
+        if len(_alt_cap_seen)>200: _alt_cap_seen.clear(); _alt_cap_seen.add(key)
+        event=dict(at=time.time() if now is None else now,ticker=ticker,reason=cap['reason'],blockedUntil=cap['blockedUntil'])
+        _alt_cap_skips.append(event)
+        del _alt_cap_skips[:-20]
+        print('ALT CAP SKIP',ticker,cap['reason'],flush=True)
+        if LV: LV.log(action='alt-cap-skip',ticker=ticker,reason=cap['reason'],blockedUntil=cap['blockedUntil'])
+    return False
 def alt_votes(btc_ticker):
     # SOL/DOGE/XRP lean for the same 15m window (YES mid > 0.5); cached 20s. User live test Nov 7.
     suf=btc_ticker.split('-',1)[1]; c=_altc.get(suf)
@@ -650,7 +668,7 @@ def tick_once():
                     rmeta=dict(priceSource='kalshi',signalSource='alt-consensus',fade=True,altConsensus=True,altVotes=av)
                     t=None
                     if LV and LV.enabled():
-                        if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
+                        if alt_cap_allow(k['ticker']) and k['ticker'] not in LV.tried and k['ticker'] not in LV.resting:
                             sz=pt.size(rd,rask,rmp)
                             if sz:
                                 _as=lambda px,d=rd:None if px>ALT_MAX else (pt.size(d,px,(lambda f:f if d=='YES' else 1-f)(min(px+need_edge()+0.001,0.99))) or [None])[0]  # keep min-edge size at the live price
@@ -818,8 +836,9 @@ class H(SimpleHTTPRequestHandler):
                 d['ticks']=dict(TICKS,queued=len(_tq))
                 d['leadlag']=LL.snapshot(pt.trades)
                 d['reconcile']=dict(RECON.state)
-                d['deployment']='looser-lock-fast-stop-v2'
+                d['deployment']='looser-lock-fast-stop-alt-cap-v3'
                 d['profitLock']=dict(weekend=wknd_night(),mode=WKND_MODE,upArmC=round(WKND_UP_ARM*100),upDropC=round(WKND_UP_DROP*100),downArmC=round(WKND_LOCK_ARM_C*100),downDropC=round(WKND_DROP*100),fixedPeakC=round(LOCK_PEAK*100))
+                d['altCap']=dict(alt_cap_state(pt.trades),enabled=ALT,recentSkips=list(_alt_cap_skips))
                 d['stopExecution']=dict(limitAttempts=1,confirmation='single immediate order-status poll',confirmationWaitSec=0,aggressiveLimitC=1,preflightPosition=False)
                 _re=[t for t in pt.trades if t.get('reentry')]; _rc=[t for t in _re if t.get('status')!='open']
                 d['reentries']=dict(count=len(_re),open=len(_re)-len(_rc),closed=len(_rc),wins=len([t for t in _rc if (t.get('pnl') or 0)>0]),pnl=round(sum(t.get('pnl') or 0 for t in _rc),2))

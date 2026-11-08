@@ -45,3 +45,20 @@ and 1200ms for a missed/partial protected limit plus fallback, with no sleeps.
 These are modeled timings, not observed live latency; external HTTP stalls
 can still exceed two seconds. All check_*.py scripts and an isolated
 LIVE_TRADING=0 boot/curl on PORT=18998 passed.
+
+## Additional owner-approved alt-consensus cap
+
+Alt-consensus stays live, with at most one live entry per rolling 3600 seconds
+across assets. If the most recent closed live alt-consensus trade has negative
+PnL, block new alt entries until 3600 seconds after that close. Both limits
+are reconstructed from the persisted trade history on every check, so they
+survive restart without resetting. Paper/shadow and other signal sources do
+not count or get blocked. Reasons are deduplicated per ticker/block period,
+recorded in the live order log, and exposed with cap state in `/api/status`.
+
+Stop order-submission and slippage logs are appended in memory on the hot
+path, then persisted by PaperTrader after recording the fill (or after a
+zero-fill result). This prevents synchronous Mongo log writes from delaying
+confirmation or the immediate aggressive fallback. Lease checks remain
+fail-closed and synchronous; modeled timing is not a guarantee against
+external Mongo/HTTP latency.
