@@ -8,7 +8,16 @@ GAP_MIN_LEFT=float(os.environ.get('GAP_SHADOW_MIN_LEFT','120'))
 GAP_MAX_LEFT=float(os.environ.get('GAP_SHADOW_MAX_LEFT','720'))
 GAP_LEAD_MIN=float(os.environ.get('GAP_SHADOW_LEAD_MIN','0.15'))
 ENABLED=os.environ.get('GAP_SHADOW','1')!='0'
-PAIRS=(('GOLD','SILVER'),('BTC','ETH'),('BTC','SOL'),('BTC','XRP'))
+def _pairs(v):
+    out=[]
+    for x in (v or '').split(','):
+        x=x.strip().upper()
+        if '-' in x:
+            a,b=[y.strip() for y in x.split('-',1)]
+            if a and b and a!=b: out.append((a,b))
+    return tuple(out)
+# User-specified pairs ONLY (no cross-mixing): BTC-ETH, GOLD-SILVER, SOL-XRP. Env GAP_SHADOW_PAIRS overrides.
+PAIRS=_pairs(os.environ.get('GAP_SHADOW_PAIRS','BTC-ETH,GOLD-SILVER,SOL-XRP')) or (('BTC','ETH'),('GOLD','SILVER'),('SOL','XRP'))
 STAKE=1.0
 TRADES=[]; _seen=set(); _lk=threading.Lock(); _path=[None]
 def fee(c,p): return math.ceil(7*c*p*(1-p))/100
