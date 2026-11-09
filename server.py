@@ -2,6 +2,7 @@
 # LIVE (env LIVE_TRADING=1 + Kalshi keys + dashboard not paused): same engine trades the real Kalshi cash; trades are
 # recorded only when contracts actually fill (mode='live'). Live never touches the paper balance (it stays frozen).
 import lockhold as LH
+import spec as SPEC
 TRUTHFIX_AUTO=True  # one-shot Kalshi-record P&L job (fill parsing fixed Nov 8)
 def pnl_bounds_ok(t,pnl,tol=0.02):
     st=float(t.get('stake') or 0); px=float(t.get('price') or 0); fees=float(t.get('entryFee') or 0)+float(t.get('exitFee') or 0)
@@ -129,13 +130,18 @@ class PaperTrader:
         tmp=TF+'.tmp'; json.dump({'balance':round(s.balance,4),'startBalance':s.start,'trades':s.trades},open(tmp,'w'),indent=1); os.replace(tmp,TF)
         if MCOL is not None: _dirty.set()
     @staticmethod
-    def size(side,ask,p_yes):
+    def size(side,ask,p_yes,bid=None):
         # quarter Kelly fraction (cap, night halving); shared by paper and live
-        q=p_yes if side=='YES' else 1-p_yes; edge=q-ask
+        # SPEC_EDGE/SPEC_GATES (default off) keep byte-for-byte current edge/floor behavior.
+        q=p_yes if side=='YES' else 1-p_yes
+        edge,bd=SPEC.decision_edge(q,ask,bid)
         nt=night()
-        if edge<need_edge() or not (0<ask<1): return None
-        if MIN_ENTRY>0 and ask<MIN_ENTRY: return None  # entry floor: sub-40c entries lost in live + 7-weekend backtest (all signals, paper+live)
-        if WKND_MAX_EDGE>0 and wknd_night() and edge>WKND_MAX_EDGE: return None
+        if edge is None or edge<need_edge() or not (0<ask<1): return None
+        if SPEC.gates_block(ask,bid): return None
+        if (not SPEC.SPEC_GATES) and MIN_ENTRY>0 and ask<MIN_ENTRY: return None  # entry floor: sub-40c entries lost in live + 7-weekend backtest (all signals, paper+live)
+        # weekend max-edge / min-ask still use raw edge for flags-off parity; with SPEC_EDGE use decision edge
+        edge_for_wknd=edge if SPEC.SPEC_EDGE else (q-ask)
+        if WKND_MAX_EDGE>0 and wknd_night() and edge_for_wknd>WKND_MAX_EDGE: return None
         if WKND_MIN>0 and wknd_night() and ask<WKND_MIN: return None
         return min(KELLY*edge/(1-ask),CAP)*(0.5 if nt else 1),edge,q
     def openLive(s,asset,side,fill,strike,close,ticker,meta,edge,q):
@@ -171,7 +177,8 @@ class PaperTrader:
             if fa is not None:
                 if fa>ask+0.01: print('PAPER NOFILL',ticker,side,ask,fa,flush=True); return None
                 ask=fa
-        sz=s.size(side,ask,p_yes)
+        bid=meta.get('_bid') if isinstance(meta,dict) else None
+        sz=s.size(side,ask,p_yes,bid)
         if not sz: return None
         f,edge,q=sz; bal=s.balance; sh=bool(meta.get('shadow'))
         stake=SHADOW_USD if (sh or PAPER_FLAT) else round(bal*f,2)
@@ -264,11 +271,27 @@ class PaperTrader:
                     m=get(f"{KALSHI}/markets/{t['ticker']}")['market']
                     if m.get('result') in('yes','no'):
                         s.close(t,(m['result']=='yes')==(t['side']=='YES'),'kalshi',m.get('expiration_value')); ch=True
+                        try:
+                            py=None
+                            if t['asset'] in('GOLD','SILVER'):
+                                py=(status.get('commodities') or {}).get(t['asset'],{}).get('price')
+                            SPEC.append_research(SPEC.settlement_row(asset=t['asset'],ticker=t.get('ticker'),side=t.get('side'),
+                                coinbase_spot=spot.get(t['asset']) if isinstance(spot,dict) else None,
+                                kalshi_result=m.get('result'),kalshi_expiration_value=m.get('expiration_value'),
+                                pyth_price=py,settled_by='kalshi',trade_id=t.get('id'),
+                                fill_ts=t.get('openedAt'),opened_at=t.get('openedAt'),closed_at=t.get('closedAt')),DATA)
+                        except Exception: pass
                         continue
                 except Exception as e: print('kalshi settle err',e,flush=True)
                 if now<t['closesAt']+600: continue
             if t['asset'] in spot:
                 s.close(t,(spot[t['asset']]>=t['strike'])==(t['side']=='YES'),'coinbase-spot',spot[t['asset']]); ch=True
+                try:
+                    SPEC.append_research(SPEC.settlement_row(asset=t['asset'],ticker=t.get('ticker'),side=t.get('side'),
+                        coinbase_spot=spot[t['asset']],kalshi_result=None,kalshi_expiration_value=None,
+                        settled_by='coinbase-spot',trade_id=t.get('id'),
+                        fill_ts=t.get('openedAt'),opened_at=t.get('openedAt'),closed_at=t.get('closedAt')),DATA)
+                except Exception: pass
             # counterfactual for early exits: what holding to settlement would have paid
         for t in s.trades:
             if t['status']=='exited' and t.get('ticker') and 'wouldHaveWon' not in t and now>=t['closesAt']:
@@ -364,7 +387,9 @@ def coinbase(a):
             if now-ts<=WHALE_WIN: wh.append(dict(side='buy' if x['side']=='sell' else 'sell',usd=round(u),price=float(x['price']),ago=round(now-ts)))
     net=sum(w['usd'] if w['side']=='buy' else -w['usd'] for w in wh)
     wdir='YES' if net>=strong else 'NO' if net<=-strong else None
-    return dict(sd15=sd15,spot=spot,momentum=round(mom,5),cvd=round(cvd,4),cvdRatio=round(cvd/vol,3) if vol else 0,
+    try: ret15=round((c[1][4]-c[1][3])/c[1][3],6) if len(c)>1 and c[1][3] else None
+    except Exception: ret15=None
+    return dict(sd15=sd15,spot=spot,momentum=round(mom,5),cvd=round(cvd,4),cvdRatio=round(cvd/vol,3) if vol else 0,ret15=ret15,
         whale=dict(thresholdUsd=round(thr),strongUsd=round(strong),usdPerMin=round(usd_per_min),floorUsd=wc['floor'],capUsd=wc['cap'],p99Usd=round(p99),count=len(wh),netFlowUsd=round(net),strongDir=wdir,alerts=wh[:10]))
 def metal(a):
     sym=METALS[a]; c=get(f"{KF}/api/charts/v1/mark/{sym}/15m?from={int(time.time())-86400*2}")['candles'][::-1]  # newest first
@@ -380,7 +405,9 @@ def metal(a):
         p=float(x['price']); sz=float(x['size'])
         if last is not None and p!=last: sg=1 if p>last else -1
         cvd+=sg*sz; vol+=sz; last=p
-    return dict(sd15=sd15,spot=spot,momentum=round(mom,5),cvd=round(cvd,4),cvdRatio=round(cvd/vol,3) if vol else 0,
+    try: ret15=round((cl[1]-float(c[1]['open']))/float(c[1]['open']),6) if len(cl)>1 and float(c[1]['open']) else None
+    except Exception: ret15=None
+    return dict(sd15=sd15,spot=spot,momentum=round(mom,5),cvd=round(cvd,4),cvdRatio=round(cvd/vol,3) if vol else 0,ret15=ret15,
         whale=dict(thresholdUsd=None,count=0,netFlowUsd=0,strongDir=None,alerts=[],note='n/a for metals'))
 def mk(m): return dict(ticker=m['ticker'],strike=m.get('floor_strike'),close=iso(m['close_time']),yesAsk=fnum(m,'yes_ask_dollars'),yesBid=fnum(m,'yes_bid_dollars'),noAsk=fnum(m,'no_ask_dollars'),noBid=fnum(m,'no_bid_dollars'),result=m.get('result') or '')
 def kalshi(a):
@@ -629,8 +656,9 @@ def leadlag_entry(k,model_p=None):
             LL.attempted={x for x in LL.attempted if x==tk}
             LL.attempted.add(tk)
             LL.last_error=None
-            if paper:
+            if paper or SPEC.EXPERIMENTAL_SHADOW_ONLY:
                 pmeta=dict(priceSource='kalshi',signalSource='leadlag',leadlag=True,leadlagTriggerCoin=ev['triggerCoin'],leadlagMove=ev['move'],leadlagBtcMove=ev['btcMove'],leadlagTriggerAt=ev['at'],leadlagEloP=ev.get('eloP'))
+                if SPEC.EXPERIMENTAL_SHADOW_ONLY: pmeta=SPEC.experimental_force_shadow(pmeta)
                 if flow_blocked('BTC',side): LL.finish(ev,'flow gate'); continue
                 with lock: trade=pt.openTrade('BTC',side,ask,mp,k['strike'],k['close'],tk,pmeta)
                 LL.finish(ev,trade=trade) if trade else LL.finish(ev,'paper size filter'); continue
@@ -687,8 +715,9 @@ def ethlead_entry(k,model_p=None):
                 ev.update(status='skipped',skipReason=reason); EL.log(ev)
             return
         EL.attempted={x for x in EL.attempted if x==tk}; EL.attempted.add(tk)
-        if paper:
+        if paper or SPEC.EXPERIMENTAL_SHADOW_ONLY:
             pmeta=dict(priceSource='kalshi',signalSource='ethlead',ethlead=True,ethleadEthAsk=ea,ethleadBtcAsk=ba,ethleadGap=gap,ethleadEloP=ev.get('eloP'),ethleadSecsIn=round(900-left))
+            if SPEC.EXPERIMENTAL_SHADOW_ONLY: pmeta=SPEC.experimental_force_shadow(pmeta)
             if flow_blocked('BTC',side): ev.update(status='skipped',skipReason='flow gate'); EL.log(ev); return
             with lock: trade=pt.openTrade('BTC',side,ba,mp,k['strike'],k['close'],tk,pmeta)
             ev.update(status='filled (paper)',tradeId=trade and trade['id']); EL.log(ev); return
@@ -704,7 +733,7 @@ def ethlead_entry(k,model_p=None):
 
 last_pyth=[0]
 def tick_once():
-    src={}; spot={}; sigs={}
+    src={}; spot={}; sigs={}; _pair_rets={}
     if time.time()-last_pyth[0]>60:
         last_pyth[0]=time.time()
         try: status['commodities']=pyth(); src['pyth']='live'
@@ -714,7 +743,9 @@ def tick_once():
     except Exception as e: elo_est,elo_wins='unavailable',{}; print('eloedge err',e,flush=True)
     for a in SERIES:
         sg={}
-        try: cb=metal(a) if a in METALS else coinbase(a); sg.update(cb); spot[a]=cb['spot']; src['kraken-futures' if a in METALS else 'coinbase']='live'
+        try:
+            cb=metal(a) if a in METALS else coinbase(a); sg.update(cb); spot[a]=cb['spot']; src['kraken-futures' if a in METALS else 'coinbase']='live'
+            if cb.get('ret15') is not None: _pair_rets[a]=cb['ret15']
         except Exception as e: src['kraken-futures' if a in METALS else 'coinbase']=f'error: {e}'; sigs[a]=dict(action='skip: coinbase down'); continue
         try:
             k=kalshi(a); src['kalshi']='live' if k else 'no open market'; sg['kalshi']=k
@@ -785,6 +816,11 @@ def tick_once():
                     f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)); pt.exit(t,bid,f'profitlock: {"night" if night() else "day"}, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
                 elif t['asset'] in GUARD_ASSETS and t['peakBid']>=t['price']+0.10 and bid>0 and bid<=t['price']-GUARD_GIVEBACK and not (q is not None and q>=LOCK_HOLD_P):
                     f3=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'breakeven: {t["asset"]} peaked {t["peakBid"]:.3f} (>=entry+0.10), fell to bid {bid:.3f} vs entry {t["price"]:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f3:.2f}',fee=f3)
+                elif SPEC.is_paperish(t):
+                    (do_stop,stop_why),cf=SPEC.paper_stop_action(t,bid,stop_pct(),model_q=q,ask=(m.get('yesAsk') if t['side']=='YES' else m.get('noAsk')) if isinstance(m,dict) else None,left_sec=left_t)
+                    try: t['stopCounterfactual']=cf
+                    except Exception: pass
+                    if do_stop: pt.exit(t,bid,stop_why,fee=kalshi_fee(t['contracts'],bid))
                 elif bid>0 and bid<=stop_pct()*t['price']: pt.exit(t,bid,f'stop: mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}')
                 elif not t.get('fade') and whale_against and bid>0 and not (left_t<90 and bid>=0.85) and (q is None or bid>=q-WHALE_MAX_GIVEUP):
                     pt.exit(t,bid,f'whale: net whale flow ${wnet:,.0f} against {t["side"]}, sold at bid {bid:.3f}')
@@ -805,8 +841,9 @@ def tick_once():
                     fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
                     rmeta=dict(priceSource='kalshi',signalSource='reversal-after-3',fade=True,reversal=True,streak=td)
                     if shadow_asset(a): rmeta=dict(rmeta,shadow=True,mode='shadow')
+                    if SPEC.EXPERIMENTAL_SHADOW_ONLY: rmeta=SPEC.experimental_force_shadow(rmeta)
                     t=None
-                    if LV and LV.enabled() and not shadow_asset(a):
+                    if LV and LV.enabled() and not shadow_asset(a) and not SPEC.EXPERIMENTAL_SHADOW_ONLY:
                         if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting and not up_tilt_skip(a,k['ticker'],rd,None,'reversal'):
                             sz=pt.size(rd,rask,rmp)
                             if sz:
@@ -824,8 +861,9 @@ def tick_once():
                 if 0<rask<=ALT_MAX and not any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
                     fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
                     rmeta=dict(priceSource='kalshi',signalSource='alt-consensus',fade=True,altConsensus=True,altVotes=av)
+                    if SPEC.EXPERIMENTAL_SHADOW_ONLY: rmeta=SPEC.experimental_force_shadow(rmeta)
                     t=None
-                    if LV and LV.enabled():
+                    if LV and LV.enabled() and not SPEC.EXPERIMENTAL_SHADOW_ONLY:
                         if alt_cap_allow(k['ticker']) and k['ticker'] not in LV.tried and k['ticker'] not in LV.resting and not up_tilt_skip(a,k['ticker'],rd,None,'alt-consensus'):
                             sz=pt.size(rd,rask,rmp)
                             if sz:
@@ -850,7 +888,7 @@ def tick_once():
             used='coinbase+eloedge'
             if mp is None: mp=heur(cb); used='coinbase-proxy (XRP shadow, no EloEdge)' if a=='XRP' else 'coinbase-fallback (EloEdge unavailable)'
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
-            meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est)
+            meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est,_bid=(k['yesBid'] if dirn=='YES' else k['noBid']))
             q=mp if dirn=='YES' else 1-mp
             shd=shadow_asset(a)
             if reok and not shd:
@@ -869,10 +907,11 @@ def tick_once():
             if LV and LV.enabled() and not shd:
                 if up_tilt_skip(a,k['ticker'],dirn,q-ask,'reentry' if meta.get('reentry') else 'eloedge'):
                     sg['action']=f'skip: up-tilt (weekend-night Up edge {q-ask:+.3f} < {need_edge()+uptilt.UP_TILT:.2f})'; sigs[a]=sg; continue
-                sz=pt.size(dirn,ask,mp); t=None
+                _bid=k['yesBid'] if dirn=='YES' else k['noBid']
+                sz=pt.size(dirn,ask,mp,_bid); t=None
                 if sz:
                     if k['ticker'] in LV.tried or k['ticker'] in LV.resting: sg['action']='live: order working / already tried this window'; sigs[a]=sg; continue
-                    _sz=lambda px,d=dirn,m=mp:None if (WKND_MAX>0 and wknd_night() and px>WKND_MAX) or uptilt.blocked(d,(m if d=='YES' else 1-m)-px,need_edge(),wknd_night()) else (pt.size(d,px,m) or [None])[0]
+                    _sz=lambda px,d=dirn,m=mp,b=_bid:None if (WKND_MAX>0 and wknd_night() and px>WKND_MAX) or uptilt.blocked(d,(m if d=='YES' else 1-m)-px,need_edge(),wknd_night()) else (pt.size(d,px,m,b) or [None])[0]
                     LV.lastBuy=None
                     fill=_gbuy(a,k['ticker'],dirn,sz[0],ask,sizer=_sz,shadow=bool(meta.get('shadow')),mode=meta.get('mode','live'))
                     if fill:
@@ -889,6 +928,32 @@ def tick_once():
                 with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],meta)
                 sg['action']=(f'OPENED {a} SHADOW #{t["id"]} (paper only)' if shd else f'OPENED #{t["id"]}') if t else (f'skip: weekend-night edge too big ({q-ask:+.3f} > {WKND_MAX_EDGE})' if WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE else f'skip: edge {q-ask:+.3f} < {need_edge()}')
         sigs[a]=sg
+    try:
+        if 'DOGE' not in _pair_rets:
+            try:
+                dc=get(f'{CB}/products/DOGE-USD/candles?granularity=900')
+                if dc and len(dc)>1 and dc[1][3]: _pair_rets['DOGE']=round((dc[1][4]-dc[1][3])/dc[1][3],6)
+            except Exception: pass
+        SPEC.update_pair_returns({a:[[0,0,0,1,1+(_pair_rets[a] or 0),0],[0,0,0,1,1+(_pair_rets[a] or 0),0]] for a in _pair_rets})
+        # update_pair_returns expects candle lists; bypass via direct cache write for snapshotted rets
+        SPEC._ret_cache.update(at=time.time(),rets=dict(_pair_rets),detail=SPEC.corr_regime(_pair_rets))
+        SPEC._ret_cache['tag']=SPEC._ret_cache['detail'].get('corrRegime'); SPEC._ret_cache['corr']=SPEC._ret_cache['detail'].get('signAgree')
+    except Exception: pass
+    try:
+        for a,sg in list(sigs.items()):
+            k=sg.get('kalshi') or {}
+            side=sg.get('direction') if sg.get('direction') in('YES','NO') else None
+            mp=sg.get('modelP'); ask=None; bid=None; q=None
+            if side and k:
+                ask=k.get('yesAsk') if side=='YES' else k.get('noAsk')
+                bid=k.get('yesBid') if side=='YES' else k.get('noBid')
+                if mp is not None: q=mp if side=='YES' else 1-mp
+            SPEC.append_research(SPEC.decision_row(asset=a,ticker=k.get('ticker') if isinstance(k,dict) else None,side=side,
+                model_p=mp,source=sg.get('signalSource') or sg.get('action'),yes_bid=(k or {}).get('yesBid'),yes_ask=(k or {}).get('yesAsk'),
+                no_bid=(k or {}).get('noBid'),no_ask=(k or {}).get('noAsk'),q=q if q is not None else mp,ask=ask,
+                bid=bid,action=sg.get('action'),skip_reason=None if (sg.get('action') or '').startswith('OPENED') else sg.get('action'),
+                cb=sg,extra=dict(secsToClose=sg.get('secsToClose'))),DATA)
+    except Exception: pass
     try: PL.observe(sigs,'live' if (LV and LV.enabled()) else 'paper')  # read-only prediction log; cannot raise
     except Exception: pass
     with lock: pt.settle(spot)
@@ -980,6 +1045,11 @@ def _ws_quote(tk,q):
             t['peakBid']=round(max(t.get('peakBid') or 0,bid),4); mp=t.get('currentModelP')
             if lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not LH.should_hold(t,log=_lh_log) and not (mp is not None and mp>=LOCK_HOLD_P):
                 f2=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'profitlock: ws quote, peak {t["peakBid"]:.3f} -> bid {bid:.3f}; fee ${f2:.2f}',fee=f2)
+            elif SPEC.is_paperish(t):
+                (do_stop,stop_why),cf=SPEC.paper_stop_action(t,bid,stop_pct(),model_q=mp,ask=None,left_sec=t['closesAt']-now)
+                try: t['stopCounterfactual']=cf
+                except Exception: pass
+                if do_stop: pt.exit(t,bid,stop_why,fee=kalshi_fee(t['contracts'],bid))
             elif bid>0 and bid<=stop_pct()*t['price']:
                 pt.exit(t,bid,f'stop: ws mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}',fee=0 if t.get('mode')=='live' else kalshi_fee(t['contracts'],bid))
     finally: lock.release()
