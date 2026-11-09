@@ -930,6 +930,8 @@ def tick_once():
         sigs[a]=sg
     try: SPEC.log_metal_gap((sigs.get('GOLD') or {}).get('kalshi'),(sigs.get('SILVER') or {}).get('kalshi'))  # research only
     except Exception: pass
+    try: SPEC.log_crypto_gap({x:(sigs.get(x) or {}).get('kalshi') for x in ('BTC','ETH','SOL','XRP')})  # research only
+    except Exception: pass
     try:
         if 'DOGE' not in _pair_rets:
             try:
@@ -1233,6 +1235,7 @@ class H(SimpleHTTPRequestHandler):
                 except Exception as e: r=dict(err=str(e)[:200])
             b=json.dumps(r,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/truthfix': b=json.dumps(TFX.ST,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/cryptogap': b=json.dumps(list(SPEC.CRYPTO_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/metalgap': b=json.dumps(list(SPEC.METAL_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/predstats': b=json.dumps(PL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/idxstats': b=json.dumps(WL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)

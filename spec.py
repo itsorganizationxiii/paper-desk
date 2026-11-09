@@ -288,3 +288,29 @@ def log_metal_gap(g, s, now=None):
         if r: METAL_GAP.append(r); append_research(r)
         return r
     except Exception: return None
+
+# --- research only: crypto pairwise intra-window gaps (never read by trading code) ---
+CRYPTO_GAP=_col.deque(maxlen=int(os.environ.get('CRYPTO_GAP_RING','3000')))
+CRYPTO_PAIRS=(('BTC','ETH'),('BTC','SOL'),('BTC','XRP'),('ETH','SOL'),('ETH','XRP'),('SOL','XRP'))
+def crypto_gap_row(mkts, now=None):
+    """mkts: {asset: kalshi market dict}. Logs pairs on the same window close."""
+    now=time.time() if now is None else now
+    mids={a:_mid(m.get('yesBid'),m.get('yesAsk')) for a,m in (mkts or {}).items() if m}
+    if len(mids)<2: return None
+    pairs={}
+    for a,b in CRYPTO_PAIRS:
+        ma,mb=mkts.get(a),mkts.get(b)
+        if not ma or not mb or ma.get('close')!=mb.get('close') or mids.get(a) is None or mids.get(b) is None: continue
+        same=(mids[a]>=0.5)==(mids[b]>=0.5)
+        pairs[f'{a}-{b}']=dict(gapDown=round((1-mids[a])-(1-mids[b]),4),sameSide=same,state='same' if same else 'diverging')
+    if not pairs: return None
+    c=next(m.get('close') for m in mkts.values() if m)
+    return dict(kind='crypto_gap',ts_ms=int(now*1000),closeAt=c,leftSec=round(c-now,1),
+                yesMid={a:v for a,v in mids.items()},down={a:round(1-v,4) for a,v in mids.items() if v is not None},
+                tickers={a:m.get('ticker') for a,m in mkts.items() if m},pairs=pairs)
+def log_crypto_gap(mkts, now=None):
+    try:
+        r=crypto_gap_row(mkts,now)
+        if r: CRYPTO_GAP.append(r); append_research(r)
+        return r
+    except Exception: return None
