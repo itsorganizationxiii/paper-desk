@@ -930,10 +930,13 @@ def tick_once():
         sigs[a]=sg
     try: SPEC.log_metal_gap((sigs.get('GOLD') or {}).get('kalshi'),(sigs.get('SILVER') or {}).get('kalshi'))  # research only
     except Exception: pass
-    try: SPEC.log_crypto_gap({x:(sigs.get(x) or {}).get('kalshi') for x in ('BTC','ETH','SOL','XRP')})  # research only
+    _gm={x:(sigs.get(x) or {}).get('kalshi') for x in GAPS_ASSETS}
+    try: _gm['DOGE']=_doge_mk()  # research/shadow confirmation only; DOGE is NOT in SERIES, never traded by Spec/live
+    except Exception: _gm['DOGE']=None
+    try: SPEC.log_crypto_gap({x:_gm.get(x) for x in ('BTC','ETH','SOL','XRP','DOGE')})  # research only
     except Exception: pass
     try:  # pairing-gap SHADOW only (separate book, never live, never pt.trades)
-        GAPS.on_tick({x:(sigs.get(x) or {}).get('kalshi') for x in GAPS_ASSETS}); GAPS.settle(_pl_result)
+        GAPS.on_tick(_gm); GAPS.settle(_pl_result)
     except Exception as e: print('gapshadow tick err',e,flush=True)
     try:
         if 'DOGE' not in _pair_rets:
@@ -991,6 +994,13 @@ import gapshadow as GAPS
 GAPS_ASSETS=('GOLD','SILVER','BTC','ETH','SOL','XRP')
 try: GAPS.load(DATA)
 except Exception as e: print('gapshadow load err',e,flush=True)
+GAP_DOGE=os.environ.get('GAP_DOGE','1')!='0'
+DOGE_SERIES='KXDOGE15M'
+def _doge_mk():
+    """Public Kalshi KXDOGE15M market for gap-shadow confirmation/logging only (not in SERIES)."""
+    if not GAP_DOGE: return None
+    ms=[m for m in get(f"{KALSHI}/markets?series_ticker={DOGE_SERIES}&status=open&limit=5")['markets'] if iso(m['close_time'])>time.time()]
+    return mk(sorted(ms,key=lambda m:m['close_time'])[0]) if ms else None
 def _pl_result(tk):
     try: return (get(f"{KALSHI}/markets/{tk}")['market'].get('result') or None)
     except Exception: return None
@@ -1200,7 +1210,7 @@ class H(SimpleHTTPRequestHandler):
             with lock: tr=list(pt.trades)
             for t in tr: w.writerow([t.get('id'),t.get('mode','paper'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl',''),t.get('hold_pnl',''),t.get('kalshiPnl',''),('kalshi' if 'kalshiPnl' in t else ''),'bot'])
             try:
-                for g in GAPS.snapshot(): w.writerow([g.get('id'),'shadow',et(g.get('openedAt')),et(g.get('closedAt')),g.get('laggard'),g.get('ticker',''),g.get('side'),g.get('entry'),g.get('stake'),0,g.get('gapDown'),'gapshadow',g.get('status'),g.get('exit') if g.get('exit') is not None else '','',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','','gapshadow'])
+                for g in GAPS.snapshot(): w.writerow([g.get('id'),'shadow',et(g.get('openedAt')),et(g.get('closedAt')),g.get('laggard'),g.get('ticker',''),g.get('side'),g.get('entry'),g.get('stake'),0,g.get('gapDown'),'gapshadow:'+str(g.get('rule','gap20')),g.get('status'),g.get('exit') if g.get('exit') is not None else '','',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','','gapshadow'])
             except Exception: pass
             for x in (TFX.ST.get('manual') or {}).get('tickers',[]): w.writerow(['','live','','',x['ticker'].split('15M')[0].removeprefix('KX'),x['ticker'],'','','','','','manual (not bot)','settled','','','',x['pnl'],'',x['pnl'],'kalshi','manual'])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')

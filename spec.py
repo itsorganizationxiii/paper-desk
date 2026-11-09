@@ -281,7 +281,8 @@ def metal_gap_row(g, s, now=None):
     same=(gy>=0.5)==(sy>=0.5)
     return dict(kind='metal_gap',ts_ms=int(now*1000),goldTicker=g.get('ticker'),silverTicker=s.get('ticker'),
                 closeAt=g.get('close'),leftSec=round(g['close']-now,1),goldYesMid=gy,silverYesMid=sy,
-                goldDown=round(1-gy,4),silverDown=round(1-sy,4),gapDown=gap,sameSide=same,state='same' if same else 'diverging')
+                goldDown=round(1-gy,4),silverDown=round(1-sy,4),gapDown=gap,sameSide=same,state='same' if same else 'diverging',
+                goldYesBid=g.get('yesBid'),goldYesAsk=g.get('yesAsk'),silverYesBid=s.get('yesBid'),silverYesAsk=s.get('yesAsk'))
 def log_metal_gap(g, s, now=None):
     try:
         r=metal_gap_row(g,s,now)
@@ -307,7 +308,9 @@ def crypto_gap_row(mkts, now=None):
     c=next(m.get('close') for m in mkts.values() if m)
     return dict(kind='crypto_gap',ts_ms=int(now*1000),closeAt=c,leftSec=round(c-now,1),
                 yesMid={a:v for a,v in mids.items()},down={a:round(1-v,4) for a,v in mids.items() if v is not None},
-                tickers={a:m.get('ticker') for a,m in mkts.items() if m},pairs=pairs)
+                tickers={a:m.get('ticker') for a,m in mkts.items() if m},pairs=pairs,
+                yesBid={a:m.get('yesBid') for a,m in mkts.items() if m},yesAsk={a:m.get('yesAsk') for a,m in mkts.items() if m},
+                closes={a:m.get('close') for a,m in mkts.items() if m})
 def log_crypto_gap(mkts, now=None):
     try:
         r=crypto_gap_row(mkts,now)
