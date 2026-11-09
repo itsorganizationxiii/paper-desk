@@ -160,6 +160,24 @@ class PaperTrader:
         s.trades.append(t); s.save()
         if LV: LV.pending_fills.pop(fill.get('orderId'),None)
         print('OPEN LIVE',t['id'],ticker,side,fill['price'],fill['contracts'],flush=True); return t
+    def openLiveGap(s,p,fill,strike=None):
+        # REAL gap-live fill (owner t1013/t1014): separate tag from its gap-paper twin (which stays in the gap paper book).
+        if 'XRP' in str(p.get('ticker')).upper() or 'XRP' in str(p.get('asset')).upper(): raise ValueError('XRP is never live')
+        existing=next((t for t in s.trades if t.get('gapLive') and t.get('liveOrderId')==fill.get('orderId')),None)
+        if existing:
+            if LV: LV.pending_fills.pop(fill.get('orderId'),None)
+            return existing
+        stake=round(fill['cost']+fill['fee'],4)
+        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',shadow=False,gapLive=True,holdToSettle=True,
+               asset=p['asset'],side=fill.get('side') or p['side'],price=fill['price'],stake=stake,stakePct=0,
+               contracts=fill['contracts'],entryFee=fill['fee'],liveOrderId=fill['orderId'],liveCashAtEntry=fill.get('cash'),
+               edge=0,modelP=None,strike=strike,ticker=p['ticker'],openedAt=time.time(),closesAt=p['closesAt'],status='open',
+               signalSource='gap-live',tag='gap-live',priceSource='kalshi',rule=p.get('rule'),pair=p.get('pair'),
+               leader=p.get('leader'),laggard=p.get('laggard'),gapDown=p.get('gapDown'),paperConf=p.get('conf'),
+               paperTwinId=p.get('id'),paperTwinKey=p.get('shadowKey'),signalPrice=p.get('price'))
+        s.trades.append(t); s.save()
+        if LV: LV.pending_fills.pop(fill.get('orderId'),None)
+        print('OPEN LIVE GAP',t['id'],t['ticker'],t['side'],fill['price'],fill['contracts'],flush=True); return t
     def adopt(s,asset,side,contracts,price,fee,ticker,strike,close,order_ids,fee_known):
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',shadow=False,adopted=True,
                asset=asset,side=side,contracts=contracts,price=round(price,6),stake=round(contracts*price+fee,6),
@@ -201,6 +219,7 @@ class PaperTrader:
             if not t.get('shadow'): s.balance+=payout
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
     def exit(s,t,bid,reason,fee=0.0):
+        if t.get('gapLive'): t['holdOnlySkipped']=str(reason)[:120]; return  # gap-live: HOLD TO SETTLEMENT, never sold early
         if t.get('mode')=='live' and not t.get('shadow'): return s.exitLive(t,bid,reason)
         proceeds=t['contracts']*bid-fee
         t.update(status='exited',exitPrice=round(bid,4),exitReason=reason,exitFee=round(fee,2),settledBy='early-exit@bid',pnl=round(proceeds-t['stake'],2),closedAt=time.time())
@@ -208,6 +227,7 @@ class PaperTrader:
         if not t.get('shadow'): s.balance+=proceeds
         s.save(); print('EXIT',t['id'],reason,bid,flush=True)
     def exitLive(s,t,bid,reason):
+        if t.get('gapLive'): return  # gap-live holds to settlement
         # real sell runs off the lock; trade stays 'open' (flagged exiting) until the fill is known
         if t.get('shadow') or t.get('mode')!='live' or 'XRP' in str(t.get('ticker')).upper(): return
         if not (LV and LV.allowed() and LV.owner()): t['liveSellError']='live disabled (env/keys); holding to settlement'; return
@@ -215,6 +235,7 @@ class PaperTrader:
         t['exiting']=reason; t['exitTrigAt']=time.time(); t['exitTrigBid']=round(bid,4)
         threading.Thread(target=s._sellLive,args=(t,bid,reason),daemon=True).start()
     def _sellLive(s,t,bid,reason):
+        if t.get('gapLive'): return  # gap-live holds to settlement
         if t.get('shadow') or t.get('mode')!='live' or 'XRP' in str(t.get('ticker')).upper(): return
         floor=round(t['price']+0.01,2) if str(reason).lower().startswith(('profitlock','take','tp','breakeven')) is True and not str(reason).lower().startswith('breakeven') else None  # profit exits never sell below entry
         isstop=str(reason).lower().startswith('stop')
@@ -286,7 +307,7 @@ class PaperTrader:
                         continue
                 except Exception as e: print('kalshi settle err',e,flush=True)
                 if now<t['closesAt']+600: continue
-            if t['asset'] in spot:
+            if t['asset'] in spot and t.get('strike') is not None:
                 s.close(t,(spot[t['asset']]>=t['strike'])==(t['side']=='YES'),'coinbase-spot',spot[t['asset']]); ch=True
                 try:
                     SPEC.append_research(SPEC.settlement_row(asset=t['asset'],ticker=t.get('ticker'),side=t.get('side'),
@@ -369,6 +390,10 @@ except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print(
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
  'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
+import gaplive as GL
+def live_for(name):
+    # LIVE_STRATEGIES (default 'gap'): Resume can only put the listed strategies live; Spec/leadlag/ethlead stay paper
+    return GL.strategy_live(name,LV)
 def coinbase(a):
     c=get(f'{CB}/products/{a}-USD/candles?granularity=900')
     spot=c[0][4]; mom=(c[0][4]-c[1][3])/c[1][3]
@@ -444,7 +469,7 @@ def cooldowns(now=None):
     # per-coin loss-streak cooldown, derived from closed live trades so restarts keep it
     now=now or time.time()
     if now-_cool['at']<5 and _cool['map'] is not None: return _cool['map']
-    tr=sorted([t for t in pt.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status') in ('won','lost','exited') and t.get('closedAt')],key=lambda t:t['closedAt'])
+    tr=sorted([t for t in pt.trades if t.get('mode')=='live' and not t.get('shadow') and not t.get('gapLive') and t.get('status') in ('won','lost','exited') and t.get('closedAt')],key=lambda t:t['closedAt'])
     st={}; out={}; shared_streak=0; shared_until=0; loss_streaks={}
     for t in tr:
         if (t.get('pnl') or 0)<0:
@@ -614,7 +639,7 @@ def leadlag_entry(k,model_p=None):
             now=time.time(); tk=k['ticker']; side=ev['side']
             with lock:
                 trades=list(pt.trades)
-            paper=not (LV and LV.enabled())
+            paper=not live_for('leadlag')
             used=tk in LL.attempted or any(t.get('ticker')==tk and t.get('leadlag') for t in trades)
             held=any(t.get('ticker')==tk and t.get('mode')=='live' and t.get('status')=='open' for t in trades)
             cd=cooldowns(now)
@@ -650,7 +675,7 @@ def leadlag_entry(k,model_p=None):
             # Use the existing minimum-edge sizing adapter, exactly as alt-consensus does.
             q=min(ask+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
             def size_at(px):
-                if k['close']-time.time()<LL_MIN_LEFT or not (paper or LV.enabled()) or shadow_asset('BTC'): return None
+                if k['close']-time.time()<LL_MIN_LEFT or not (paper or live_for('leadlag')) or shadow_asset('BTC'): return None
                 if WKND_MAX>0 and wknd_night() and px>WKND_MAX: return None
                 return (pt.size(side,px,mp) or [None])[0]
             sz=pt.size(side,ask,mp)
@@ -686,7 +711,7 @@ def ethlead_entry(k,model_p=None):
     try:
         now=time.time(); tk=k['ticker']; left=k['close']-now
         if not LV: return
-        paper=not LV.enabled()
+        paper=not live_for('ethlead')
         if now<ethlead.ETHLEAD_RESUME_AT: EL.last_reason='paused by user until 8 AM ET'; return
         eq=LV.wsq('KXETH15M-'+tk.split('15M-',1)[1]); bq=LV.wsq(tk)
         side,ea,ba,gap,reason=el_eval(eq,bq,left,now)
@@ -707,7 +732,7 @@ def ethlead_entry(k,model_p=None):
         if reason is None:
             q=min(ba+need_edge()+0.001,0.99); mp=q if side=='YES' else 1-q
             def size_at(px):
-                if k['close']-time.time()<EL_MIN_LEFT or not (paper or LV.enabled()) or shadow_asset('BTC'): return None
+                if k['close']-time.time()<EL_MIN_LEFT or not (paper or live_for('ethlead')) or shadow_asset('BTC'): return None
                 if WKND_MAX>0 and wknd_night() and px>WKND_MAX: return None
                 if not (0.40<=px<=0.69): return None
                 return (pt.size(side,px,mp) or [None])[0]
@@ -765,7 +790,7 @@ def tick_once():
             w=wins.get(tk)
             return w['model_p'] if w and w.get('model_p') is not None and (w.get('age_sec') or 99)<60 and w.get('state')=='open' else None
         # ---- monitor open positions for this asset ----
-        for t in [t for t in pt.trades if t['status']=='open' and t['asset']==a and t.get('ticker') and time.time()<t['closesAt'] and not t.get('exiting')]:
+        for t in [t for t in pt.trades if t['status']=='open' and t['asset']==a and t.get('ticker') and time.time()<t['closesAt'] and not t.get('exiting') and not t.get('gapLive')]:
             w=LV.wsq(t['ticker']) if (LV and t.get('mode')=='live') else None
             if w and w.get('yesBid') is not None and w.get('yesAsk') is not None: m=dict(yesBid=w['yesBid'],noBid=round(1-w['yesAsk'],4))  # live: pushed WS quote
             else:
@@ -837,18 +862,18 @@ def tick_once():
         left=k['close']-time.time(); sg['secsToClose']=round(left)
         if a=='BTC': leadlag_entry(k,mp)
         if a=='BTC': ethlead_entry(k,mp)
-        if REV and 600<=left<=840 and not any(t.get('ticker')==k['ticker'] for t in pt.trades):
+        if REV and 600<=left<=840 and not any(t.get('ticker')==k['ticker'] for t in pt.trades if not t.get('gapLive')):
             # reversal bet (user test, Nov 7): after 3+ same-way settles, buy the other side early in the window; backtest 59% wins
             td=trend_dir(k['ticker'].split('-')[0])
             if td:
                 rd='NO' if td=='YES' else 'YES'; rask=k['yesAsk'] if rd=='YES' else k['noAsk']
-                if 0<rask<=REV_MAX and not any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
+                if 0<rask<=REV_MAX and not any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades if not t.get('gapLive')):
                     fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
                     rmeta=dict(priceSource='kalshi',signalSource='reversal-after-3',fade=True,reversal=True,streak=td)
                     if shadow_asset(a): rmeta=dict(rmeta,shadow=True,mode='shadow')
                     if SPEC.EXPERIMENTAL_SHADOW_ONLY: rmeta=SPEC.experimental_force_shadow(rmeta)
                     t=None
-                    if LV and LV.enabled() and not shadow_asset(a) and not SPEC.EXPERIMENTAL_SHADOW_ONLY:
+                    if live_for('spec') and not shadow_asset(a) and not SPEC.EXPERIMENTAL_SHADOW_ONLY:
                         if k['ticker'] not in LV.tried and k['ticker'] not in LV.resting and not up_tilt_skip(a,k['ticker'],rd,None,'reversal'):
                             sz=pt.size(rd,rask,rmp)
                             if sz:
@@ -859,16 +884,16 @@ def tick_once():
                     else:
                         with lock: t=pt.openTrade(a,rd,rask,rmp,k['strike'],k['close'],k['ticker'],rmeta)
                     if t: sg['action']=f'OPENED REVERSAL #{t["id"]} {rd} after 3x {td}'; sigs[a]=sg; continue
-        if ALT and a=='BTC' and 540<=left<=780 and not any(t.get('ticker')==k['ticker'] for t in pt.trades):
+        if ALT and a=='BTC' and 540<=left<=780 and not any(t.get('ticker')==k['ticker'] for t in pt.trades if not t.get('gapLive')):
             av=alt_votes(k['ticker'])
             if len(av)==3 and len(set(av.values()))==1:
                 rd=list(av.values())[0]; rask=k['yesAsk'] if rd=='YES' else k['noAsk']
-                if 0<rask<=ALT_MAX and not any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades):
+                if 0<rask<=ALT_MAX and not any(t.get('status')=='open' and not is_shadow(t) and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=rd for t in pt.trades if not t.get('gapLive')):
                     fq=min(rask+need_edge()+0.001,0.99); rmp=fq if rd=='YES' else 1-fq
                     rmeta=dict(priceSource='kalshi',signalSource='alt-consensus',fade=True,altConsensus=True,altVotes=av)
                     if SPEC.EXPERIMENTAL_SHADOW_ONLY: rmeta=SPEC.experimental_force_shadow(rmeta)
                     t=None
-                    if LV and LV.enabled() and not SPEC.EXPERIMENTAL_SHADOW_ONLY:
+                    if live_for('spec') and not SPEC.EXPERIMENTAL_SHADOW_ONLY:
                         if alt_cap_allow(k['ticker']) and k['ticker'] not in LV.tried and k['ticker'] not in LV.resting and not up_tilt_skip(a,k['ticker'],rd,None,'alt-consensus'):
                             sz=pt.size(rd,rask,rmp)
                             if sz:
@@ -880,15 +905,15 @@ def tick_once():
                         with lock: t=pt.openTrade(a,rd,rask,rmp,k['strike'],k['close'],k['ticker'],rmeta)
                     if t: sg['action']=f'OPENED ALT-CONSENSUS #{t["id"]} {rd} (SOL/DOGE/XRP all {rd})'; sigs[a]=sg; continue
         reok=False
-        try: reok=(bool(LV and LV.enabled()) and any(t.get('ticker')==k['ticker'] for t in pt.trades) and reentry_ok(a,k,dirn,cb,left)) or False
+        try: reok=(live_for('spec') and any(t.get('ticker')==k['ticker'] for t in pt.trades if not t.get('gapLive')) and reentry_ok(a,k,dirn,cb,left)) or False
         except Exception as e: print('reentry err',e,flush=True)
-        if PAPER_LOOSE and not dirn and not (LV and LV.enabled()) and mp is not None and abs(mp-0.5)>=0.05: dirn='YES' if mp>0.5 else 'NO'
+        if PAPER_LOOSE and not dirn and not live_for('spec') and mp is not None and abs(mp-0.5)>=0.05: dirn='YES' if mp>0.5 else 'NO'
         if not dirn: sg['action']='skip: momentum/CVD disagree'
         elif est=='live' and mp is None and a!='XRP': sg['action']='skip: no fresh EloEdge model_p'
         elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
         elif cb['whale']['strongDir'] not in (None,dirn): sg['action']=f"skip: strong whale flow against (${cb['whale']['netFlowUsd']:,.0f})"
         elif left<60: sg['action']='skip: <60s to close'
-        elif any(t.get('ticker')==k['ticker'] for t in pt.trades) and not reok: sg['action']='holding/traded this window'
+        elif any(t.get('ticker')==k['ticker'] for t in pt.trades if not t.get('gapLive')) and not reok: sg['action']='holding/traded this window'
         else:
             used='coinbase+eloedge'
             if mp is None: mp=heur(cb); used='coinbase-proxy (XRP shadow, no EloEdge)' if a=='XRP' else 'coinbase-fallback (EloEdge unavailable)'
@@ -906,10 +931,10 @@ def tick_once():
                 meta=dict(meta,fade=True,fadeOrigEdge=oe)
             td=trend_dir(k['ticker'].split('-')[0]) if TREND_N>0 else None
             if td and td!=dirn: meta=dict(meta,againstTrend=td)  # log-only: data showed 3-in-a-row reverses ~59%
-            if any(t.get('status')=='open' and is_shadow(t)==shd and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=dirn for t in pt.trades):
+            if any(t.get('status')=='open' and is_shadow(t)==shd and t.get('asset')!=a and t.get('closesAt')==k['close'] and t.get('side')!=dirn for t in pt.trades if not t.get('gapLive')):
                 sg['action']='skip: opposite side of another coin open this window (BTC/ETH settle together ~84%)'; sigs[a]=sg; continue
             if WKND_MAX>0 and wknd_night() and ask>WKND_MAX: sg['action']=f'skip: weekend-night price cap ({ask:.2f} > {WKND_MAX:.2f})'; sigs[a]=sg; continue
-            if LV and LV.enabled() and not shd:
+            if live_for('spec') and not shd:
                 if up_tilt_skip(a,k['ticker'],dirn,q-ask,'reentry' if meta.get('reentry') else 'eloedge'):
                     sg['action']=f'skip: up-tilt (weekend-night Up edge {q-ask:+.3f} < {need_edge()+uptilt.UP_TILT:.2f})'; sigs[a]=sg; continue
                 _bid=k['yesBid'] if dirn=='YES' else k['noBid']
@@ -969,7 +994,7 @@ def tick_once():
                 bid=bid,action=sg.get('action'),skip_reason=None if (sg.get('action') or '').startswith('OPENED') else sg.get('action'),
                 cb=sg,extra=dict(secsToClose=sg.get('secsToClose'))),DATA)
     except Exception: pass
-    try: PL.observe(sigs,'live' if (LV and LV.enabled()) else 'paper')  # read-only prediction log; cannot raise
+    try: PL.observe(sigs,'live' if live_for('spec') else 'paper')  # read-only prediction log; cannot raise
     except Exception: pass
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
@@ -1046,6 +1071,10 @@ try: _persist_boot()
 except Exception as e: print('persist boot err',e,flush=True)
 # gap PAPER fills re-check the fresh websocket quote (same as Spec paper PAPER_FRESH_FILL); read-only quote cache
 GAPS.QUOTE[0]=lambda tk:(LV.wsq(tk) if LV is not None else None)
+def _gap_live_open(p,fill,strike):
+    with lock: return pt.openLiveGap(p,fill,strike)
+GAPLIVE=GL.GapLive(LV,_gap_live_open,log=lambda *a:print(*a,flush=True))
+GAPS.LIVE[0]=GAPLIVE.on_paper
 # SHADOW-ONLY entry filters on gap trades (tags only; skip2L per book: gapShadow = rules A/B/C combined, gapPaper = paper book)
 def _gap_ftag(t,book):
     if book=='paper': FS.tag(t,'gapPaper',list(GAPS.PAPER),t.get('laggard') or t.get('asset'),t.get('price') or t.get('entry'))
@@ -1142,7 +1171,7 @@ def _ws_quote(tk,q):
     try: tick_rec(tk,q)
     except Exception: pass
     if not (LV and LV.allowed()): return
-    ts=[t for t in list(pt.trades) if not t.get('shadow') and (t.get('mode')=='live' or PAPER_WS_EXITS) and t.get('status')=='open' and t.get('ticker')==tk and not t.get('exiting')]
+    ts=[t for t in list(pt.trades) if not t.get('shadow') and (t.get('mode')=='live' or PAPER_WS_EXITS) and t.get('status')=='open' and t.get('ticker')==tk and not t.get('exiting') and not t.get('gapLive')]
     if not ts or not LV.owner(): return
     if not lock.acquire(timeout=0.2): return
     try:
@@ -1352,6 +1381,9 @@ class H(SimpleHTTPRequestHandler):
             b=json.dumps(r,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/truthfix': b=json.dumps(TFX.ST,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/cryptogap': b=json.dumps(list(SPEC.CRYPTO_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/gaplive':
+            with lock: _gl=[dict(t) for t in pt.trades if t.get('gapLive')]
+            b=json.dumps(GAPLIVE.summary(_gl),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapexits' or (p=='/api/gapshadow' and 'summary=1' in s.path): b=json.dumps(dict(shadow=GAPS.variant_summary('shadow'),paper=GAPS.variant_summary('paper')),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)

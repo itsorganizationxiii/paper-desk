@@ -78,7 +78,7 @@ class Live:
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.totalPnl=float(st.get('totalPnl',0)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.entry_block=None
+        s.totalPnl=float(st.get('totalPnl',0)); s.gapLiveUsed=int(st.get('gapLiveUsed',0) or 0); s.gapLiveDisabled=bool(st.get('gapLiveDisabled',False)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.entry_block=None
         s.cash=None; s.cashAt=None; s.lastError=None; s.ws=None
         s.lease_ok=None
         s.instance=uuid.uuid4().hex[:12]; s.own_orders={}; s.submitted_orders={}; s._lost_cleanup=False
@@ -124,7 +124,7 @@ class Live:
         ok=(held==side and n>=want-0.011)
         s.log(action='position-check' if ok else 'position-mismatch',expect=f'{side} {want}',actual=f'{held} {n}' if held else 'flat',error=None if ok else 'Kalshi position differs from recorded trade; recording what Kalshi holds',**a)
         return (held,min(n,want) if held==side else n) if held else (side,0.0)
-    def state(s): return dict(paused=s.paused,day=s.day,dayPnl=s.dayPnl,killed=s.killed,killReason=s.killReason,orders=s.orders[-200:],totalPnl=s.totalPnl)
+    def state(s): return dict(paused=s.paused,day=s.day,dayPnl=s.dayPnl,killed=s.killed,killReason=s.killReason,orders=s.orders[-200:],totalPnl=s.totalPnl,gapLiveUsed=getattr(s,'gapLiveUsed',0),gapLiveDisabled=getattr(s,'gapLiveDisabled',False))
     def persist(s):
         if not s.owner(): return  # stale deploy instance must not overwrite the new instance's order log
         if s._save:
@@ -317,7 +317,7 @@ class Live:
             return c,fc,fpx if fc else None,fee,oid,('buy cancel unresolved' if action=='buy' and oid in s.own_orders and fc<count-0.001 else (None if c in (200,201) else f'order HTTP {c}'))
         finally:
             with s._activity: s.active_orders.discard(ticker); s.position_generation+=1
-    def buy(s,asset,ticker,side,frac,ref,sizer=None,shadow=False,mode='live'):
+    def buy(s,asset,ticker,side,frac,ref,sizer=None,shadow=False,mode='live',usd=None):
         """Synchronous real buy. Returns dict(contracts,price,fee,cost,orderId,cash) when anything filled, else None (logged)."""
         a=dict(asset=asset,ticker=ticker,side=side)
         if xrp_blocked(ticker) or xrp_blocked(asset): s.lastBuy='blocked'; return None
@@ -335,9 +335,10 @@ class Live:
         try: cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
         except Exception as e: s.lastError=f'balance: {e}'; s.log(action='buy-skip',error=s.lastError,**a); return None
         maxpx=min(0.99,round(ref+MAX_CHASE,2)) if sizer is None else 0.99
-        usd=frac*cash
+        fixed=usd; usd=frac*cash
         if MAX_USD>0: usd=min(usd,MAX_USD)
         usd=stake(usd,cash)
+        if fixed is not None: usd=min(float(fixed),0.9*cash)  # gap-live: fixed dollar stake (owner: $1)
         usd=min(usd,HARD_MAX_USD)
         c=fc=0; fee=0.0; oid=None; err=None; px=None; n=0; cost=0.0
         for attempt in range(2):
