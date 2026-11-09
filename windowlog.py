@@ -157,22 +157,133 @@ def sample_once(t):
     if not med: ST['samplesNoPrice']=ST.get('samplesNoPrice',0)+1; return False  # <2 fresh venues: no sample (never fabricated)
     row=(t,dm or med,n,med); _sec.append(row); _pend.append(row); ST['samplesGenerated']=ST.get('samplesGenerated',0)+1; return True
 PEND_MAX=7200
+# Only the sample writer uses these handles; never close/reconfigure the shared DB client.
+_writer_col=None; _writer_client=None; _writer_factory=None; _writer_thread=None
+_writer_start_lock=threading.Lock(); _writer_single=False
+
+def _safe_writer_message(exc):
+    import os, re
+    from urllib.parse import urlsplit, unquote
+    try:
+        text=str(exc)
+        secrets=[]
+        for key,value in os.environ.items():
+            if not value: continue
+            if any(tag in key.upper() for tag in ('PASSWORD','SECRET','TOKEN','KEY','MONGODB_URI')):
+                if len(value)>=4: secrets.append(value)
+            if 'MONGODB' in key.upper() and 'URI' in key.upper():
+                try:
+                    uri=urlsplit(value)
+                    secrets.extend(x for x in (uri.username,uri.password,unquote(uri.username or ''),unquote(uri.password or '')) if x)
+                except Exception: pass
+        for value in sorted(set(secrets),key=len,reverse=True): text=text.replace(value,'[REDACTED]')
+        text=re.sub(r'mongodb(?:\+srv)?://[^\s]+','[REDACTED_URI]',text,flags=re.I)
+        text=re.sub(r"(?i)([\"']?(?:password|passwd|username|user|api[_-]?key|token|secret)[\"']?\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}\]]+)",r'\1[REDACTED]',text)
+        return text.replace('\n',' ')[:1000]
+    except Exception: return '[message unavailable; sanitization failed]'
+
+def _writer_error(exc):
+    # Error reporting must never become a second exception that kills the writer.
+    try:
+        ST['secErr']=type(exc).__name__+': '+_safe_writer_message(exc)
+        ST['secErrors']=ST.get('secErrors',0)+1; ST['secRetries']=ST.get('secRetries',0)+1
+        ST['writerLastErrorAt']=time.time()
+        try: print('sample writer:',ST['secErr'],flush=True)
+        except Exception: pass
+    except Exception: pass
+
+def _ack_writer_rows(rows,ack):
+    # Sampler only appends; the sole writer removes selected prefix rows.
+    for i in sorted(ack,reverse=True): del _pend[i]
+    ST['secWritten']=ST.get('secWritten',0)+len(ack)
+    if ack: ST['writerLastSuccess']=time.time()
+
 def _flush():
-    """Write queued samples; a sample leaves the queue only once Mongo acked it (or it already exists). Failures retry next pass."""
     from datetime import datetime, timezone
-    if not _pend or _col.get('idxsec') is None: return True
-    rows=list(_pend[:500])
-    try: _col['idxsec'].insert_many([dict(_id=t,v=v,n=n,med=m,boot=BOOT,at=datetime.now(timezone.utc)) for t,v,n,m in rows],ordered=False)
-    except Exception as e:
-        errs=getattr(e,'details',{}).get('writeErrors') if hasattr(e,'details') else None
-        dup_only=(errs is not None and all(x.get('code')==11000 for x in errs)) or (errs is None and ('E11000' in str(e) or 'duplicate' in str(e).lower()))
-        if not dup_only: ST['secErr']=f'{type(e).__name__}: {str(e)[:120]}'; ST['secRetries']=ST.get('secRetries',0)+1; return False
-    del _pend[:len(rows)]; ST['secWritten']=ST.get('secWritten',0)+len(rows); return True
+    global _writer_single
+    c=_writer_col if _writer_col is not None else _col.get('idxsec')
+    if not _pend or c is None: return True
+    rows=list(_pend[:500]); docs=[dict(_id=t,v=v,n=n,med=m,boot=BOOT,at=datetime.now(timezone.utc)) for t,v,n,m in rows]
+    if _writer_single:
+        ack=set(); failed=None
+        for i,doc in enumerate(docs):
+            try: c.insert_one(doc); ack.add(i)
+            except Exception as exc:
+                if getattr(exc,'code',None)==11000: ack.add(i)
+                else: failed=exc; break
+        _ack_writer_rows(rows,ack)
+        if failed is not None: _writer_error(failed); return False
+        _writer_single=False; return True
+    try: c.insert_many(docs,ordered=False)
+    except Exception as exc:
+        details=getattr(exc,'details',None)
+        errors=details.get('writeErrors') if isinstance(details,dict) else None
+        # Only a complete, unambiguous unordered bulk response proves which rows saved.
+        valid=(isinstance(errors,list) and bool(errors) and all(isinstance(e,dict) and isinstance(e.get('index'),int) and 0<=e['index']<len(rows) for e in errors))
+        if valid and not details.get('writeConcernErrors') and not details.get('writeConcernError'):
+            failed={e['index'] for e in errors if e.get('code')!=11000}
+            _ack_writer_rows(rows,set(range(len(rows)))-failed)
+            if not failed: return True
+        else:
+            # Unknown/connection outcome: retain everything; per-row retry makes even an
+            # ambiguous duplicate response unable to poison the whole batch.
+            _writer_single=True
+        _writer_error(exc); return False
+    _ack_writer_rows(rows,set(range(len(rows)))); return True
+
+def _writer_reconnect():
+    global _writer_client,_writer_col
+    if _writer_factory is None: return
+    if _writer_client is not None:
+        try: _writer_client.close()
+        except Exception: pass
+    _writer_client=None; _writer_col=None
+    _writer_client,_writer_col=_writer_factory()
+    ST['writerReconnects']=ST.get('writerReconnects',0)+1
+
+def _writer_pass():
+    ST['writerHeartbeat']=time.time()
+    while _pend:
+        if not _flush(): return False
+        ST['writerHeartbeat']=time.time()
+        if _writer_col is None and _col.get('idxsec') is None: break
+    return True
+
 def _writer():
+    # Supervisor and worker routine share ONE thread: restart the routine on failure,
+    # never spawn a second consumer or reset a shared Mongo client.
+    delay=2; reconnect=True
     while True:
-        time.sleep(2)
-        while _pend and _flush(): pass
-        if len(_pend)>PEND_MAX: ST['secDropped']=ST.get('secDropped',0)+len(_pend)-PEND_MAX; del _pend[:len(_pend)-PEND_MAX]
+        try:
+            ST['writerHeartbeat']=time.time()
+            if reconnect: _writer_reconnect(); reconnect=False
+            good=_writer_pass()
+            if len(_pend)>PEND_MAX:
+                ST['secDropped']=ST.get('secDropped',0)+len(_pend)-PEND_MAX; del _pend[:len(_pend)-PEND_MAX]
+            if good: delay=2
+            else: reconnect=True; delay=min(delay*2,60)
+        except Exception as exc:
+            _writer_error(exc); ST['writerRestarts']=ST.get('writerRestarts',0)+1
+            reconnect=True; delay=min(delay*2,60)
+        ST['writerBackoffSec']=delay
+        time.sleep(delay)
+
+def _start_writer(db):
+    global _writer_thread,_writer_factory
+    with _writer_start_lock:
+        if _writer_thread is not None and _writer_thread.is_alive(): return
+        import os
+        uri=os.environ.get('MONGODB_URI','')
+        if db is not None and uri:
+            name=db.name
+            def factory():
+                from pymongo import MongoClient
+                client=MongoClient(uri,serverSelectionTimeoutMS=8000,connectTimeoutMS=8000,socketTimeoutMS=10000,appname='paper-desk-sample-writer')
+                from pymongo.write_concern import WriteConcern
+                return client,client[name]['idxsec'].with_options(write_concern=WriteConcern(w=1))
+            _writer_factory=factory
+        _writer_thread=threading.Thread(target=_writer,name='idxsec-writer-supervisor',daemon=True)
+        _writer_thread.start()
 def _restore(now=None):
     """On boot, reload the last 20 min of persisted samples so the open window resumes instead of being discarded."""
     c=_col.get('idxsec')
@@ -249,7 +360,8 @@ def _idx_loop(owner):
         except Exception as e: ST['idxErr']=f'{type(e).__name__}: {str(e)[:120]}'
 def stats():
     c=_col.get('idxcmp')
-    out=dict(ST,feeds={k:dict(v) for k,v in FEED.items()},boot=BOOT)
+    out=dict(ST,feeds={k:dict(v) for k,v in FEED.items()},boot=BOOT,writerAlive=bool(_writer_thread and _writer_thread.is_alive()))
+    out.update(writerHeartbeat=ST.get('writerHeartbeat'),writerLastSuccess=ST.get('writerLastSuccess'),writerLastError=ST.get('secErr'),writerLastErrorAt=ST.get('writerLastErrorAt'),writerErrors=ST.get('secErrors',0),writerRetries=ST.get('secRetries',0),writerRestarts=ST.get('writerRestarts',0),writerReconnects=ST.get('writerReconnects',0),writerBackoffSec=ST.get('writerBackoffSec',0))
     if c is None: return dict(out,n=0)
     allr=list(c.find({},{'_id':0,'venues':0,'feeds':0})); rows=[r for r in allr if r.get('complete')]
     by=collections.Counter(r.get('status') or ('LEGACY-COMPLETE' if r.get('complete') else 'LEGACY-EXCLUDED') for r in allr)
@@ -277,4 +389,5 @@ def start(db,owner=lambda:True):
     _ws('gemini','wss://api.gemini.com/v2/marketdata',{'type':'subscribe','subscriptions':[{'name':'l2','symbols':['BTCUSD']}]},_p_gm2)
     _ws('cryptocom','wss://stream.crypto.com/exchange/v1/market',{'id':1,'method':'subscribe','params':{'channels':['book.BTC_USD.50']}},_p_cdc)
     _ws('bullish','wss://api.exchange.bullish.com/trading-api/v1/market-data/tick/BTCUSD',None,_p_bl)
-    for f,a in ((_sampler,()),(_writer,()),(_book_loop,(owner,)),(_idx_loop,(owner,))): threading.Thread(target=f,args=a,daemon=True).start()
+    _start_writer(db)
+    for f,a in ((_sampler,()),(_book_loop,(owner,)),(_idx_loop,(owner,))): threading.Thread(target=f,args=a,daemon=True).start()

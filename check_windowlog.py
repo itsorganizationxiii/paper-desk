@@ -1,5 +1,6 @@
 # Window collection tests: restart mid-window, ws drop, deploy during finalize, duplicate finalize, missing data.
 import windowlog as W
+from pymongo.errors import BulkWriteError, DuplicateKeyError
 class Res:
     def __init__(s,u): s.upserted_id=u
 class Col:
@@ -11,10 +12,14 @@ class Col:
     def find_one(s,q,p=None): return s.d.get(q['boundary'])
     def find(s,q=None,p=None): return list(s.d.values())
     def insert_many(s,rows,ordered=False):
-        for r in rows:
-            if r['_id'] in s.d: raise Exception('E11000 duplicate')
-            s.d[r['_id']]=r
-    def insert_one(s,r): pass
+        errors=[]
+        for i,r in enumerate(rows):
+            if r['_id'] in s.d: errors.append(dict(index=i,code=11000))
+            else: s.d[r['_id']]=r
+        if errors: raise BulkWriteError(dict(writeErrors=errors,writeConcernErrors=[]))
+    def insert_one(s,r):
+        if r['_id'] in s.d: raise DuplicateKeyError('duplicate',11000)
+        s.d[r['_id']]=r
 b=1794160800
 def mk(ts): return [(t,75000.0,5,75000.0) for t in ts]
 mkt=lambda ct: dict(ticker='T%d'%ct,expiration_value='75001',floor_strike=75000,result='yes')

@@ -111,3 +111,11 @@ LIVE (Kalshi-verified) n=198 exit=-12.60 hold=-15.58 diff=2.98
   paircash     n=  3 exit=   1.23 hold=  -0.85 exit-hold=  2.09
   stop         n= 69 exit= -33.16 hold= -44.30 exit-hold= 11.13
 ```
+
+## Writer-only repair preparation (not deployed)
+- Read-only production snapshot: 2026-11-08 07:24:42 PM ET; queued=2206; acknowledged=11575; generated=13781; dropped=0; valid windows=22.
+- Live enabled=False, paused=True; reported open positions=0. No trading/access changes.
+- Earliest authorized deployment: after the 7:30 PM ET close on Nov 8, 2026. PREPARATION ONLY: no push/deploy performed. Refresh this snapshot immediately before the eventual push and check live positions again after deployment.
+- RAM backlog will NOT be recovered by this fix; restart discards unpersisted RAM rows. Record final backlog as potential loss, not as restored samples. Historical window IDs/counting thresholds and observations remain unchanged.
+- Changes limited to sample writer error handling, per-row/bulk acknowledgement/retry, dedicated-client reconnect/backoff, same-thread supervision, additive idxstats diagnostics, and fixture tests. Sampler, strategy, paper/trading, and prediction logger unchanged.
+- Validation: 12 new writer tests pass, window tests pass, isolated credential-free boot exposes status/trades CSV/predstats/idxstats HTTP 200 and writerAlive=true. Full suite has only preexisting check_up_tilt failure (same failure in untouched HEAD); check_reconcile currently passes both baseline and changed tree.
