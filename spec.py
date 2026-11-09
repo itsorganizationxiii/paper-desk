@@ -17,10 +17,10 @@ try:
 except Exception:
     from datetime import timezone, timedelta; ET=timezone(timedelta(hours=-5))
 
-SPEC_EDGE=os.environ.get('SPEC_EDGE','0')=='1'
-SPEC_GATES=os.environ.get('SPEC_GATES','0')=='1'
+SPEC_EDGE=os.environ.get('SPEC_EDGE','1')=='1'
+SPEC_GATES=os.environ.get('SPEC_GATES','1')=='1'
 SPEC_MARGIN=float(os.environ.get('SPEC_MARGIN','0.02'))
-PAPER_STOP_MODE=os.environ.get('PAPER_STOP_MODE','current').lower().strip() or 'current'
+PAPER_STOP_MODE=os.environ.get('PAPER_STOP_MODE','edgedecay').lower().strip() or 'current'
 PAPER_TIME_EXIT_SEC=int(os.environ.get('PAPER_TIME_EXIT_SEC','120'))
 EXPERIMENTAL_SHADOW_ONLY=os.environ.get('EXPERIMENTAL_SHADOW_ONLY','1')!='0'
 SPEC_LOG=os.environ.get('SPEC_RESEARCH_LOG','1')!='0'
