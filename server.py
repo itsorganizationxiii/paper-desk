@@ -965,9 +965,13 @@ def tick_once():
     except Exception: _gm['DOGE']=None
     try: SPEC.log_crypto_gap({x:_gm.get(x) for x in ('BTC','ETH','SOL','XRP','DOGE')})  # research only
     except Exception: pass
+    try: GAPLIVE.presubscribe(_gm)   # warm WS quotes for the BTC/ETH/SOL gap legs before any signal (read-only market data)
+    except Exception as e: print('gaplive presub err',e,flush=True)
     try:  # pairing-gap SHADOW only (separate book, never live, never pt.trades)
         GAPS.on_tick(_gm); GAPS.settle(_pl_result)
     except Exception as e: print('gapshadow tick err',e,flush=True)
+    try: GAPLIVE.tick()   # capped retries of gap-live signals skipped only for a stale Kalshi quote
+    except Exception as e: print('gaplive tick err',e,flush=True)
     try:
         if 'DOGE' not in _pair_rets:
             try:

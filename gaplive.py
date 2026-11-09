@@ -13,6 +13,9 @@ E=os.environ.get
 ENABLED=E('GAP_LIVE_ENABLED','1')!='0'
 MAX_TRADES=int(E('GAP_LIVE_MAX_TRADES','3'))
 USD=float(E('GAP_LIVE_USD','1'))
+QUOTE_WAIT=float(E('GAP_QUOTE_WAIT','3'))   # seconds to wait for a first/next WS quote before REST fallback
+RETRY_MAX=int(E('GAP_STALE_RETRY_MAX','5')); RETRY_WINDOW=90.0   # stale-quote retries per ticker, within 90s of the signal
+WATCH_ASSETS=('BTC','ETH','SOL')   # non-XRP legs of BTC-ETH / SOL-XRP
 RULES={'A'}
 PAIRS={'BTC-ETH','SOL-XRP'}
 LIVE_STRATEGIES={x.strip().lower() for x in E('LIVE_STRATEGIES','gap').split(',') if x.strip()}
@@ -32,9 +35,30 @@ class GapLive:
         s.lv=lv; s.opener=opener; s.log=log; s.lk=threading.Lock()
         s.stat=dict(signals=0,blocked=0,attempts=0,filled=0,lastReason=None,lastAt=None)
         s.recent=collections.deque(maxlen=10)   # diagnostics only: last 10 live attempt records
-    def _rec(s,p,reason,filled):
+        s.pending={}   # ticker -> dict(p,m,n,first) awaiting a stale-quote retry
+        s.watched={}   # asset -> current-round ticker pre-subscribed on the WS
+    def presubscribe(s,markets):
+        """Each tick: subscribe the WS feed to the current BTC/ETH/SOL 15-min markets (read-only), so a quote is warm before any signal."""
+        try:
+            if s.lv is None or not getattr(s.lv,'ws',None): return
+            for x in WATCH_ASSETS:
+                tk=((markets or {}).get(x) or {}).get('ticker') if isinstance((markets or {}).get(x),dict) else None
+                if tk and not _xrp(tk) and s.lv.prewatch(tk): s.watched[x]=tk
+        except Exception as e: s.log('GAPLIVE presub err',e)
+    def tick(s):
+        """Each tick: retry gap-live signals that were skipped only for a stale Kalshi quote (capped)."""
+        if not s.pending: return
+        for tk,r in list(s.pending.items()):
+            try:
+                if time.time()-r['first']>RETRY_WINDOW or r['n']>=RETRY_MAX: s.pending.pop(tk,None); continue
+                rb=s.block_reason(r['p'])
+                if rb: s.pending.pop(tk,None); s._rec(r['p'],'retry dropped: '+rb,0); continue
+                r['n']+=1; s.stat['retries']=s.stat.get('retries',0)+1
+                with s.lk: s._attempt(r['p'],r['m'],retry=r['n']-1)
+            except Exception as e: s.pending.pop(tk,None); s.log('GAPLIVE retry err',e)
+    def _rec(s,p,reason,filled,**extra):
         try: s.recent.append(dict(at=time.time(),pair=p.get('pair'),ticker=p.get('ticker'),side=p.get('side'),
-                                  signalPrice=p.get('price') or p.get('entry'),reason=reason,filled=filled))
+                                  signalPrice=p.get('price') or p.get('entry'),reason=reason,filled=filled,**extra))
         except Exception: pass
     def _why(s):
         lv=s.lv; return str(getattr(lv,'lastBuyDetail',None) or getattr(lv,'lastBuy',None) or 'execution guard (no reason recorded)')
@@ -62,16 +86,26 @@ class GapLive:
             with s.lk:
                 r=s.block_reason(p)   # re-check under the lock (two pairs can fire in one tick)
                 if r: s.stat.update(blocked=s.stat['blocked']+1,lastReason=r,lastAt=time.time()); return None
-                s.stat['attempts']+=1
-                fill=s.lv.buy(p['asset'],p['ticker'],p['side'],1.0,float(p.get('price') or p.get('entry')),usd=USD)
-                if not fill or not fill.get('contracts'):
-                    why=s._why(); s._rec(p,why,0)
-                    s.stat.update(lastReason='no fill: '+why,lastAt=time.time()); return None
-                s._rec(p,'filled',fill.get('contracts'))
-                s.lv.gapLiveUsed=s.used()+1
-                if s.lv.gapLiveUsed>=MAX_TRADES: s.lv.gapLiveDisabled=True
-                s.lv.persist()
-                s.stat.update(filled=s.stat['filled']+1,lastReason='filled',lastAt=time.time())
+                return s._attempt(p,m)
+        except Exception as e:
+            s.stat.update(lastReason=f'error: {type(e).__name__}: {e}',lastAt=time.time()); s._rec(p if isinstance(p,dict) else {},f'error: {type(e).__name__}',0); s.log('GAPLIVE err',e); return None
+    def _attempt(s,p,m,retry=0):
+        """One live buy for a gap paper signal; caller holds s.lk and has checked block_reason. Never raises."""
+        try:
+            s.stat['attempts']+=1; t0=time.time()
+            fill=s.lv.buy(p['asset'],p['ticker'],p['side'],1.0,float(p.get('price') or p.get('entry')),usd=USD,quote_wait=QUOTE_WAIT)
+            lat=dict(retry=retry,sinceSignal=round(t0-float(p.get('openedAt') or t0),1),buySec=round(time.time()-t0,1))
+            if not fill or not fill.get('contracts'):
+                why=s._why(); s._rec(p,why,0,**lat)
+                if getattr(s.lv,'lastBuyRetry',False): s.pending.setdefault(p['ticker'],dict(p=p,m=m,n=1,first=t0))   # n = tries made
+                else: s.pending.pop(p.get('ticker'),None)
+                s.stat.update(lastReason='no fill: '+why,lastAt=time.time()); return None
+            s.pending.pop(p.get('ticker'),None)
+            s._rec(p,'filled',fill.get('contracts'),**lat)
+            s.lv.gapLiveUsed=s.used()+1
+            if s.lv.gapLiveUsed>=MAX_TRADES: s.lv.gapLiveDisabled=True
+            s.lv.persist()
+            s.stat.update(filled=s.stat['filled']+1,lastReason='filled',lastAt=time.time())
             strike=(m or {}).get('strike') if isinstance(m,dict) and (m or {}).get('ticker')==p.get('ticker') else None
             t=s.opener(p,fill,strike)
             try: p['liveTwinId']=t and t.get('id'); p['liveTwinOrderId']=fill.get('orderId')
@@ -80,6 +114,13 @@ class GapLive:
             return t
         except Exception as e:
             s.stat.update(lastReason=f'error: {type(e).__name__}: {e}',lastAt=time.time()); s._rec(p if isinstance(p,dict) else {},f'error: {type(e).__name__}',0); s.log('GAPLIVE err',e); return None
+    def ws_fresh(s):
+        """Read-only: is the live WS feed holding a fresh quote for each pre-subscribed gap ticker? (no prices)"""
+        try:
+            if s.lv is None or not getattr(s.lv,'ws',None): return dict(ws=None)
+            out={x:dict(ticker=tk,**s.lv.ws_info(tk)) for x,tk in list(s.watched.items())}
+            out['feed']=s.lv.ws_status(); return out
+        except Exception as e: return dict(error=type(e).__name__)
     def order_log(s,n=10):
         """Last n live order-log entries for gap-live tickers (Rule A pairs' laggard legs), safe fields only."""
         try:
@@ -98,6 +139,6 @@ class GapLive:
         return dict(enabled=ENABLED,active=s.active(),liveStrategies=sorted(LIVE_STRATEGIES),used=s.used(),max=MAX_TRADES,
                     autoDisabled=s.disabled(),usd=USD,rules=sorted(RULES),pairs=sorted(PAIRS),exit='hold to settlement',
                     liveEngine=dict(envAllow=bool(s.lv and s.lv.allowed()),paused=bool(s.lv and s.lv.paused),killSwitch=bool(s.lv and s.lv.killed)),
-                    stats=dict(s.stat),recentAttempts=list(s.recent)[::-1],recentOrders=s.order_log(),open=[t for t in lt if t.get('status')=='open'],closed=cl,
+                    stats=dict(s.stat),recentAttempts=list(s.recent)[::-1],recentOrders=s.order_log(),pendingRetries={k:dict(n=v['n'],age=round(time.time()-v['first'],1)) for k,v in list(s.pending.items())},wsQuoteFresh=s.ws_fresh(),open=[t for t in lt if t.get('status')=='open'],closed=cl,
                     results=dict(trades=len(lt),closed=len(cl),wins=sum(1 for t in cl if (t.get('pnl') or 0)>0),
                                  losses=sum(1 for t in cl if (t.get('pnl') or 0)<=0),pnl=round(sum(t.get('pnl') or 0 for t in cl),2)))

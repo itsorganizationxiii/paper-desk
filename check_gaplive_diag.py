@@ -12,7 +12,7 @@ def mk(q=0.50):
 # stale Kalshi quote
 lb=mk(); lb.ws=type('W',(),{})(); lb.wsq=lambda tk:None; lb.lastBuy='edge'
 chk('stale quote -> None',lb.buy('BTC','KXBTC15M-S1','YES',1.0,0.76,usd=1.0) is None)
-chk('stale quote -> lastBuy specific',lb.lastBuy=='stale Kalshi quote' and lb.lastBuyDetail=='stale Kalshi quote' and not lb.orders_sent)
+chk('stale quote -> lastBuy specific',lb.lastBuy=='stale Kalshi quote' and lb.lastBuyDetail.startswith('stale Kalshi quote') and not lb.orders_sent)
 # ask above max (ref 0.76 + MAX_CHASE 0.05 = 0.81)
 lb=mk(q=0.84)
 chk('ask above max -> None, no order',lb.buy('BTC','KXBTC15M-S2','YES',1.0,0.76,usd=1.0) is None and not lb.orders_sent)

@@ -7,13 +7,13 @@ class Feed:
     def __init__(s,url,headers_fn):
         s.url=url; s.hdr=headers_fn; s.q={}; s.want=set(); s.subbed=set(); s.ws=None; s.connected=False
         s.lastMsg=None; s.err=None; s.lock=threading.Lock(); s.mid=0; s.reconnects=0; s.on_quote=None
-        s.trades=collections.deque(maxlen=TRADE_MAX); s.tradeSeen=0; s.tradeLast=None
+        s.trades=collections.deque(maxlen=TRADE_MAX); s.tradeSeen=0; s.tradeLast=None; s.wantAt={}
         threading.Thread(target=s._run,daemon=True).start()
     def watch(s,ticker):
         if not ticker: return
         with s.lock:
-            if ticker in s.want: return
-            s.want.add(ticker)
+            if ticker in s.want: s.wantAt[ticker]=time.time(); return
+            s.want.add(ticker); s.wantAt[ticker]=time.time()
         s._sub([ticker])
     def quote(s,ticker,maxage=FRESH):
         """{'yesBid','yesAsk'} if pushed within maxage seconds (by receipt and Kalshi's own ts), else None."""
@@ -30,7 +30,9 @@ class Feed:
     def _prune(s):
         # drop tickers whose 15-min window is long gone (ticker suffix is the close time; keep the set small)
         with s.lock:
-            if len(s.want)>40: s.want=set(sorted(s.want)[-20:])
+            if len(s.want)>40:
+                keep=sorted(s.want,key=lambda t:s.wantAt.get(t,0))[-20:]   # keep the 20 most recently watched
+                s.want=set(keep); s.wantAt={t:s.wantAt.get(t,0) for t in keep}
     def _msg(s,raw):
         try: d=json.loads(raw)
         except Exception: return
@@ -121,5 +123,11 @@ class Feed:
             try: s.ws and s.ws.close()
             except Exception: pass
             s.ws=None; time.sleep(back); back=min(back*2,60)
+    def info(s,ticker):
+        """Read-only freshness diagnostics for one ticker (no prices)."""
+        v=s.q.get(ticker); now=time.time()
+        return dict(connected=s.connected,watched=ticker in s.want,have=bool(v),
+                    rxAge=round(now-v['rx'],2) if v else None,tsAge=round(now-v['ts'],2) if (v and v.get('ts')) else None,
+                    fresh=s.quote(ticker) is not None)
     def status(s):
         return dict(connected=s.connected,subscribed=len(s.subbed),quotes=len(s.q),lastMsgAge=round(time.time()-s.lastMsg,1) if s.lastMsg else None,reconnects=s.reconnects,error=s.err)

@@ -17,6 +17,7 @@ ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for
 HARD_MAX_USD=2.0
 STALE_GUARD=True
 STALE_KILL_N=3
+STALE_RETRY_MAX=int(os.environ.get('GAP_STALE_RETRY_MAX','5'))   # gap-live: max stale-quote tries per ticker
 HARD_DAILY_LOSS=0.0
 def _daily_cap(): return DAILY_LOSS if DAILY_LOSS>0 else (HARD_DAILY_LOSS if HARD_DAILY_LOSS>0 else float("inf"))
 SHARD=int(os.environ.get('LIVE_EXCHANGE_INDEX','2')); SWEEP=os.environ.get('LIVE_SWEEP','1')=='1'; BUY_SLIP=0.02; SELL_BUF=0.02; STOP_LIMIT_BUF=0.02; STOP_LIMIT_TRIES=1; STOP_RETRY_SEC=0.0; STOP_CONFIRM=(1,0); MAX_CHASE=float(os.environ.get('LIVE_MAX_CHASE','0.05'))
@@ -78,7 +79,7 @@ class Live:
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.totalPnl=float(st.get('totalPnl',0)); s.gapLiveUsed=int(st.get('gapLiveUsed',0) or 0); s.gapLiveDisabled=bool(st.get('gapLiveDisabled',False)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.lastBuyDetail=None; s.entry_block=None
+        s.totalPnl=float(st.get('totalPnl',0)); s.gapLiveUsed=int(st.get('gapLiveUsed',0) or 0); s.gapLiveDisabled=bool(st.get('gapLiveDisabled',False)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.lastBuyDetail=None; s.lastBuyRetry=False; s.staleRetry={}; s.entry_block=None
         s.cash=None; s.cashAt=None; s.lastError=None; s.ws=None
         s.lease_ok=None
         s.instance=uuid.uuid4().hex[:12]; s.own_orders={}; s.submitted_orders={}; s._lost_cleanup=False
@@ -97,6 +98,26 @@ class Live:
             if s.ws: s.ws.watch(ticker); return s.ws.quote(ticker)
         except Exception: pass
         return None
+    def prewatch(s,ticker):
+        """Subscribe the WS ticker feed for a market ahead of any order (read-only market data)."""
+        try:
+            if s.ws and ticker: s.ws.watch(ticker); return True
+        except Exception: pass
+        return False
+    def ws_info(s,ticker):
+        try: return s.ws.info(ticker) if s.ws else dict(connected=False,have=False,fresh=False)
+        except Exception as e: return dict(error=type(e).__name__)
+    def ws_status(s):
+        try:
+            if not s.ws: return None
+            st=s.ws.status(); return {k:st.get(k) for k in ('connected','subscribed','quotes','lastMsgAge','reconnects','error')}
+        except Exception as e: return dict(error=type(e).__name__)
+    def _rest_ask(s,ticker,side):
+        """Public market quote over REST (read-only); our-side ask or None."""
+        try:
+            m=s.market(ticker); k=f"{side.lower()}_ask"; v=m.get(k+'_dollars'); v=float(v) if v not in (None,'') else (m[k]/100 if m.get(k) is not None else None)
+            return v if v and 0<v<1 else None
+        except Exception: return None
     def allowed(s): return ENV_ALLOW and keys_present()
     def owner(s):
         try: ok=s.lease_ok is not None and bool(s.lease_ok())
@@ -317,12 +338,12 @@ class Live:
             return c,fc,fpx if fc else None,fee,oid,('buy cancel unresolved' if action=='buy' and oid in s.own_orders and fc<count-0.001 else (None if c in (200,201) else f'order HTTP {c}'))
         finally:
             with s._activity: s.active_orders.discard(ticker); s.position_generation+=1
-    def buy(s,asset,ticker,side,frac,ref,sizer=None,shadow=False,mode='live',usd=None):
+    def buy(s,asset,ticker,side,frac,ref,sizer=None,shadow=False,mode='live',usd=None,quote_wait=0.0):
         """Synchronous real buy. Returns dict(contracts,price,fee,cost,orderId,cash) when anything filled, else None (logged)."""
         a=dict(asset=asset,ticker=ticker,side=side)
         # Diagnostics only (t1022): every None return records a specific reason in lastBuy/lastBuyDetail.
         # Exact codes 'blocked'/'edge'/'nofill' are kept for existing callers; trading logic unchanged.
-        s.lastBuy=None; s.lastBuyDetail=None
+        s.lastBuy=None; s.lastBuyDetail=None; s.lastBuyRetry=False
         if xrp_blocked(ticker) or xrp_blocked(asset): s.lastBuy='blocked'; s.lastBuyDetail='blocked: XRP is never live'; return None
         if not s.entry_allowed(asset,ticker,shadow,mode):
             s.lastBuy='blocked'
@@ -333,11 +354,30 @@ class Live:
         if ticker in s.tried: s.lastBuy=s.lastBuyDetail='already tried this ticker'; return None
         s.tried.add(ticker)
         if s.killed: s.lastBuy=s.lastBuyDetail=f'kill switch: {s.killReason}'; s.log(action='buy-skip',error=f'kill switch: {s.killReason}',**a); return None
+        stale_reset=True
         if STALE_GUARD and s.ws and not shadow and s.wsq(ticker) is None:
-            s.staleN=getattr(s,'staleN',0)+1
-            if s.staleN>=STALE_KILL_N and not s.killed: s.killed=True; s.killReason=f'stale Kalshi data on {s.staleN} straight buy attempts'; s.persist()
-            s.lastBuy=s.lastBuyDetail='stale Kalshi quote'; s.log(action='buy-skip',error='stale Kalshi quote',**a); return None
-        s.staleN=0
+            w=None
+            if quote_wait>0:   # gap-live: make sure it is subscribed, then wait briefly for the first/next push
+                s.prewatch(ticker); end=time.time()+quote_wait
+                while w is None and time.time()<end: time.sleep(0.25); w=s.wsq(ticker)
+            if w is None:
+                info=s.ws_info(ticker)
+                first=bool(info.get('connected')) and not info.get('have')   # just subscribed, no first push yet
+                rest=s._rest_ask(ticker,side) if quote_wait>0 else None
+                if rest is None:
+                    if not first:   # genuine staleness (quote went stale / WS down) still counts toward the kill
+                        s.staleN=getattr(s,'staleN',0)+1
+                        if s.staleN>=STALE_KILL_N and not s.killed: s.killed=True; s.killReason=f'stale Kalshi data on {s.staleN} straight buy attempts'; s.persist()
+                    sr=s.__dict__.setdefault('staleRetry',{}); n=sr.get(ticker,0)+1; sr[ticker]=n
+                    if len(sr)>200: [sr.pop(k) for k in list(sr)[:100]]
+                    if quote_wait>0 and n<STALE_RETRY_MAX: s.tried.discard(ticker); s.lastBuyRetry=True
+                    s.lastBuy='stale Kalshi quote'
+                    s.lastBuyDetail=('stale Kalshi quote ('+('no first WS quote yet' if first else ('WS disconnected' if not info.get('connected') else f"WS quote age rx {info.get('rxAge')}s ts {info.get('tsAge')}s"))
+                                     +('; REST quote unavailable' if quote_wait>0 else '')+f'; try {n}/{STALE_RETRY_MAX})')
+                    s.log(action='buy-skip',error=s.lastBuyDetail,**a); return None
+                stale_reset=False   # WS stale but REST public quote is live: trade on REST price, leave staleN untouched
+                s.log(action='ws-stale-rest-ok',error=None,wsHave=info.get('have'),wsConnected=info.get('connected'),**a)
+        if stale_reset: s.staleN=0
         try: cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
         except Exception as e: s.lastBuy=s.lastBuyDetail=f'balance error: {type(e).__name__}'; s.lastError=f'balance: {e}'; s.log(action='buy-skip',error=s.lastError,**a); return None
         maxpx=min(0.99,round(ref+MAX_CHASE,2)) if sizer is None else 0.99
