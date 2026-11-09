@@ -932,6 +932,9 @@ def tick_once():
     except Exception: pass
     try: SPEC.log_crypto_gap({x:(sigs.get(x) or {}).get('kalshi') for x in ('BTC','ETH','SOL','XRP')})  # research only
     except Exception: pass
+    try:  # pairing-gap SHADOW only (separate book, never live, never pt.trades)
+        GAPS.on_tick({x:(sigs.get(x) or {}).get('kalshi') for x in GAPS_ASSETS}); GAPS.settle(_pl_result)
+    except Exception as e: print('gapshadow tick err',e,flush=True)
     try:
         if 'DOGE' not in _pair_rets:
             try:
@@ -984,6 +987,10 @@ if LV is not None:
 try: WL.start(MCOL.database if MCOL is not None else None,owner=lambda:(LV is None or LV.lease_ok is None or LV.owner()))
 except Exception as _e: print('windowlog start err',_e,flush=True)
 import predlog as PL
+import gapshadow as GAPS
+GAPS_ASSETS=('GOLD','SILVER','BTC','ETH','SOL','XRP')
+try: GAPS.load(DATA)
+except Exception as e: print('gapshadow load err',e,flush=True)
 def _pl_result(tk):
     try: return (get(f"{KALSHI}/markets/{tk}")['market'].get('result') or None)
     except Exception: return None
@@ -1192,6 +1199,9 @@ class H(SimpleHTTPRequestHandler):
             buf=io.StringIO(); w=csv.writer(buf); w.writerow(cols)
             with lock: tr=list(pt.trades)
             for t in tr: w.writerow([t.get('id'),t.get('mode','paper'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl',''),t.get('hold_pnl',''),t.get('kalshiPnl',''),('kalshi' if 'kalshiPnl' in t else ''),'bot'])
+            try:
+                for g in GAPS.snapshot(): w.writerow([g.get('id'),'shadow',et(g.get('openedAt')),et(g.get('closedAt')),g.get('laggard'),g.get('ticker',''),g.get('side'),g.get('entry'),g.get('stake'),0,g.get('gapDown'),'gapshadow',g.get('status'),g.get('exit') if g.get('exit') is not None else '','',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','','gapshadow'])
+            except Exception: pass
             for x in (TFX.ST.get('manual') or {}).get('tickers',[]): w.writerow(['','live','','',x['ticker'].split('15M')[0].removeprefix('KX'),x['ticker'],'','','','','','manual (not bot)','settled','','','',x['pnl'],'',x['pnl'],'kalshi','manual'])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')
             s.send_header('Content-Disposition',f'attachment; filename="paper-desk-trades-{datetime.now(ET).strftime("%Y%m%d-%H%M")}.csv"'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
@@ -1236,6 +1246,7 @@ class H(SimpleHTTPRequestHandler):
             b=json.dumps(r,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/truthfix': b=json.dumps(TFX.ST,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/cryptogap': b=json.dumps(list(SPEC.CRYPTO_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/gapshadow': b=json.dumps(GAPS.snapshot(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/metalgap': b=json.dumps(list(SPEC.METAL_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/predstats': b=json.dumps(PL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/idxstats': b=json.dumps(WL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
