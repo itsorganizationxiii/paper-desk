@@ -15,6 +15,7 @@ try:
 except Exception: ET=timezone(timedelta(hours=-5))
 from datetime import datetime
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+import cpuprof as CPU   # read-only profiling (/api/cpuprof); imported first: pt.save() runs at module init
 APP=os.path.dirname(os.path.abspath(__file__))
 DATA=os.environ.get('DATA_DIR',APP); os.makedirs(DATA,exist_ok=True)
 TF=os.path.join(DATA,'trades.json'); SEED=os.path.join(APP,'seed_trades.json')
@@ -393,7 +394,6 @@ if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
  'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
 import gaplive as GL
-import cpuprof as CPU   # read-only profiling (/api/cpuprof)
 def live_for(name):
     # LIVE_STRATEGIES (default 'gap'): Resume can only put the listed strategies live; Spec/leadlag/ethlead stay paper
     return GL.strategy_live(name,LV)

@@ -26,6 +26,8 @@ chk('json serialisable',isinstance(txt,str))
 # server wiring + display-only mark
 src=open('server.py').read(); tree=ast.parse(src)
 chk('/api/cpuprof route present (GET, read-only)',"elif p=='/api/cpuprof':" in src and 'CPU.profile(' in src)
+imp=src.index('import cpuprof as CPU'); first_use=src.index('CPU.'); inst=src.index('pt=PaperTrader()') if 'pt=PaperTrader()' in src else len(src)
+chk('cpuprof imported before first use / PaperTrader init (boot regression)',imp<first_use and imp<inst)
 fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_gap_live_marks')
 g={'time':time,'LV':None,'pt':types.SimpleNamespace(trades=[dict(id=1190,gapLive=True,status='open',asset='ETH',side='NO',ticker='KXETH15M-X',price=0.47,stake=0.9164,contracts=1.88),
                                                            dict(id=5,gapLive=False,status='open',asset='ETH',side='NO',ticker='KXETH15M-X',price=0.5,stake=1,contracts=2)])}
