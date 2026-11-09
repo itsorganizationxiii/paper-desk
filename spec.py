@@ -261,3 +261,30 @@ def settlement_row(*, asset, ticker, side, coinbase_spot, kalshi_result, kalshi_
                 row['pythVsKalshiGap']=round(float(pyth_price)-float(kalshi_expiration_value),6)
         except Exception: pass
     return row
+
+# --- research only: gold vs silver intra-window gap (never read by trading code) ---
+import collections as _col
+METAL_GAP=_col.deque(maxlen=int(os.environ.get('METAL_GAP_RING','3000')))
+def _mid(b,a):
+    try:
+        b=float(b) if b is not None else None; a=float(a) if a is not None else None
+        if b and a: return round((b+a)/2,4)
+        return a if a else b
+    except Exception: return None
+def metal_gap_row(g, s, now=None):
+    """g/s: kalshi market dicts (mk()) for GOLD/SILVER. Returns row or None if not same window."""
+    if not g or not s or g.get('close')!=s.get('close'): return None
+    now=time.time() if now is None else now
+    gy=_mid(g.get('yesBid'),g.get('yesAsk')); sy=_mid(s.get('yesBid'),s.get('yesAsk'))
+    if gy is None or sy is None: return None
+    gap=round((1-gy)-(1-sy),4)  # gold Down% minus silver Down%
+    same=(gy>=0.5)==(sy>=0.5)
+    return dict(kind='metal_gap',ts_ms=int(now*1000),goldTicker=g.get('ticker'),silverTicker=s.get('ticker'),
+                closeAt=g.get('close'),leftSec=round(g['close']-now,1),goldYesMid=gy,silverYesMid=sy,
+                goldDown=round(1-gy,4),silverDown=round(1-sy,4),gapDown=gap,sameSide=same,state='same' if same else 'diverging')
+def log_metal_gap(g, s, now=None):
+    try:
+        r=metal_gap_row(g,s,now)
+        if r: METAL_GAP.append(r); append_research(r)
+        return r
+    except Exception: return None

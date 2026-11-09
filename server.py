@@ -928,6 +928,8 @@ def tick_once():
                 with lock: t=pt.openTrade(a,dirn,ask,mp,k['strike'],k['close'],k['ticker'],meta)
                 sg['action']=(f'OPENED {a} SHADOW #{t["id"]} (paper only)' if shd else f'OPENED #{t["id"]}') if t else (f'skip: weekend-night edge too big ({q-ask:+.3f} > {WKND_MAX_EDGE})' if WKND_MAX_EDGE>0 and wknd_night() and q-ask>WKND_MAX_EDGE else f'skip: edge {q-ask:+.3f} < {need_edge()}')
         sigs[a]=sg
+    try: SPEC.log_metal_gap((sigs.get('GOLD') or {}).get('kalshi'),(sigs.get('SILVER') or {}).get('kalshi'))  # research only
+    except Exception: pass
     try:
         if 'DOGE' not in _pair_rets:
             try:
@@ -1231,6 +1233,7 @@ class H(SimpleHTTPRequestHandler):
                 except Exception as e: r=dict(err=str(e)[:200])
             b=json.dumps(r,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/truthfix': b=json.dumps(TFX.ST,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/metalgap': b=json.dumps(list(SPEC.METAL_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/predstats': b=json.dumps(PL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/idxstats': b=json.dumps(WL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
