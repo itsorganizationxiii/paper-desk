@@ -87,8 +87,9 @@ def _mongo_writer():
         _dirty.wait(); time.sleep(2); _dirty.clear()
         if LV is not None and LV.lease_ok is not None and not LV.owner(): continue  # stale instance: never overwrite the new one's state
         try:
-            with lock: doc={'balance':round(pt.balance,4),'startBalance':pt.start,'trades':json.loads(json.dumps(pt.trades)),'updatedAt':time.time()}
-            MCOL.replace_one({'_id':'state'},doc,upsert=True)
+            with CPU.timed('mongo_writer.copy(under lock)',lambda:len(pt.trades)):
+                with lock: doc={'balance':round(pt.balance,4),'startBalance':pt.start,'trades':json.loads(json.dumps(pt.trades)),'updatedAt':time.time()}
+            with CPU.timed('mongo_writer.replace_one'): MCOL.replace_one({'_id':'state'},doc,upsert=True)
         except Exception as e: print('mongo write err',e,flush=True); _dirty.set(); time.sleep(10)
 class PaperTrader:
     def __init__(s):
@@ -127,7 +128,8 @@ class PaperTrader:
             if t.get('status') in('won','lost','exited') and 'pnlChecked' not in t and t.get('pnl') is not None:
                 ok,lo,hi=pnl_bounds_ok(t,t['pnl']); t['pnlChecked']=True
                 if not ok: t.update(pnlRaw=t['pnl'],pnl=None,pnlFlagged=dict(lo=lo,hi=hi,at=time.time())); print('PNL FLAG',t.get('id'),t['pnlRaw'],lo,hi,flush=True)
-        tmp=TF+'.tmp'; json.dump({'balance':round(s.balance,4),'startBalance':s.start,'trades':s.trades},open(tmp,'w'),indent=1); os.replace(tmp,TF)
+        with CPU.timed('pt.save(trades.json)',lambda:os.path.getsize(TF)):
+            tmp=TF+'.tmp'; json.dump({'balance':round(s.balance,4),'startBalance':s.start,'trades':s.trades},open(tmp,'w'),indent=1); os.replace(tmp,TF)
         if MCOL is not None: _dirty.set()
     @staticmethod
     def size(side,ask,p_yes,bid=None):
@@ -391,6 +393,7 @@ if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
  'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
 import gaplive as GL
+import cpuprof as CPU   # read-only profiling (/api/cpuprof)
 def live_for(name):
     # LIVE_STRATEGIES (default 'gap'): Resume can only put the listed strategies live; Spec/leadlag/ethlead stay paper
     return GL.strategy_live(name,LV)
@@ -968,10 +971,13 @@ def tick_once():
     try: GAPLIVE.presubscribe(_gm)   # warm WS quotes for the BTC/ETH/SOL gap legs before any signal (read-only market data)
     except Exception as e: print('gaplive presub err',e,flush=True)
     try:  # pairing-gap SHADOW only (separate book, never live, never pt.trades)
-        GAPS.on_tick(_gm); GAPS.settle(_pl_result)
+        with CPU.timed('gaps.on_tick'): GAPS.on_tick(_gm)
+        with CPU.timed('gaps.settle'): GAPS.settle(_pl_result)
     except Exception as e: print('gapshadow tick err',e,flush=True)
     try: GAPLIVE.tick()   # capped retries of gap-live signals skipped only for a stale Kalshi quote
     except Exception as e: print('gaplive tick err',e,flush=True)
+    try: _gap_live_marks(_gm)   # DISPLAY ONLY: mark/unrealized P&L on open gap-live cards (no exits)
+    except Exception as e: print('gaplive mark err',e,flush=True)
     try:
         if 'DOGE' not in _pair_rets:
             try:
@@ -1075,6 +1081,21 @@ try: _persist_boot()
 except Exception as e: print('persist boot err',e,flush=True)
 # gap PAPER fills re-check the fresh websocket quote (same as Spec paper PAPER_FRESH_FILL); read-only quote cache
 GAPS.QUOTE[0]=lambda tk:(LV.wsq(tk) if LV is not None else None)
+def _gap_live_marks(gm):
+    """Display-only mark for open gap-live (hold-to-settle) trades: our-side bid from this tick's Kalshi market
+    (already fetched over REST for the asset), else a fresh WS quote. Never exits or changes the position."""
+    for t in [t for t in list(pt.trades) if t.get('gapLive') and t.get('status')=='open']:
+        bid=None; src=None
+        m=(gm or {}).get(t.get('asset'))
+        if isinstance(m,dict) and m.get('ticker')==t.get('ticker'):
+            bid=m.get('yesBid') if t.get('side')=='YES' else m.get('noBid'); src='kalshi-rest'
+        if bid is None and LV is not None:
+            w=LV.wsq(t['ticker'])
+            if w and w.get('yesBid') is not None and w.get('yesAsk') is not None:
+                bid=w['yesBid'] if t.get('side')=='YES' else round(1-w['yesAsk'],4); src='kalshi-ws'
+        if t.get('contracts'): t.setdefault('costPerContract',round(float(t['stake'])/float(t['contracts']),4))   # incl. fee (Kalshi 'cost')
+        if bid is None: continue
+        t.update(markPrice=round(float(bid),4),markSource=src,markAt=time.time(),unrealizedPnl=round(t['contracts']*float(bid)-t['stake'],2))
 def _gap_live_open(p,fill,strike):
     with lock: return pt.openLiveGap(p,fill,strike)
 GAPLIVE=GL.GapLive(LV,_gap_live_open,log=lambda *a:print(*a,flush=True))
@@ -1197,7 +1218,11 @@ def _ws_quote(tk,q):
             elif bid>0 and bid<=stop_pct()*t['price']:
                 pt.exit(t,bid,f'stop: ws mark {bid:.3f} <= {stop_pct():.0%} of entry {t["price"]}',fee=0 if t.get('mode')=='live' else kalshi_fee(t['contracts'],bid))
     finally: lock.release()
-if LV is not None and getattr(LV,'ws',None) is not None: LV.ws.on_quote=_ws_quote
+def _ws_quote_timed(tk,q):
+    _t0=time.perf_counter()
+    try: return _ws_quote(tk,q)
+    finally: CPU.stage('ws_quote_callback',time.perf_counter()-_t0)
+if LV is not None and getattr(LV,'ws',None) is not None: LV.ws.on_quote=_ws_quote_timed
 REENTRY_WAIT=60; REENTRY_MIN_LEFT=120
 STOP_REENTRY_ENABLED=True
 STOP_REENTRY_WAIT=60
@@ -1256,7 +1281,8 @@ def reentry_ok(a,k,dirn,cb,left,now=None,feed=None):
 def loop():
     while True:
         if LV is not None and LV.lease_ok is not None and not LV.owner(): time.sleep(5); continue  # newer instance owns trading; stale one idles
-        try: tick_once()
+        try:
+            with CPU.timed('tick_once'): tick_once()
         except Exception as e: print('tick err',e,flush=True)
         time.sleep(LIVE_TICK if any(t.get('mode')=='live' and t['status']=='open' for t in pt.trades) else TICK)  # faster checks while a real position is open
 STATUS_TRADES=50
@@ -1386,6 +1412,16 @@ class H(SimpleHTTPRequestHandler):
             b=json.dumps(r,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/truthfix': b=json.dumps(TFX.ST,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/cryptogap': b=json.dumps(list(SPEC.CRYPTO_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/cpuprof':
+            from urllib.parse import parse_qs
+            qs={k:v[0] for k,v in parse_qs(s.path.split('?',1)[1] if '?' in s.path else '').items()}
+            try:
+                if qs.get('last'): r=dict(CPU.LAST) or dict(note='no profile yet'); r['stagesNow']=CPU.stages()
+                else: r=CPU.profile(float(qs.get('sec') or 3))
+                r['wsFeed']=LV.ws_status() if LV is not None else None
+                r['counts']=dict(trades=len(pt.trades),gapShadow=len(GAPS.TRADES),gapPaper=len(GAPS.PAPER),liveOrders=len(getattr(LV,'orders',[]) or []) if LV else None)
+            except Exception as e: r=dict(error=f'{type(e).__name__}: {str(e)[:200]}')
+            b=json.dumps(r,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gaplive':
             with lock: _gl=[dict(t) for t in pt.trades if t.get('gapLive')]
             b=json.dumps(GAPLIVE.summary(_gl),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)

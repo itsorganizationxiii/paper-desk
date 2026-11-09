@@ -144,6 +144,11 @@ def _emit(t):
     except Exception as e: print('gapshadow sink err',e,flush=True)
 def _save():
     if not _path[0]: return
+    try:
+        import cpuprof as _C
+        with _C.timed('gapshadow._save(json files)',lambda:sum(os.path.getsize(f) for f in (_path[0],os.path.join(os.path.dirname(_path[0]),'gap_paper.json')) if os.path.exists(f))): return _save_body()
+    except ImportError: return _save_body()
+def _save_body():
     for fn,rows in ((_path[0],TRADES),(os.path.join(os.path.dirname(_path[0]),'gap_paper.json'),PAPER)):
         try:
             tmp=fn+'.tmp'

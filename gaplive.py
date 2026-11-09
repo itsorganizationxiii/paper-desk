@@ -22,7 +22,7 @@ LIVE_STRATEGIES={x.strip().lower() for x in E('LIVE_STRATEGIES','gap').split(','
 def strategy_live(name,lv):
     """True only if the live engine is enabled (Resume pressed etc.) AND this strategy is allowed to trade live."""
     return bool(lv is not None and str(name).lower() in LIVE_STRATEGIES and lv.enabled())
-_SAFE=('at','action','ticker','side','limit','want','filled','http','error')
+_SAFE=('at','action','ticker','side','limit','want','filled','fillPrice','fee','http','error')
 def _scrub(v):
     v=str(v)
     if v.startswith('balance'): return 'balance error'
