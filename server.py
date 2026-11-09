@@ -145,8 +145,8 @@ class PaperTrader:
         if WKND_MIN>0 and wknd_night() and ask<WKND_MIN: return None
         return min(KELLY*edge/(1-ask),CAP)*(0.5 if nt else 1),edge,q
     def openLive(s,asset,side,fill,strike,close,ticker,meta,edge,q):
-        if meta.get('shadow') or meta.get('mode','live')!='live' or 'XRP' in str(ticker).upper():
-            raise ValueError('shadow metadata forbidden for live fill')
+        if meta.get('shadow') or meta.get('gap') or str(meta.get('signalSource','')).startswith('gap') or meta.get('mode','live')!='live' or 'XRP' in str(ticker).upper():
+            raise ValueError('shadow/gap metadata forbidden for live fill')
         existing=next((t for t in s.trades if t.get('mode')=='live' and not t.get('shadow') and t.get('status')=='open' and t.get('ticker')==ticker and t.get('side')==side and (t.get('liveOrderId')==fill.get('orderId') or t.get('adopted'))),None)
         if existing:
             if LV: LV.pending_fills.pop(fill.get('orderId'),None)
@@ -994,6 +994,78 @@ import gapshadow as GAPS
 GAPS_ASSETS=('GOLD','SILVER','BTC','ETH','SOL','XRP')
 try: GAPS.load(DATA)
 except Exception as e: print('gapshadow load err',e,flush=True)
+# ---- Nov 9: persist in-memory-only state to the existing Mongo (async/batched, owner-gated, bounded) + reload on boot ----
+import gappersist as GP
+SEED_DIR=os.path.join(APP,'gap_seed')
+def _gp_owner(): return LV is None or LV.lease_ok is None or LV.owner()
+def _seed(name):
+    try:
+        with open(os.path.join(SEED_DIR,name)) as f: return json.load(f)
+    except Exception: return []
+def _log_id(r):
+    k=r.get('kind')
+    if k=='metal_gap': return 'metalgap','m|%d'%int(r['ts_ms'])
+    if k=='crypto_gap': return 'cryptogap','c|%d'%int(r['ts_ms'])
+    return 'spec_research','s|%d|%s|%s'%(int(r.get('ts_ms') or 0),r.get('ticker'),r.get('tradeId'))
+def _log_sink(r):
+    col,_id=_log_id(r); GP.insert(col,_id,r)
+def _persist_boot():
+    GP.start(MCOL.database if MCOL is not None else None,owner=_gp_owner)
+    # gap shadow + gap paper trades: file (already loaded) + Mongo + committed seed (one-time import, idempotent)
+    mdocs=GP.load_all('gap_trades'); mk_={GAPS.doc_id(d):d for d in mdocs}
+    GAPS.merge_in(mdocs); GAPS.merge_in(_seed('gapshadow.json'))
+    n=0
+    for t in GAPS.snapshot()+GAPS.paper_snapshot():
+        o=mk_.get(GAPS.doc_id(t))
+        if o is None or GAPS._rank(t)>GAPS._rank(o): GP.upsert('gap_trades',GAPS.doc_id(t),t); n+=1
+    GP.ST['seeded']['gap_trades']=n if GP.enabled() else 0
+    GAPS.SINK[0]=lambda t:GP.upsert('gap_trades',GAPS.doc_id(t),t)
+    # tick logs: newest ring from Mongo + seed rows (within TTL); seed rows are re-inserted idempotently (_id = kind|ts_ms)
+    cut=(time.time()-GP.LOG_TTL_DAYS*86400)*1000
+    try:
+        import hashlib; _sha=hashlib.sha256(b''.join(open(os.path.join(SEED_DIR,f),'rb').read() for f in ('metalgap.json','cryptogap.json'))).hexdigest()[:16]
+    except Exception: _sha=None
+    _mk=GP.load_doc('research_state','seed_import') if GP.enabled() else None
+    _need=bool(_sha) and GP.enabled() and not (_mk and _mk.get('sha')==_sha)
+    for dq,col,fn in ((SPEC.METAL_GAP,'metalgap','metalgap.json'),(SPEC.CRYPTO_GAP,'cryptogap','cryptogap.json')):
+        GP.merge_rows(dq,GP.load_recent(col,dq.maxlen or 3000))
+        sd=[r for r in _seed(fn) if isinstance(r,dict) and (r.get('ts_ms') or 0)>=cut]
+        add=GP.merge_rows(dq,sd)
+        if _need:
+            for r in sd: _log_sink(r)   # one-time import; _id=kind|ts_ms so a repeat is a harmless duplicate-key no-op
+        GP.ST['seeded'][col]=len(sd) if _need else 0
+    if _need: GP.upsert('research_state','seed_import',dict(sha=_sha,at=time.time()))
+    SPEC.LOG_SINK[0]=_log_sink
+    print('persist boot: gap trades',len(GAPS.TRADES),'shadow /',len(GAPS.PAPER),'paper; metalgap',len(SPEC.METAL_GAP),'cryptogap',len(SPEC.CRYPTO_GAP),'mongo',GP.enabled(),flush=True)
+try: _persist_boot()
+except Exception as e: print('persist boot err',e,flush=True)
+# gap PAPER fills re-check the fresh websocket quote (same as Spec paper PAPER_FRESH_FILL); read-only quote cache
+GAPS.QUOTE[0]=lambda tk:(LV.wsq(tk) if LV is not None else None)
+# research trigger logs (leadlag / ethlead): capped snapshot doc each, reloaded on boot (display/research only)
+def _rs_reload(name,dq):
+    try:
+        d=GP.load_doc('research_state',name)
+        if d and isinstance(d.get('items'),list) and not dq: dq.extend(d['items'][-(dq.maxlen or 200):])
+    except Exception as e: print('research_state reload err',name,e,flush=True)
+try:
+    _rs_reload('leadlag_events',LL.events); _rs_reload('ethlead_events',EL.events)
+    GP.register_snapshot('leadlag_events',lambda:[dict(e) for e in list(LL.events)])
+    GP.register_snapshot('ethlead_events',lambda:[dict(e) for e in list(EL.events)])
+except Exception as e: print('research_state err',e,flush=True)
+# open paper positions' lock/stop state (peakBid etc.) is mutated on websocket quotes without a save; flush it to the
+# existing paper_desk_state doc at most once a minute when it changed (background, never in the trading path)
+def _peak_sig():
+    return tuple((t.get('id'),t.get('peakBid'),t.get('stopCounterfactual') is not None) for t in list(pt.trades) if t.get('status')=='open')
+def _peak_flusher():
+    last=None
+    while True:
+        time.sleep(60)
+        try:
+            sg=_peak_sig()
+            if sg and sg!=last: _dirty.set()
+            last=sg
+        except Exception as e: print('peak flush err',e,flush=True)
+if MCOL is not None: threading.Thread(target=_peak_flusher,daemon=True).start()
 GAP_DOGE=os.environ.get('GAP_DOGE','1')!='0'
 DOGE_SERIES='KXDOGE15M'
 def _doge_mk():
@@ -1200,6 +1272,10 @@ class H(SimpleHTTPRequestHandler):
                     d['live']['cooldownsEnabled']=COOLDOWNS_ENABLED
                     d['live']['lossStreaks']=dict(_cool.get('streaks',{}))
                 except Exception as e: d['live']['cooldowns']={'error':str(e)}
+                try:  # gap PAPER book shown in the paper ledger (display copies only; Spec stats/balance above exclude it)
+                    d['gapPaper']=GAPS.paper_summary(); d['persistence_gap']=GP.stats()
+                    d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}") for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
+                except Exception as e: d['gapPaper']=dict(error=str(e)[:200])
                 if 'full=1' not in s.path: slim_status(d)
                 b=json.dumps(d).encode()
             s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.send_header('Access-Control-Allow-Origin','*'); s.end_headers(); s.wfile.write(b)
@@ -1210,7 +1286,10 @@ class H(SimpleHTTPRequestHandler):
             with lock: tr=list(pt.trades)
             for t in tr: w.writerow([t.get('id'),t.get('mode','paper'),et(t.get('openedAt')),et(t.get('closedAt')),t.get('asset'),t.get('ticker',''),t.get('side'),t.get('price'),t.get('stake'),t.get('stakePct',''),t.get('edge'),t.get('signalSource',''),t.get('status'),t.get('exitPrice',''),t.get('exitReason',''),t.get('settle',''),t.get('pnl',''),t.get('hold_pnl',''),t.get('kalshiPnl',''),('kalshi' if 'kalshiPnl' in t else ''),'bot'])
             try:
-                for g in GAPS.snapshot(): w.writerow([g.get('id'),'shadow',et(g.get('openedAt')),et(g.get('closedAt')),g.get('laggard'),g.get('ticker',''),g.get('side'),g.get('entry'),g.get('stake'),0,g.get('gapDown'),'gapshadow:'+str(g.get('rule','gap20')),g.get('status'),g.get('exit') if g.get('exit') is not None else '','',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','','gapshadow'])
+                for g in GAPS.snapshot(): w.writerow([g.get('id'),'shadow',et(g.get('openedAt')),et(g.get('closedAt')),g.get('laggard'),g.get('ticker',''),g.get('side'),g.get('entry'),g.get('stake'),0,g.get('gapDown'),'gapshadow:'+str(g.get('rule','gap20'))+':'+str(g.get('pair','')),g.get('status'),g.get('exit') if g.get('exit') is not None else '','',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','','gapshadow'])
+            except Exception: pass
+            try:  # gap PAPER book (Rule A BTC-ETH / SOL-XRP): real paper trades, never live, separate from Spec balance
+                for g in GAPS.paper_snapshot(): w.writerow([g.get('id'),'paper',et(g.get('openedAt')),et(g.get('closedAt')),g.get('asset'),g.get('ticker',''),g.get('side'),g.get('price'),g.get('stake'),0,g.get('gapDown'),'gap:'+str(g.get('rule'))+':'+str(g.get('pair','')),g.get('status'),g.get('exit') if g.get('exit') is not None else '','',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','','gap-paper'])
             except Exception: pass
             for x in (TFX.ST.get('manual') or {}).get('tickers',[]): w.writerow(['','live','','',x['ticker'].split('15M')[0].removeprefix('KX'),x['ticker'],'','','','','','manual (not bot)','settled','','','',x['pnl'],'',x['pnl'],'kalshi','manual'])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')
@@ -1256,6 +1335,8 @@ class H(SimpleHTTPRequestHandler):
             b=json.dumps(r,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/truthfix': b=json.dumps(TFX.ST,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/cryptogap': b=json.dumps(list(SPEC.CRYPTO_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapshadow': b=json.dumps(GAPS.snapshot(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/metalgap': b=json.dumps(list(SPEC.METAL_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/predstats': b=json.dumps(PL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)

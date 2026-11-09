@@ -143,8 +143,14 @@ def _log_path(data_dir=None):
     _path=os.path.join(base,'spec_research.jsonl')
     return _path
 
+LOG_SINK=[None]  # fn(row): non-blocking persistence hook (server -> async Mongo); research only
+def _sink(row):
+    if LOG_SINK[0] is None: return
+    try: LOG_SINK[0](row)
+    except Exception: pass
 def append_research(row, data_dir=None):
     if not SPEC_LOG: return
+    if isinstance(row,dict) and row.get('kind')=='settlement': _sink(dict(row,ts_ms=row.get('ts_ms') or int(time.time()*1000)))
     try:
         row=dict(row); row.setdefault('ts_ms',int(time.time()*1000)); row.setdefault('loggedAt',time.time())
         p=_log_path(data_dir)
@@ -286,7 +292,7 @@ def metal_gap_row(g, s, now=None):
 def log_metal_gap(g, s, now=None):
     try:
         r=metal_gap_row(g,s,now)
-        if r: METAL_GAP.append(r); append_research(r)
+        if r: METAL_GAP.append(r); _sink(r); append_research(r)
         return r
     except Exception: return None
 
@@ -314,6 +320,6 @@ def crypto_gap_row(mkts, now=None):
 def log_crypto_gap(mkts, now=None):
     try:
         r=crypto_gap_row(mkts,now)
-        if r: CRYPTO_GAP.append(r); append_research(r)
+        if r: CRYPTO_GAP.append(r); _sink(r); append_research(r)
         return r
     except Exception: return None

@@ -13,7 +13,12 @@ Implements the owner's discretionary method as tagged rules (each trade has rule
                        (each moved <=5pt over ~60s), XRP Up<90%. Buy XRP YES with $0.10 stake; hold to settlement.
   gap20              : the old 20-pt gap rule, kept as a comparison variant.
 Common gates: ask 10-90c, yes spread <=5c when known, fee ceil(7*c*p*(1-p))/100, one per rule per pair per window,
-entry leftSec 60-780 (A/B/gap20; gap20 keeps its 120-720)."""
+entry leftSec 60-780 (A/B/gap20; gap20 keeps its 120-720).
+PAPER promotion (Nov 9 2026, owner-approved): Rule A on GAP_PAPER_PAIRS (default BTC-ETH,SOL-XRP) ALSO opens a real PAPER
+trade in a separate gap paper book (PAPER, mode='paper', gap=True, signalSource='gap'), $1 stake, fresh-quote fill check,
+held to settlement like the shadow rule. Everything else (A GOLD-SILVER, B, C, gap20) stays shadow-only. The gap paper book
+is never in pt.trades, so it cannot change Spec decisions/sizing/stops or the Spec paper balance, and this module has no
+order path at all (live can never take a gap trade). Persistence: SINK hook (server wires it to async Mongo upserts)."""
 import collections, json, math, os, threading, time
 E=os.environ.get
 GAP_MIN=float(E('GAP_SHADOW_MIN','0.20'))           # gap20
@@ -40,7 +45,15 @@ def _pairs(v):
 # User-specified pairs ONLY (no cross-mixing): BTC-ETH, GOLD-SILVER, SOL-XRP. Env GAP_SHADOW_PAIRS overrides.
 PAIRS=_pairs(E('GAP_SHADOW_PAIRS','BTC-ETH,GOLD-SILVER,SOL-XRP')) or (('BTC','ETH'),('GOLD','SILVER'),('SOL','XRP'))
 STAKE=1.0
+PAPER_ENABLED=E('GAP_PAPER','1')!='0'
+PAPER_RULES=set(x.strip() for x in E('GAP_PAPER_RULES','A').split(',') if x.strip())
+PAPER_PAIRS=set(f'{a}-{b}' for a,b in _pairs(E('GAP_PAPER_PAIRS','BTC-ETH,SOL-XRP')))
+PAPER_STAKE=1.0; PAPER_SLIP=0.01
 TRADES=[]; _seen=set(); _lk=threading.Lock(); _path=[None]
+PAPER=[]; _pseen=set()
+QUOTE=[None]   # fn(ticker)->{'yesBid','yesAsk'} fresh quote (server: websocket cache) or None
+SINK=[None]    # fn(trade) persistence hook; must be non-blocking
+PSTAT=dict(opened=0,nofill=0,skipped=0)
 HIST=collections.defaultdict(lambda:collections.deque(maxlen=64))  # asset -> (ts, close, yesMid)
 def fee(c,p): return math.ceil(7*c*p*(1-p))/100
 def _f(x):
@@ -51,20 +64,54 @@ def _mid(m):
     b,a=_f(m.get('yesBid')),_f(m.get('yesAsk'))
     if b and a: return (b+a)/2
     return a or b or None
+def is_paper(t): return bool(t.get('gap')) and t.get('mode')=='paper'
+def key(t): return ('paper' if is_paper(t) else 'shadow',t.get('rule','gap20'),t.get('pair'),round(float(t.get('closesAt') or 0),3))
+def doc_id(t):
+    b,r,p,c=key(t); return f'{b}|{r}|{p}|{c:.3f}'
+def _rank(t):
+    st=t.get('status'); return (st not in ('open',None), t.get('hold_pnl') is not None, t.get('closedAt') or 0)
+def _reindex():
+    TRADES.sort(key=lambda t:(t.get('openedAt') or 0)); PAPER.sort(key=lambda t:(t.get('openedAt') or 0))
+    for i,t in enumerate(TRADES,1): t['id']=f'G{i}'
+    for i,t in enumerate(PAPER,1): t['id']=f'GP{i}'
+    _seen.clear(); _seen.update((t['rule'],t['pair'],t['closesAt']) for t in TRADES)
+    _pseen.clear(); _pseen.update((t['rule'],t['pair'],t['closesAt']) for t in PAPER)
+def merge_in(items):
+    """Merge trades (from Mongo / seed / file) into TRADES/PAPER by key; a settled record beats an open one.
+    Returns the list of merged-in records that were new or better (caller may persist them)."""
+    out=[]
+    with _lk:
+        cur={key(t):t for t in TRADES+PAPER}
+        for t in items or []:
+            try:
+                if not isinstance(t,dict) or not t.get('pair') or not t.get('closesAt'): continue
+                t={k:v for k,v in t.items() if k not in ('_id','openedAtDt')}; t.setdefault('rule','gap20')
+                k=key(t); o=cur.get(k)
+                if o is None:
+                    (PAPER if is_paper(t) else TRADES).append(t); cur[k]=t; out.append(t)
+                elif _rank(t)>_rank(o):
+                    o.clear(); o.update(t); out.append(o)
+            except Exception as e: print('gapshadow merge err',e,flush=True)
+        _reindex()
+    return out
 def load(data_dir):
     _path[0]=os.path.join(data_dir,'gap_shadow.json')
-    try:
-        with open(_path[0]) as f: TRADES[:]=json.load(f)
-        for t in TRADES:
-            t.setdefault('rule','gap20'); _seen.add((t['rule'],t['pair'],t['closesAt']))
-    except Exception: pass
+    for fn in (_path[0],os.path.join(data_dir,'gap_paper.json')):
+        try:
+            with open(fn) as f: merge_in(json.load(f))
+        except Exception: pass
+def _emit(t):
+    if SINK[0] is None: return
+    try: SINK[0](t)
+    except Exception as e: print('gapshadow sink err',e,flush=True)
 def _save():
     if not _path[0]: return
-    try:
-        tmp=_path[0]+'.tmp'
-        with open(tmp,'w') as f: json.dump(TRADES,f,default=str)
-        os.replace(tmp,_path[0])
-    except Exception as e: print('gapshadow save err',e,flush=True)
+    for fn,rows in ((_path[0],TRADES),(os.path.join(os.path.dirname(_path[0]),'gap_paper.json'),PAPER)):
+        try:
+            tmp=fn+'.tmp'
+            with open(tmp,'w') as f: json.dump(rows,f,default=str)
+            os.replace(tmp,fn)
+        except Exception as e: print('gapshadow save err',e,flush=True)
 def record(mkts,now):
     for a,m in (mkts or {}).items():
         y=_mid(m) if isinstance(m,dict) else None
@@ -176,12 +223,41 @@ def decide_c(mkts,now=None):
     ask=_ask_ok(mx,'YES')
     if ask is None: return None
     return _mk_trade('C','XRP','XRP',mx,'YES',ask,C_STAKE,now,xrpYes=round(yx,4),others={x:round(y,4) for x,y in others.items()})
-def _add(t,out):
-    key=(t['rule'],t['pair'],t['closesAt'])
-    if key in _seen: return
+def _add(t,out,m=None):
+    k=(t['rule'],t['pair'],t['closesAt'])
+    if k in _seen: return
     with _lk:
-        _seen.add(key); t['id']=f'G{len(TRADES)+1}'; TRADES.append(t)
-    out.append(t); print('GAPSHADOW open',t['id'],t['rule'],t['pair'],t['laggard'],t['side'],t['entry'],flush=True)
+        _seen.add(k); t['id']=f'G{len(TRADES)+1}'; TRADES.append(t)
+    out.append(t); print('GAPSHADOW open',t['id'],t['rule'],t['pair'],t['laggard'],t['side'],t['entry'],flush=True); _emit(t)
+    try: paper_open(t,m)
+    except Exception as e: print('gappaper open err',e,flush=True)
+def paper_open(st,m=None,now=None):
+    """Promote a shadow trade to a real PAPER trade (separate gap paper book). Never live. Returns trade or None."""
+    if not PAPER_ENABLED or st.get('rule') not in PAPER_RULES or st.get('pair') not in PAPER_PAIRS: return None
+    k=(st['rule'],st['pair'],st['closesAt'])
+    if k in _pseen: return None
+    now=st.get('openedAt') if now is None else now
+    side=st['side']; ask=st['entry']; fq=None
+    if QUOTE[0] is not None:
+        try: fq=QUOTE[0](st['ticker'])
+        except Exception: fq=None
+    fa=None
+    if fq and fq.get('yesAsk') is not None and fq.get('yesBid') is not None:
+        fa=_f(fq['yesAsk']) if side=='YES' else round(1-_f(fq['yesBid']),4)
+    if fa is not None:
+        if fa>ask+PAPER_SLIP+1e-9: PSTAT['nofill']+=1; print('GAPPAPER NOFILL',st['ticker'],side,ask,fa,flush=True); return None
+        ask=fa
+    if not (0.10<=ask<=0.90): PSTAT['skipped']+=1; return None
+    c0=PAPER_STAKE/ask; ef=fee(c0,ask); contracts=round(max(PAPER_STAKE-ef,0.001)/ask,4)
+    t=dict(id=None,mode='paper',shadow=False,gap=True,book='gap-paper',signalSource='gap',rule=st['rule'],pair=st['pair'],
+           asset=st['laggard'],laggard=st['laggard'],leader=st.get('leader'),ticker=st['ticker'],side=side,price=round(ask,4),entry=round(ask,4),
+           signalAsk=st['entry'],freshAsk=fa,stake=PAPER_STAKE,contracts=contracts,entryFee=ef,leftSec=st.get('leftSec'),closesAt=st['closesAt'],
+           openedAt=now,status='open',settle=None,exit=None,pnl=None,hold_pnl=None,shadowKey=doc_id(st),
+           gapDown=st.get('gapDown'),leaderYesMid=st.get('leaderYesMid'),laggardYesMid=st.get('laggardYesMid'),confirm=st.get('confirm'))
+    with _lk:
+        _pseen.add(k); t['id']=f'GP{len(PAPER)+1}'; PAPER.append(t)
+    PSTAT['opened']+=1; print('GAPPAPER open',t['id'],t['rule'],t['pair'],t['asset'],side,t['price'],flush=True); _emit(t)
+    return t
 def manage_exits(mkts,now=None):
     """Rule B early cash-out (paper). Returns list of trades cashed this tick."""
     now=time.time() if now is None else now; out=[]
@@ -200,7 +276,7 @@ def manage_exits(mkts,now=None):
             if not bid: continue
             xf=fee(t['contracts'],bid); val=t['contracts']*bid-xf
             if val<=t['stake']: continue
-            t.update(status='cashed',exit=round(bid,4),exitFee=xf,pnl=round(val-t['stake'],2),cashedAt=now,cashLeftSec=round(left,1)); out.append(t)
+            t.update(status='cashed',exit=round(bid,4),exitFee=xf,pnl=round(val-t['stake'],2),cashedAt=now,cashLeftSec=round(left,1)); out.append(t); _emit(t)
             print('GAPSHADOW cash',t['id'],bid,t['pnl'],flush=True)
         except Exception as e: print('gapshadow exit err',e,flush=True)
     return out
@@ -220,7 +296,7 @@ def on_tick(mkts,now=None):
                     ma=mkts.get(a)
                     if not ma or (r,f'{a}-{b}',ma.get('close')) in _seen: continue
                     t=fn()
-                    if t: _add(t,out)
+                    if t: _add(t,out,mkts.get(t['laggard']))
                 except Exception as e: print('gapshadow pair err',r,e,flush=True)
         for r,fn in (('B',decide_b),('C',decide_c)):
             if r not in RULES: continue
@@ -237,6 +313,7 @@ def settle(result_fn,now=None):
     """result_fn(ticker)->'yes'|'no'|None. Open -> settle; cashed -> record hold_pnl only."""
     now=time.time() if now is None else now; ch=False
     todo=[t for t in TRADES if (t.get('status')=='open' or (t.get('status')=='cashed' and t.get('hold_pnl') is None)) and now>=t['closesAt']+5][:6]
+    todo+=[t for t in PAPER if t.get('status')=='open' and now>=t['closesAt']+5][:6]
     for t in todo:
         try:
             r=result_fn(t['ticker'])
@@ -245,9 +322,21 @@ def settle(result_fn,now=None):
             hp=round((t['contracts'] if win else 0)-t['stake'],2)
             if t['status']=='cashed': t.update(settle=r,hold_pnl=hp,closedAt=now)
             else: t.update(status='won' if win else 'lost',settle=r,exit=1.0 if win else 0.0,pnl=hp,hold_pnl=hp,closedAt=now)
-            ch=True
+            if is_paper(t): t['settledBy']='kalshi'
+            ch=True; _emit(t)
         except Exception as e: print('gapshadow settle err',e,flush=True)
     if ch: _save()
     return ch
 def snapshot():
     with _lk: return [dict(t) for t in TRADES]
+def paper_snapshot():
+    with _lk: return [dict(t) for t in PAPER]
+def paper_summary():
+    with _lk: ps=[dict(t) for t in PAPER]
+    def agg(ts):
+        c=[t for t in ts if t.get('status') not in ('open',None)]
+        return dict(trades=len(ts),closed=len(c),open=len(ts)-len(c),wins=sum(1 for t in c if (t.get('pnl') or 0)>0),pnl=round(sum(t.get('pnl') or 0 for t in c),2))
+    by={}
+    for t in ps: by.setdefault(f"{t.get('rule')} {t.get('pair')}",[]).append(t)
+    return dict(enabled=PAPER_ENABLED,rules=sorted(PAPER_RULES),pairs=sorted(PAPER_PAIRS),stake=PAPER_STAKE,all=agg(ps),byRulePair={k:agg(v) for k,v in by.items()},
+                stats=dict(PSTAT),note='gap PAPER book: separate from Spec paper balance/ledger math; never live')

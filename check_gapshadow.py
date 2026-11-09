@@ -93,4 +93,61 @@ try:
     chk('metal/crypto rows carry bid/ask (+DOGE)',r1['goldYesBid']==0.4 and r1['silverYesAsk']==0.52 and r2['yesBid']['DOGE']==0.3 and r2['yesAsk']['ETH']==0.52)
 except ImportError as e: print('skip spec row check',e)
 chk('rules enabled',G.RULES>={'A','B','C','gap20'})
+
+# ---- Nov 9: gap PAPER promotion (Rule A BTC-ETH / SOL-XRP only), separate book, never live ----
+G=importlib.reload(G); G.load(tempfile.mkdtemp()); G.HIST.clear()
+chk('paper defaults: rule A on BTC-ETH,SOL-XRP only',G.PAPER_RULES=={'A'} and G.PAPER_PAIRS=={'BTC-ETH','SOL-XRP'} and G.PAPER_STAKE==1.0)
+sunk=[]; G.SINK[0]=lambda t:sunk.append(dict(t)); G.QUOTE[0]=None
+C2=3700.0
+mk_be={'BTC':mm('KXBTC-P',0.46,C2),'ETH':mm('KXETH-P',0.58,C2),'SOL':mm('KXSOL-P',0.6,C2),'XRP':mm('KXXRP-P',0.55,C2),'DOGE':mm('KXDOGE-P',0.3,C2)}
+o=G.on_tick(mk_be,C2-400)
+pa=G.paper_snapshot()
+chk('A BTC-ETH shadow trade still logged',any(t['rule']=='A' and t['pair']=='BTC-ETH' for t in G.TRADES))
+be=[t for t in pa if t['pair']=='BTC-ETH']
+chk('A BTC-ETH opens one gap PAPER trade',len(be)==1)
+p0=be[0] if be else {}
+chk('paper trade labeled mode=paper gap signalSource=gap rule/pair, $1',p0.get('mode')=='paper' and p0.get('gap') is True and p0.get('shadow') is False and p0.get('signalSource')=='gap' and p0.get('rule')=='A' and p0.get('pair')=='BTC-ETH' and p0.get('stake')==1.0)
+chk('paper trade has asset/price for ledger',p0.get('asset')=='BTC' and p0.get('price')==p0.get('entry') and p0.get('id','').startswith('GP'))
+chk('sink called for shadow and paper',any(t.get('gap') for t in sunk) and any(t.get('mode')=='shadow' for t in sunk))
+G.on_tick(mk_be,C2-390); chk('one paper trade per rule/pair/window',len([t for t in G.PAPER if t['pair']=='BTC-ETH'])==1)
+# gold-silver A, gap20, B, C stay shadow-only
+G2c=C2+900
+o=G.on_tick({'GOLD':mm('g',0.30,G2c),'SILVER':mm('s',0.38,G2c)},G2c-400)
+chk('A GOLD-SILVER stays shadow-only',any(t['pair']=='GOLD-SILVER' for t in o) and not any(t['pair']=='GOLD-SILVER' for t in G.PAPER))
+chk('gap20/B/C never paper',not any(t['rule']!='A' for t in G.PAPER))
+# SOL-XRP paper
+C3=C2+1800
+o=G.on_tick({'SOL':mm('KXSOL-Q',0.62,C3),'XRP':mm('KXXRP-Q',0.52,C3),'BTC':mm('KXBTC-Q',0.6,C3),'ETH':mm('KXETH-Q',0.6,C3),'DOGE':mm('KXDOGE-Q',0.4,C3)},C3-400)
+chk('A SOL-XRP opens gap PAPER (XRP laggard)',any(t['pair']=='SOL-XRP' and t['asset']=='XRP' for t in G.PAPER))
+# fresh quote check: ran >1c away -> no fill; within -> fill at fresh price
+st=dict(rule='A',pair='BTC-ETH',closesAt=9999.0,side='YES',entry=0.47,ticker='KXBTC-Z',laggard='BTC',openedAt=1.0)
+G.QUOTE[0]=lambda tk:dict(yesBid=0.49,yesAsk=0.50)
+chk('fresh ask ran >1c -> no paper fill',G.paper_open(st) is None and G.PSTAT['nofill']>=1)
+G.QUOTE[0]=lambda tk:dict(yesBid=0.46,yesAsk=0.475)
+pt2=G.paper_open(st); chk('fresh ask within 1c -> fills at fresh price',pt2 is not None and pt2['price']==0.475 and pt2['signalAsk']==0.47)
+G.QUOTE[0]=lambda tk:(_ for _ in ()).throw(RuntimeError('ws down'))
+st2=dict(st,closesAt=9998.0); chk('quote error -> falls back to signal ask',G.paper_open(st2)['price']==0.47)
+G.QUOTE[0]=None
+# settlement of paper trades
+G.settle(lambda tk:'yes',C3+900)
+ps=[t for t in G.PAPER if t['closesAt']<=C3]
+chk('paper trades settle via Kalshi result',ps and all(t['status'] in ('won','lost') and t['settledBy']=='kalshi' and t['pnl']==t['hold_pnl'] for t in ps))
+sm=G.paper_summary(); chk('paper summary by rule/pair',sm['all']['trades']==len(G.PAPER) and 'A BTC-ETH' in sm['byRulePair'])
+# merge_in: reload from Mongo/seed keeps history; settled beats open; dedup by key; ids reassigned in time order
+snapS=G.snapshot(); snapP=G.paper_snapshot()
+G=importlib.reload(G); G.load(tempfile.mkdtemp())
+stale=[dict(t,status='open',pnl=None,hold_pnl=None,closedAt=None) for t in snapS[:2]]
+G.merge_in(stale); G.merge_in(snapS+snapP); G.merge_in(snapS)
+chk('merge_in restores shadow+paper books',len(G.TRADES)==len(snapS) and len(G.PAPER)==len(snapP))
+chk('settled record beats stale open',all(G.TRADES[i]['status']==snapS[i]['status'] for i in range(2)))
+chk('dedup keys rebuilt (no reopen same window)',(snapS[0]['rule'],snapS[0]['pair'],snapS[0]['closesAt']) in G._seen and len(G._pseen)==len(snapP))
+_pp=[t for t in G.PAPER if t['closesAt']==C2][0]
+chk('doc_id distinguishes books',G.doc_id(_pp)!=G.doc_id(next(t for t in G.TRADES if t['pair']==_pp['pair'] and t['closesAt']==_pp['closesAt'] and t['rule']=='A')))
+chk('merge_in ignores junk',G.merge_in([None,{},{'pair':'X'},'x'])==[])
+src=open('gapshadow.py').read()
+chk('gap module has no order path',all(x not in src for x in ('buy(','sell(','openLive','_gbuy','rest_buy','api(')))
+ssrc=open('server.py').read()
+chk('server never puts gap trades into pt.trades',all(x not in ssrc for x in ('pt.trades.append(g','pt.trades+GAPS','pt.merge(GAPS')))
+chk('openLive rejects gap metadata',"meta.get('gap') or str(meta.get('signalSource','')).startswith('gap')" in ssrc)
+chk('csv labels gap paper + shadow rule:pair',"'gap:'+str(g.get('rule'))+':'+str(g.get('pair',''))" in ssrc and "'gapshadow:'+str(g.get('rule','gap20'))+':'+str(g.get('pair',''))" in ssrc)
 print('ALL PASS' if ok else 'SOME FAILED'); raise SystemExit(0 if ok else 1)
