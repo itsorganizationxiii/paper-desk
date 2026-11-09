@@ -78,7 +78,7 @@ class Live:
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.totalPnl=float(st.get('totalPnl',0)); s.gapLiveUsed=int(st.get('gapLiveUsed',0) or 0); s.gapLiveDisabled=bool(st.get('gapLiveDisabled',False)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.entry_block=None
+        s.totalPnl=float(st.get('totalPnl',0)); s.gapLiveUsed=int(st.get('gapLiveUsed',0) or 0); s.gapLiveDisabled=bool(st.get('gapLiveDisabled',False)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.lastBuyDetail=None; s.entry_block=None
         s.cash=None; s.cashAt=None; s.lastError=None; s.ws=None
         s.lease_ok=None
         s.instance=uuid.uuid4().hex[:12]; s.own_orders={}; s.submitted_orders={}; s._lost_cleanup=False
@@ -320,20 +320,26 @@ class Live:
     def buy(s,asset,ticker,side,frac,ref,sizer=None,shadow=False,mode='live',usd=None):
         """Synchronous real buy. Returns dict(contracts,price,fee,cost,orderId,cash) when anything filled, else None (logged)."""
         a=dict(asset=asset,ticker=ticker,side=side)
-        if xrp_blocked(ticker) or xrp_blocked(asset): s.lastBuy='blocked'; return None
-        if not s.entry_allowed(asset,ticker,shadow,mode): s.lastBuy='blocked'; return None
+        # Diagnostics only (t1022): every None return records a specific reason in lastBuy/lastBuyDetail.
+        # Exact codes 'blocked'/'edge'/'nofill' are kept for existing callers; trading logic unchanged.
+        s.lastBuy=None; s.lastBuyDetail=None
+        if xrp_blocked(ticker) or xrp_blocked(asset): s.lastBuy='blocked'; s.lastBuyDetail='blocked: XRP is never live'; return None
+        if not s.entry_allowed(asset,ticker,shadow,mode):
+            s.lastBuy='blocked'
+            s.lastBuyDetail='blocked: '+('shadow/paper mode' if (shadow or mode!='live') else 'live env/keys off' if not s.allowed() else 'live paused' if s.paused else 'kill switch' if s.killed else 'entry block (shadow asset/loss streak)' if (s.entry_block and s.entry_block(asset,ticker)) else 'no trader lease (stale instance)')
+            return None
         with s.lock: s._rollday()
-        if ASSETS is not None and asset not in ASSETS: return None
-        if ticker in s.tried: return None
+        if ASSETS is not None and asset not in ASSETS: s.lastBuy=s.lastBuyDetail=f'asset {asset} not in LIVE_ASSETS'; return None
+        if ticker in s.tried: s.lastBuy=s.lastBuyDetail='already tried this ticker'; return None
         s.tried.add(ticker)
-        if s.killed: s.log(action='buy-skip',error=f'kill switch: {s.killReason}',**a); return None
+        if s.killed: s.lastBuy=s.lastBuyDetail=f'kill switch: {s.killReason}'; s.log(action='buy-skip',error=f'kill switch: {s.killReason}',**a); return None
         if STALE_GUARD and s.ws and not shadow and s.wsq(ticker) is None:
             s.staleN=getattr(s,'staleN',0)+1
             if s.staleN>=STALE_KILL_N and not s.killed: s.killed=True; s.killReason=f'stale Kalshi data on {s.staleN} straight buy attempts'; s.persist()
-            s.log(action='buy-skip',error='stale Kalshi quote',**a); return None
+            s.lastBuy=s.lastBuyDetail='stale Kalshi quote'; s.log(action='buy-skip',error='stale Kalshi quote',**a); return None
         s.staleN=0
         try: cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
-        except Exception as e: s.lastError=f'balance: {e}'; s.log(action='buy-skip',error=s.lastError,**a); return None
+        except Exception as e: s.lastBuy=s.lastBuyDetail=f'balance error: {type(e).__name__}'; s.lastError=f'balance: {e}'; s.log(action='buy-skip',error=s.lastError,**a); return None
         maxpx=min(0.99,round(ref+MAX_CHASE,2)) if sizer is None else 0.99
         fixed=usd; usd=frac*cash
         if MAX_USD>0: usd=min(usd,MAX_USD)
@@ -348,25 +354,25 @@ class Live:
                 f2=sizer(px)
                 if f2 is None:
                     if fc: break
-                    s.lastBuy='edge'; s.tried.discard(ticker)  # edge gone at the live price; re-check next tick
+                    s.lastBuy='edge'; s.lastBuyDetail=f'edge gone at live ask {px} (signal {ref})'; s.tried.discard(ticker)  # edge gone at the live price; re-check next tick
                     if ticker not in s.edgeLogged: s.edgeLogged.add(ticker); s.log(action='buy-skip',error=f'edge gone at live ask {px} (signal {ref}); will keep checking',**a)
                     return None
                 if not fc: frac=f2; usd=f2*cash; usd=min(usd,MAX_USD) if MAX_USD>0 else usd; usd=stake(usd,cash)
             if px>maxpx:
                 err=f'ask {px} above max {maxpx} (signal {ref})'
-                if not fc: s.log(action='buy-skip',error=err,**a); return None
+                if not fc: s.lastBuy=s.lastBuyDetail=err; s.log(action='buy-skip',error=err,**a); return None
                 break
             if s.fracOK is not False: n=round(math.floor((usd/px-fc)*100)/100,2); mn=0.01
             else: n=int(usd//px)-int(fc); mn=1
             if n<mn:
-                if not fc: s.log(action='buy-skip',error=f'<{mn} contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
+                if not fc: s.lastBuy=s.lastBuyDetail=f'<{mn} contract affordable (usd {usd:.2f}, px {px})'; s.log(action='buy-skip',error=f'<{mn} contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
                 break
             c,f1,p1,fe1,oid,err=s._order(ticker,side,'buy',n,px)
             if s.fracOK is None and n!=int(n):
                 if err and c not in (200,201) and not f1 and 'insufficient' not in str(err):
                     s.fracOK=False; s.log(action='frac-test',error=f'Kalshi rejected fractional count {n}: {err}; using whole contracts',**a)
                     err=None; n2=int(usd//px)
-                    if n2<1: s.log(action='buy-skip',error=f'<1 whole contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
+                    if n2<1: s.lastBuy=s.lastBuyDetail=f'<1 whole contract affordable (fractional rejected; usd {usd:.2f}, px {px})'; s.log(action='buy-skip',error=f'<1 whole contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
                     c,f1,p1,fe1,oid,err=s._order(ticker,side,'buy',n2,px); n=n2
                 elif c in (200,201): s.fracOK=True; s.log(action='frac-test',error=f'Kalshi accepted fractional count {n} (filled {f1})',**a)
             if f1>0: cost+=f1*(p1 if p1 is not None else px); fc+=f1; fee+=fe1
@@ -375,7 +381,10 @@ class Live:
         if err: s.lastError=f'buy HTTP {c}: {err}'
         if err and 'insufficient' in str(err): s.diag_balance()
         s.log(action='buy',orderId=oid,want=n,limit=px,filled=fc,fillPrice=round(cost/fc,4) if fc else None,fee=fee,http=c,error=err or (None if fc else 'no fill'),**a)
-        if not fc: s.lastBuy='nofill' if (c in (200,201) or not err) else 'error'; return None
+        if not fc:
+            s.lastBuy='nofill' if (c in (200,201) or not err) else f'order HTTP {c}: {err}'
+            s.lastBuyDetail=(f'no fill: IOC at limit {px} want {n} got 0 (HTTP {c}{", "+str(err) if err else ""})' if s.lastBuy=='nofill' else s.lastBuy)
+            return None
         s.cashAt=None
         s.verify(ticker,side,fc,a)
         return dict(contracts=fc,price=round(cost/fc,4),fee=round(fee,4),cost=round(cost,4),orderId=oid,cash=cash,frac=frac,side=side)

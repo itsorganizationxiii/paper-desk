@@ -8,7 +8,7 @@ Hard limits, all enforced here (server wires the hooks):
   - Hold to settlement: no trail / takeprofit / stops / edgedecay on gapLive trades (server guards every exit path).
   - Needs Live.enabled(): LIVE_TRADING=1 + keys + NOT paused (owner presses Resume) + lease owner. Daily loss + stale kill apply.
 LIVE_STRATEGIES (default 'gap') names which strategies may trade live; Spec/leadlag/ethlead are excluded by default."""
-import os, threading, time
+import os, re, threading, time, collections
 E=os.environ.get
 ENABLED=E('GAP_LIVE_ENABLED','1')!='0'
 MAX_TRADES=int(E('GAP_LIVE_MAX_TRADES','3'))
@@ -19,11 +19,25 @@ LIVE_STRATEGIES={x.strip().lower() for x in E('LIVE_STRATEGIES','gap').split(','
 def strategy_live(name,lv):
     """True only if the live engine is enabled (Resume pressed etc.) AND this strategy is allowed to trade live."""
     return bool(lv is not None and str(name).lower() in LIVE_STRATEGIES and lv.enabled())
+_SAFE=('at','action','ticker','side','limit','want','filled','http','error')
+def _scrub(v):
+    v=str(v)
+    if v.startswith('balance'): return 'balance error'
+    return re.sub(r'cash \$-?[\d.]+,? ?','',v)[:200]
+def _safe(o):
+    return {k:(_scrub(o[k]) if k=='error' and o.get(k) is not None else o.get(k)) for k in _SAFE if k in o}
 def _xrp(x): return 'XRP' in str(x or '').upper()
 class GapLive:
     def __init__(s,lv,opener,log=print):
         s.lv=lv; s.opener=opener; s.log=log; s.lk=threading.Lock()
         s.stat=dict(signals=0,blocked=0,attempts=0,filled=0,lastReason=None,lastAt=None)
+        s.recent=collections.deque(maxlen=10)   # diagnostics only: last 10 live attempt records
+    def _rec(s,p,reason,filled):
+        try: s.recent.append(dict(at=time.time(),pair=p.get('pair'),ticker=p.get('ticker'),side=p.get('side'),
+                                  signalPrice=p.get('price') or p.get('entry'),reason=reason,filled=filled))
+        except Exception: pass
+    def _why(s):
+        lv=s.lv; return str(getattr(lv,'lastBuyDetail',None) or getattr(lv,'lastBuy',None) or 'execution guard (no reason recorded)')
     # persisted counters live on the Live object (saved in its Mongo state doc)
     def used(s): return int(getattr(s.lv,'gapLiveUsed',0) or 0) if s.lv is not None else 0
     def disabled(s): return bool(getattr(s.lv,'gapLiveDisabled',False)) if s.lv is not None else True
@@ -51,7 +65,9 @@ class GapLive:
                 s.stat['attempts']+=1
                 fill=s.lv.buy(p['asset'],p['ticker'],p['side'],1.0,float(p.get('price') or p.get('entry')),usd=USD)
                 if not fill or not fill.get('contracts'):
-                    s.stat.update(lastReason='no fill: '+str(getattr(s.lv,'lastBuy',None) or 'execution guard'),lastAt=time.time()); return None
+                    why=s._why(); s._rec(p,why,0)
+                    s.stat.update(lastReason='no fill: '+why,lastAt=time.time()); return None
+                s._rec(p,'filled',fill.get('contracts'))
                 s.lv.gapLiveUsed=s.used()+1
                 if s.lv.gapLiveUsed>=MAX_TRADES: s.lv.gapLiveDisabled=True
                 s.lv.persist()
@@ -63,13 +79,25 @@ class GapLive:
             s.log('GAPLIVE open',p.get('pair'),p.get('ticker'),p.get('side'),fill.get('price'),fill.get('contracts'),f'{s.used()}/{MAX_TRADES}')
             return t
         except Exception as e:
-            s.stat.update(lastReason=f'error: {type(e).__name__}: {e}',lastAt=time.time()); s.log('GAPLIVE err',e); return None
+            s.stat.update(lastReason=f'error: {type(e).__name__}: {e}',lastAt=time.time()); s._rec(p if isinstance(p,dict) else {},f'error: {type(e).__name__}',0); s.log('GAPLIVE err',e); return None
+    def order_log(s,n=10):
+        """Last n live order-log entries for gap-live tickers (Rule A pairs' laggard legs), safe fields only."""
+        try:
+            tks={r.get('ticker') for r in s.recent if r.get('ticker')}
+            out=[]
+            for o in list(getattr(s.lv,'orders',None) or [])[::-1]:
+                tk=str(o.get('ticker') or '')
+                if not (tk in tks or (o.get('action') in ('buy','buy-skip','frac-test') and tk[:5] in ('KXBTC','KXETH','KXSOL'))): continue
+                out.append(_safe(o))
+                if len(out)>=n: break
+            return out
+        except Exception as e: return [dict(error=f'order log unavailable: {type(e).__name__}')]
     def summary(s,trades):
         lt=[t for t in trades if t.get('gapLive')]
         cl=[t for t in lt if t.get('status')!='open']
         return dict(enabled=ENABLED,active=s.active(),liveStrategies=sorted(LIVE_STRATEGIES),used=s.used(),max=MAX_TRADES,
                     autoDisabled=s.disabled(),usd=USD,rules=sorted(RULES),pairs=sorted(PAIRS),exit='hold to settlement',
                     liveEngine=dict(envAllow=bool(s.lv and s.lv.allowed()),paused=bool(s.lv and s.lv.paused),killSwitch=bool(s.lv and s.lv.killed)),
-                    stats=dict(s.stat),open=[t for t in lt if t.get('status')=='open'],closed=cl,
+                    stats=dict(s.stat),recentAttempts=list(s.recent)[::-1],recentOrders=s.order_log(),open=[t for t in lt if t.get('status')=='open'],closed=cl,
                     results=dict(trades=len(lt),closed=len(cl),wins=sum(1 for t in cl if (t.get('pnl') or 0)>0),
                                  losses=sum(1 for t in cl if (t.get('pnl') or 0)<=0),pnl=round(sum(t.get('pnl') or 0 for t in cl),2)))
