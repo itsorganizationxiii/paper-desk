@@ -1019,7 +1019,7 @@ def _persist_boot():
         o=mk_.get(GAPS.doc_id(t))
         if o is None or GAPS._rank(t)>GAPS._rank(o): GP.upsert('gap_trades',GAPS.doc_id(t),t); n+=1
     GP.ST['seeded']['gap_trades']=n if GP.enabled() else 0
-    GAPS.SINK[0]=lambda t:GP.upsert('gap_trades',GAPS.doc_id(t),t)
+    GAPS.SINK[0]=lambda t:GP.upsert('gap_trades',GAPS.doc_id(t),json.loads(json.dumps(t,default=str)))  # deep copy in the writer-thread-safe way
     # tick logs: newest ring from Mongo + seed rows (within TTL); seed rows are re-inserted idempotently (_id = kind|ts_ms)
     cut=(time.time()-GP.LOG_TTL_DAYS*86400)*1000
     try:
@@ -1337,6 +1337,7 @@ class H(SimpleHTTPRequestHandler):
         elif p=='/api/cryptogap': b=json.dumps(list(SPEC.CRYPTO_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/gapexits' or (p=='/api/gapshadow' and 'summary=1' in s.path): b=json.dumps(dict(shadow=GAPS.variant_summary('shadow'),paper=GAPS.variant_summary('paper')),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapshadow': b=json.dumps(GAPS.snapshot(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/metalgap': b=json.dumps(list(SPEC.METAL_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/predstats': b=json.dumps(PL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)

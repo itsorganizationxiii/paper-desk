@@ -58,6 +58,25 @@ PAPER=[]; _pseen=set()
 QUOTE=[None]   # fn(ticker)->{'yesBid','yesAsk'} fresh quote (server: websocket cache) or None
 SINK=[None]    # fn(trade) persistence hook; must be non-blocking
 PSTAT=dict(opened=0,nofill=0,skipped=0)
+# SHADOW exit variants (Nov 9, research only): every gap trade (shadow + paper) logs what each take-profit variant WOULD have
+# done; the trade itself is untouched (still held to settlement / B cash-out). Env GAP_EXIT_VARIANTS, comma list of
+#   trail:<arm>:<drop>  arm once our bid >= entry+arm, exit when bid <= peak-drop
+#   tpat:<level>        exit when our bid >= level
+#   tpplus:<c>          exit when our bid >= entry+c
+#   time:<sec>          exit when leftSec <= sec and exit value (after fee) > stake
+EXIT_VARIANTS_ENV=E('GAP_EXIT_VARIANTS','trail:0.15:0.10,tpat:0.75,time:360')
+def _parse_variants(v):
+    out={}
+    for x in (v or '').split(','):
+        p=[y.strip() for y in x.split(':') if y.strip()]
+        try:
+            if p[0]=='trail' and len(p)==3: out[f'trail{round(float(p[1])*100)}/{round(float(p[2])*100)}']=('trail',float(p[1]),float(p[2]))
+            elif p[0]=='tpat' and len(p)==2: out[f'tp@{round(float(p[1])*100)}c']=('tpat',float(p[1]))
+            elif p[0]=='tpplus' and len(p)==2: out[f'tp+{round(float(p[1])*100)}c']=('tpplus',float(p[1]))
+            elif p[0]=='time' and len(p)==2: out[f'time{int(float(p[1]))}s']=('time',float(p[1]))
+        except Exception: pass
+    return out
+VARIANTS=_parse_variants(EXIT_VARIANTS_ENV)
 HIST=collections.defaultdict(lambda:collections.deque(maxlen=64))  # asset -> (ts, close, yesMid)
 def fee(c,p): return math.ceil(7*c*p*(1-p))/100
 def _f(x):
@@ -296,6 +315,58 @@ def manage_exits(mkts,now=None):
             print('GAPSHADOW cash',t['id'],bid,t['pnl'],flush=True)
         except Exception as e: print('gapshadow exit err',e,flush=True)
     return out
+def _our_bid(t,m):
+    if t['side']=='YES': return _f(m.get('yesBid'))
+    a=_f(m.get('yesAsk')); return None if a is None else round(1-a,4)
+def _vval(t,bid):
+    c=t['contracts']; return round(c*bid-fee(c,bid)-t['stake'],4)
+def track_variants(mkts,now=None):
+    """Update shadow exit variants on every open/pending gap trade. Never changes the trade's own status/pnl."""
+    if not VARIANTS: return []
+    now=time.time() if now is None else now; hit=[]
+    for t in TRADES+PAPER:
+        try:
+            if now>=t['closesAt'] or t.get('settle') is not None: continue
+            m=mkts.get(t.get('laggard') or t.get('asset'))
+            if not m or m.get('ticker')!=t['ticker']: continue
+            bid=_our_bid(t,m)
+            if bid is None or bid<=0: continue
+            ev=t.setdefault('exitVariants',{}); left=round(t['closesAt']-now,1); changed=False
+            for name,spec in VARIANTS.items():
+                v=ev.setdefault(name,dict(status='open',peak=None))
+                if v.get('status')!='open': continue
+                v['peak']=round(max(v.get('peak') or 0,bid),4); go=False
+                if spec[0]=='trail': go=v['peak']>=t['entry']+spec[1]-1e-9 and bid<=v['peak']-spec[2]+1e-9
+                elif spec[0]=='tpat': go=bid>=spec[1]-1e-9
+                elif spec[0]=='tpplus': go=bid>=t['entry']+spec[1]-1e-9
+                elif spec[0]=='time': go=left<=spec[1] and _vval(t,bid)>0
+                if go: v.update(status='exited',exit=bid,leftSec=left,at=now,pnl=_vval(t,bid)); changed=True
+            if changed: hit.append(t); _emit(t)
+        except Exception as e: print('gap variant err',e,flush=True)
+    return hit
+def _finish_variants(t,hp):
+    ev=t.get('exitVariants')
+    if not ev: return
+    for v in ev.values():
+        if v.get('status')=='open': v.update(status='held',pnl=hp,exit=None,leftSec=0)
+def variant_summary(book=None):
+    with _lk: ts=[_cp(t) for t in (TRADES if book=='shadow' else PAPER if book=='paper' else TRADES+PAPER)]
+    out={}
+    done=[t for t in ts if t.get('exitVariants') and t.get('hold_pnl') is not None]
+    for name in VARIANTS:
+        rows=[(t,t['exitVariants'].get(name)) for t in done if t['exitVariants'].get(name) and t['exitVariants'][name].get('pnl') is not None]
+        p=[v['pnl'] for _,v in rows]; h=[t['hold_pnl'] for t,_ in rows]
+        cum=pk=dd=0
+        for x in p: cum+=x; pk=max(pk,cum); dd=max(dd,pk-cum)
+        by={}
+        for t,v in rows:
+            g=by.setdefault(t.get('pair'),[0,0,0.0,0.0]); g[0]+=1; g[1]+=(v['pnl']>0); g[2]+=v['pnl']; g[3]+=t['hold_pnl']
+        out[name]=dict(n=len(p),wins=sum(1 for x in p if x>0),losses=sum(1 for x in p if x<=0),exited=sum(1 for _,v in rows if v.get('status')=='exited'),
+                       pnl=round(sum(p),2),holdPnl=round(sum(h),2),vsHold=round(sum(p)-sum(h),2),maxDD=round(dd,2),
+                       byPair={k:dict(n=g[0],wins=g[1],pnl=round(g[2],2),holdPnl=round(g[3],2)) for k,g in by.items()})
+    return dict(variants={k:list(v) for k,v in VARIANTS.items()},env=EXIT_VARIANTS_ENV,summary=out,
+                tracking=sum(1 for t in ts if t.get('exitVariants') and t.get('hold_pnl') is None),
+                note='shadow exit variants only: what each take-profit WOULD have done; trades themselves still hold to settlement')
 def on_tick(mkts,now=None):
     """mkts: {asset: kalshi mk() dict}. Paper only."""
     if not ENABLED: return []
@@ -305,6 +376,8 @@ def on_tick(mkts,now=None):
         mkts={k:v for k,v in (mkts or {}).items() if isinstance(v,dict)}
         record(mkts,now)
         cashed=manage_exits(mkts,now)
+        try: track_variants(mkts,now)
+        except Exception as e: print('gap variants err',e,flush=True)
         for a,b in PAIRS:
             for r,fn in (('A',lambda:decide_a(a,b,mkts,now)),('gap20',lambda:decide(a,b,mkts.get(a),mkts.get(b),now))):
                 if r not in RULES: continue
@@ -336,6 +409,7 @@ def settle(result_fn,now=None):
             if r not in ('yes','no'): continue
             win=(r=='yes')==(t['side']=='YES')
             hp=round((t['contracts'] if win else 0)-t['stake'],2)
+            _finish_variants(t,hp)
             if t['status']=='cashed': t.update(settle=r,hold_pnl=hp,closedAt=now)
             else: t.update(status='won' if win else 'lost',settle=r,exit=1.0 if win else 0.0,pnl=hp,hold_pnl=hp,closedAt=now)
             if is_paper(t): t['settledBy']='kalshi'
@@ -343,10 +417,14 @@ def settle(result_fn,now=None):
         except Exception as e: print('gapshadow settle err',e,flush=True)
     if ch: _save()
     return ch
+def _cp(t):
+    d=dict(t)
+    if isinstance(d.get('exitVariants'),dict): d['exitVariants']={k:dict(v) for k,v in list(d['exitVariants'].items())}
+    return d
 def snapshot():
-    with _lk: return [dict(t) for t in TRADES]
+    with _lk: return [_cp(t) for t in TRADES]
 def paper_snapshot():
-    with _lk: return [dict(t) for t in PAPER]
+    with _lk: return [_cp(t) for t in PAPER]
 def paper_summary():
     with _lk: ps=[dict(t) for t in PAPER]
     def agg(ts):
@@ -359,4 +437,4 @@ def paper_summary():
     return dict(enabled=PAPER_ENABLED,rules=sorted(PAPER_RULES),pairs=sorted(PAPER_PAIRS),stake=PAPER_STAKE,strongStake=STRONG_STAKE,
                 strongGate=dict(unanimousConfirm=True,minOf=STRONG_MIN_OF,minGap=STRONG_GAP,leftSec=[STRONG_MIN_LEFT,STRONG_MAX_LEFT]),
                 all=agg(ps),byTier=tiers,byRulePair={k:agg(v) for k,v in by.items()},
-                stats=dict(PSTAT),note='gap PAPER book: separate from Spec paper balance/ledger math; never live')
+                exitVariants=variant_summary('paper'),stats=dict(PSTAT),note='gap PAPER book: separate from Spec paper balance/ledger math; never live')
