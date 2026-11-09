@@ -182,7 +182,7 @@ del _os.environ['GAP_PAPER_STRONG_STAKE']; del _os.environ['GAP_STRONG_GAP']; G=
 chk('csv tags strong tier',"g.get('tag') or 'gap-paper'" in open('server.py').read() and ":conf='+str(g.get('conf') or 'normal')" in open('server.py').read())
 # ---- Nov 9: SHADOW exit variants (trail15/10, tp@75c, time360s) logged per trade; trades unchanged ----
 G=importlib.reload(G); G.load(tempfile.mkdtemp()); G.HIST.clear(); G.QUOTE[0]=None; G.SINK[0]=None
-chk('default variants',set(G.VARIANTS)=={'trail15/10','tp@75c','time360s'})
+chk('default variants',set(G.VARIANTS)=={'trail15/10','tp@75c','time360s','hold'})
 chk('variant env parser',set(G._parse_variants('trail:0.2:0.05,tpat:0.8,tpplus:0.3,time:300,bad,tpat:x'))=={'trail20/5','tp@80c','tp+30c','time300s'})
 C9=20000.0
 def vset(c,btc,eth=0.62,sol=0.7,xrp=0.65,doge=0.7):
@@ -199,9 +199,13 @@ chk('trail exits on 10c giveback',ta['exitVariants']['trail15/10']['status']=='e
 G.on_tick(vset(C9,0.66),C9-300)   # <=360 left & in profit -> time exits
 chk('time360 exits when in profit late',ta['exitVariants']['time360s']['status']=='exited' and ta['exitVariants']['time360s']['leftSec']==300)
 chk('paper trade tracked too',tp['exitVariants']['tp@75c']['status']=='exited')
-chk('trades themselves unchanged (still open, same stake)',(ta['status'],ta['pnl'],tp['status'],tp['pnl'],tp['stake'])==st0)
+chk('shadow trade unchanged (still open)',(ta['status'],ta['pnl'])==st0[:2])
+chk('PAPER trade booked trail exit at bid minus fee, stake unchanged',tp['status']=='exited' and tp['stake']==st0[4] and abs(tp['pnl']-round(tp['contracts']*tp['exit']-G.fee(tp['contracts'],tp['exit'])-tp['stake'],2))<1e-9 and tp['exit']<=tp['peakBid']-0.10+1e-9 and tp['exitVariants']['trail15/10']['exit']==tp['exit'])
+chk('hold variant never exits',tp['exitVariants']['hold']['status']=='open')
 G.settle(lambda tk:'no',C9+10)
 chk('settled as loss; variants keep their exits',ta['status']=='lost' and ta['exitVariants']['tp@75c']['pnl']>0)
+chk('exited paper trade keeps booked pnl, records hold at settle',tp['status']=='exited' and tp['settle']=='no' and tp['hold_pnl']==-tp['stake'] and tp['pnl']>tp['hold_pnl'] and tp['exitVariants']['hold']['pnl']==tp['hold_pnl'])
+_ps=G.paper_summary(); chk('gappaper reports exit mode + trail exits',_ps['exitMode'].startswith('trail:+15c') and _ps['all']['trailExits']>=1 and _ps['all']['pnlVsHold']>0)
 vs=G.variant_summary('shadow')['summary']
 chk('variant summary vs hold',vs['tp@75c']['n']>=1 and vs['tp@75c']['vsHold']>0 and 'BTC-ETH' in vs['tp@75c']['byPair'] and 'maxDD' in vs['trail15/10'])
 chk('gappaper summary includes exitVariants',G.paper_summary()['exitVariants']['summary']['time360s']['n']>=1)
@@ -209,6 +213,7 @@ chk('gappaper summary includes exitVariants',G.paper_summary()['exitVariants']['
 C10=C9+900; G.on_tick(vset(C10,0.50),C10-700); G.on_tick(vset(C10,0.45),C10-300)
 tb=[t for t in G.TRADES if t['rule']=='A' and t['closesAt']==C10 and t['pair']=='BTC-ETH'][0]; G.settle(lambda tk:'no',C10+10)
 chk('untriggered variants -> held at hold pnl',all(v['status']=='held' and v['pnl']==tb['hold_pnl'] for v in tb['exitVariants'].values()))
+tq=[t for t in G.PAPER if t['closesAt']==C10]; chk('untriggered paper trade holds to settlement',tq and all(t['status'] in ('won','lost') and t['pnl']==t['hold_pnl'] for t in tq))
 sn=G.snapshot(); sn[0].setdefault('exitVariants',{})['x']={}
 chk('snapshot deep-copies variants',('x' not in (G.TRADES[0].get('exitVariants') or {})))
 print('ALL PASS' if ok else 'SOME FAILED'); raise SystemExit(0 if ok else 1)

@@ -1291,7 +1291,7 @@ class H(SimpleHTTPRequestHandler):
                 except Exception as e: d['live']['cooldowns']={'error':str(e)}
                 try:  # gap PAPER book shown in the paper ledger (display copies only; Spec stats/balance above exclude it)
                     d['gapPaper']=GAPS.paper_summary(); d['persistence_gap']=GP.stats()
-                    d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}") for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
+                    d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}"+(f"; {g['exitReason']}" if g.get('exitReason') else '')) for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
                 except Exception as e: d['gapPaper']=dict(error=str(e)[:200])
                 if 'full=1' not in s.path: slim_status(d)
                 b=json.dumps(d).encode()
@@ -1306,7 +1306,7 @@ class H(SimpleHTTPRequestHandler):
                 for g in GAPS.snapshot(): w.writerow([g.get('id'),'shadow',et(g.get('openedAt')),et(g.get('closedAt')),g.get('laggard'),g.get('ticker',''),g.get('side'),g.get('entry'),g.get('stake'),0,g.get('gapDown'),'gapshadow:'+str(g.get('rule','gap20'))+':'+str(g.get('pair','')),g.get('status'),g.get('exit') if g.get('exit') is not None else '','',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','','gapshadow'])
             except Exception: pass
             try:  # gap PAPER book (Rule A BTC-ETH / SOL-XRP): real paper trades, never live, separate from Spec balance
-                for g in GAPS.paper_snapshot(): w.writerow([g.get('id'),'paper',et(g.get('openedAt')),et(g.get('closedAt')),g.get('asset'),g.get('ticker',''),g.get('side'),g.get('price'),g.get('stake'),0,g.get('gapDown'),'gap:'+str(g.get('rule'))+':'+str(g.get('pair',''))+':conf='+str(g.get('conf') or 'normal'),g.get('status'),g.get('exit') if g.get('exit') is not None else '','',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','',g.get('tag') or 'gap-paper'])
+                for g in GAPS.paper_snapshot(): w.writerow([g.get('id'),'paper',et(g.get('openedAt')),et(g.get('closedAt')),g.get('asset'),g.get('ticker',''),g.get('side'),g.get('price'),g.get('stake'),0,g.get('gapDown'),'gap:'+str(g.get('rule'))+':'+str(g.get('pair',''))+':conf='+str(g.get('conf') or 'normal'),g.get('status'),g.get('exit') if g.get('exit') is not None else '',g.get('exitReason') or '',g.get('settle') or '',g.get('pnl') if g.get('pnl') is not None else '',g.get('hold_pnl') if g.get('hold_pnl') is not None else '','','',g.get('tag') or 'gap-paper'])
             except Exception: pass
             for x in (TFX.ST.get('manual') or {}).get('tickers',[]): w.writerow(['','live','','',x['ticker'].split('15M')[0].removeprefix('KX'),x['ticker'],'','','','','','manual (not bot)','settled','','','',x['pnl'],'',x['pnl'],'kalshi','manual'])
             b=buf.getvalue().encode(); s.send_response(200); s.send_header('Content-Type','text/csv; charset=utf-8')

@@ -65,7 +65,11 @@ PSTAT=dict(opened=0,nofill=0,skipped=0)
 #   tpat:<level>        exit when our bid >= level
 #   tpplus:<c>          exit when our bid >= entry+c
 #   time:<sec>          exit when leftSec <= sec and exit value (after fee) > stake
-EXIT_VARIANTS_ENV=E('GAP_EXIT_VARIANTS','trail:0.15:0.10,tpat:0.75,time:360')
+#   hold                never exits (hold-to-settle reference)
+EXIT_VARIANTS_ENV=E('GAP_EXIT_VARIANTS','trail:0.15:0.10,tpat:0.75,time:360,hold')
+# REAL gap PAPER exit (Nov 9, owner t1004): the gap PAPER book (never live) books a trailing take-profit: arm once our bid
+# >= entry+ARM, sell at the bid (minus Kalshi fee) when bid <= peak-DROP; otherwise hold to settlement. Shadow book unchanged.
+PAPER_EXIT_ENV=E('GAP_PAPER_EXIT','trail:0.15:0.10')
 def _parse_variants(v):
     out={}
     for x in (v or '').split(','):
@@ -75,9 +79,18 @@ def _parse_variants(v):
             elif p[0]=='tpat' and len(p)==2: out[f'tp@{round(float(p[1])*100)}c']=('tpat',float(p[1]))
             elif p[0]=='tpplus' and len(p)==2: out[f'tp+{round(float(p[1])*100)}c']=('tpplus',float(p[1]))
             elif p[0]=='time' and len(p)==2: out[f'time{int(float(p[1]))}s']=('time',float(p[1]))
+            elif p[0]=='hold' and len(p)==1: out['hold']=('hold',)
         except Exception: pass
     return out
 VARIANTS=_parse_variants(EXIT_VARIANTS_ENV)
+def _parse_paper_exit(v):
+    p=[y.strip() for y in (v or '').split(':')]
+    try:
+        if p[0]=='trail' and len(p)==3: return ('trail',float(p[1]),float(p[2]))
+    except Exception: pass
+    return None   # 'hold' / anything else -> hold to settlement
+PAPER_EXIT=_parse_paper_exit(PAPER_EXIT_ENV)
+def paper_exit_mode(): return f'trail:+{round(PAPER_EXIT[1]*100)}c arm/{round(PAPER_EXIT[2]*100)}c giveback, else hold to settlement' if PAPER_EXIT else 'hold to settlement'
 HIST=collections.defaultdict(lambda:collections.deque(maxlen=64))  # asset -> (ts, close, yesMid)
 def fee(c,p): return math.ceil(7*c*p*(1-p))/100
 def _f(x):
@@ -347,10 +360,41 @@ def track_variants(mkts,now=None):
                 elif spec[0]=='tpat': go=bid>=spec[1]-1e-9
                 elif spec[0]=='tpplus': go=bid>=t['entry']+spec[1]-1e-9
                 elif spec[0]=='time': go=left<=spec[1] and _vval(t,bid)>0
+                elif spec[0]=='hold': go=False
                 if go: v.update(status='exited',exit=bid,leftSec=left,at=now,pnl=_vval(t,bid)); changed=True
             if changed: hit.append(t); _emit(t)
         except Exception as e: print('gap variant err',e,flush=True)
     return hit
+def manage_paper_exits(mkts,now=None):
+    """REAL exits for the gap PAPER book only (never live, never Spec): trailing take-profit per PAPER_EXIT.
+    Exit price = our bid (fresh websocket quote when available, else this tick's quote); pnl = contracts*bid - fee - stake."""
+    if not PAPER_EXIT: return []
+    now=time.time() if now is None else now; out=[]; _,arm,drop=PAPER_EXIT
+    for t in PAPER:
+        try:
+            if t.get('status')!='open' or now>=t['closesAt']: continue
+            m=mkts.get(t.get('asset') or t.get('laggard'))
+            if not m or m.get('ticker')!=t['ticker']: continue
+            bid=_our_bid(t,m); src='tick'
+            if QUOTE[0] is not None:
+                try:
+                    fq=QUOTE[0](t['ticker'])
+                    if fq and fq.get('yesBid') is not None and fq.get('yesAsk') is not None:
+                        bid=_f(fq['yesBid']) if t['side']=='YES' else round(1-_f(fq['yesAsk']),4); src='ws'
+                except Exception: pass
+            if bid is None or bid<=0: continue
+            entry=float(t.get('price') or t['entry'])
+            t['peakBid']=round(max(t.get('peakBid') or 0,bid),4)
+            if t['peakBid']>=entry+arm-1e-9:
+                if not t.get('trailArmedAt'): t['trailArmedAt']=now; _emit(t)
+                if bid<=t['peakBid']-drop+1e-9:
+                    xf=fee(t['contracts'],bid); pnl=round(t['contracts']*bid-xf-t['stake'],2)
+                    t.update(status='exited',exit=round(bid,4),exitFee=xf,pnl=pnl,closedAt=now,exitLeftSec=round(t['closesAt']-now,1),exitQuote=src,
+                             exitReason=f"trail: peak {t['peakBid']:.2f} (armed at entry {entry:.2f}+{arm:.2f}) -> bid {bid:.2f}; fee ${xf:.2f}")
+                    PSTAT['trailExits']=PSTAT.get('trailExits',0)+1; out.append(t); _emit(t)
+                    print('GAPPAPER trail exit',t['id'],t['pair'],bid,pnl,flush=True)
+        except Exception as e: print('gappaper exit err',e,flush=True)
+    return out
 def _finish_variants(t,hp):
     ev=t.get('exitVariants')
     if not ev: return
@@ -385,6 +429,8 @@ def on_tick(mkts,now=None):
         cashed=manage_exits(mkts,now)
         try: track_variants(mkts,now)
         except Exception as e: print('gap variants err',e,flush=True)
+        try: pexits=manage_paper_exits(mkts,now)
+        except Exception as e: pexits=[]; print('gappaper exits err',e,flush=True)
         for a,b in PAIRS:
             for r,fn in (('A',lambda:decide_a(a,b,mkts,now)),('gap20',lambda:decide(a,b,mkts.get(a),mkts.get(b),now))):
                 if r not in RULES: continue
@@ -402,14 +448,14 @@ def on_tick(mkts,now=None):
                 t=fn(mkts,now)
                 if t: _add(t,out)
             except Exception as e: print('gapshadow xrp err',r,e,flush=True)
-        if out or cashed: _save()
+        if out or cashed or pexits: _save()
     except Exception as e: print('gapshadow err',e,flush=True)
     return out
 def settle(result_fn,now=None):
     """result_fn(ticker)->'yes'|'no'|None. Open -> settle; cashed -> record hold_pnl only."""
     now=time.time() if now is None else now; ch=False
     todo=[t for t in TRADES if (t.get('status')=='open' or (t.get('status')=='cashed' and t.get('hold_pnl') is None)) and now>=t['closesAt']+5][:6]
-    todo+=[t for t in PAPER if t.get('status')=='open' and now>=t['closesAt']+5][:6]
+    todo+=[t for t in PAPER if (t.get('status')=='open' or (t.get('status')=='exited' and t.get('hold_pnl') is None)) and now>=t['closesAt']+5][:6]
     for t in todo:
         try:
             r=result_fn(t['ticker'])
@@ -418,6 +464,7 @@ def settle(result_fn,now=None):
             hp=round((t['contracts'] if win else 0)-t['stake'],2)
             _finish_variants(t,hp)
             if t['status']=='cashed': t.update(settle=r,hold_pnl=hp,closedAt=now)
+            elif t['status']=='exited': t.update(settle=r,hold_pnl=hp,settledAt=now)   # paper trail exit: keep booked pnl, record hold
             else: t.update(status='won' if win else 'lost',settle=r,exit=1.0 if win else 0.0,pnl=hp,hold_pnl=hp,closedAt=now)
             if is_paper(t): t['settledBy']='kalshi'
             ch=True; _emit(t)
@@ -437,11 +484,13 @@ def paper_summary():
     def agg(ts):
         c=[t for t in ts if t.get('status') not in ('open',None)]
         w=sum(1 for t in c if (t.get('pnl') or 0)>0)
-        return dict(trades=len(ts),closed=len(c),open=len(ts)-len(c),wins=w,losses=len(c)-w,staked=round(sum(t.get('stake') or 0 for t in c),2),pnl=round(sum(t.get('pnl') or 0 for t in c),2))
+        h=[t for t in c if t.get('hold_pnl') is not None]
+        return dict(trades=len(ts),closed=len(c),open=len(ts)-len(c),wins=w,losses=len(c)-w,trailExits=sum(1 for t in c if t.get('status')=='exited'),staked=round(sum(t.get('stake') or 0 for t in c),2),pnl=round(sum(t.get('pnl') or 0 for t in c),2),
+                    holdPnl=round(sum(t['hold_pnl'] for t in h),2),pnlVsHold=round(sum((t.get('pnl') or 0)-t['hold_pnl'] for t in h),2))
     by={}
     for t in ps: by.setdefault(f"{t.get('rule')} {t.get('pair')}",[]).append(t)
     tiers={k:agg([t for t in ps if (t.get('conf') or 'normal')==k]) for k in ('strong','normal')}
-    return dict(enabled=PAPER_ENABLED,rules=sorted(PAPER_RULES),pairs=sorted(PAPER_PAIRS),stake=PAPER_STAKE,strongStake=STRONG_STAKE,
+    return dict(enabled=PAPER_ENABLED,exitMode=paper_exit_mode(),exitEnv=PAPER_EXIT_ENV,rules=sorted(PAPER_RULES),pairs=sorted(PAPER_PAIRS),stake=PAPER_STAKE,strongStake=STRONG_STAKE,
                 strongGate=dict(unanimousConfirm=True,minOf=STRONG_MIN_OF,minGap=STRONG_GAP,leftSec=[STRONG_MIN_LEFT,STRONG_MAX_LEFT]),
                 all=agg(ps),byTier=tiers,byRulePair={k:agg(v) for k,v in by.items()},
-                exitVariants=variant_summary('paper'),stats=dict(PSTAT),note='gap PAPER book: separate from Spec paper balance/ledger math; never live')
+                exitVariants=variant_summary('paper'),stats=dict(PSTAT),note='gap PAPER book: separate from Spec paper balance/ledger math; never live. Exits: '+paper_exit_mode()+'; exitVariants stay shadow comparisons')
