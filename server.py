@@ -1079,6 +1079,7 @@ def _gap_live_open(p,fill,strike):
     with lock: return pt.openLiveGap(p,fill,strike)
 GAPLIVE=GL.GapLive(LV,_gap_live_open,log=lambda *a:print(*a,flush=True))
 GAPS.LIVE[0]=GAPLIVE.on_paper
+GAPLIVE.async_=True; GAPLIVE.emit=GAPS._emit   # live buy on its own thread the moment the paper signal opens
 # SHADOW-ONLY entry filters on gap trades (tags only; skip2L per book: gapShadow = rules A/B/C combined, gapPaper = paper book)
 def _gap_ftag(t,book):
     if book=='paper': FS.tag(t,'gapPaper',list(GAPS.PAPER),t.get('laggard') or t.get('asset'),t.get('price') or t.get('entry'))

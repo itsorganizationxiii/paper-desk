@@ -17,6 +17,8 @@ ASSETS=None if not _assets or _assets.upper()=='ALL' else {a.strip().upper() for
 HARD_MAX_USD=2.0
 STALE_GUARD=True
 STALE_KILL_N=3
+OWNER_CACHE_SEC=float(os.environ.get('LIVE_OWNER_CACHE_SEC','10'))   # lease TTL is 45s: a success <10s ago proves no other instance can own
+GAP_CASH_CACHE_SEC=300.0   # fixed-$ gap-live stake: reuse last known cash if < 5 min old and >= $2
 STALE_RETRY_MAX=int(os.environ.get('GAP_STALE_RETRY_MAX','5'))   # gap-live: max stale-quote tries per ticker
 HARD_DAILY_LOSS=0.0
 def _daily_cap(): return DAILY_LOSS if DAILY_LOSS>0 else (HARD_DAILY_LOSS if HARD_DAILY_LOSS>0 else float("inf"))
@@ -110,7 +112,7 @@ class Live:
     def ws_status(s):
         try:
             if not s.ws: return None
-            st=s.ws.status(); return {k:st.get(k) for k in ('connected','subscribed','quotes','lastMsgAge','reconnects','error')}
+            st=s.ws.status(); return {k:st.get(k) for k in ('connected','subscribed','quotes','lastMsgAge','reconnects','error','lag','lagMax60','cbBacklog','cbDropped')}
         except Exception as e: return dict(error=type(e).__name__)
     def _rest_ask(s,ticker,side):
         """Public market quote over REST (read-only); our-side ask or None."""
@@ -120,8 +122,14 @@ class Live:
         except Exception: return None
     def allowed(s): return ENV_ALLOW and keys_present()
     def owner(s):
+        # Each lease check is 2 Mongo round trips; it was called per WS message and many times per buy, which
+        # backed up the WS consumer (~100s behind) and the buy path. A lease success renews hb and no other
+        # instance can take over until hb+45s (TraderLease ttl), so a success < OWNER_CACHE_SEC ago is still proof.
+        now=time.time()
+        if s.lease_ok is not None and now-getattr(s,'_ownOkAt',0)<OWNER_CACHE_SEC: return True
         try: ok=s.lease_ok is not None and bool(s.lease_ok())
         except Exception: ok=False
+        s._ownOkAt=now if ok else 0
         if not ok and s.own_orders and not s._lost_cleanup:
             s._lost_cleanup=True
             threading.Thread(target=s.cancel_owned,daemon=True).start()
@@ -165,12 +173,37 @@ class Live:
             if s.dayPnl<=-_daily_cap() and not s.killed: s.killed=True; s.killReason=f'realized live loss ${-s.dayPnl:.2f} today >= ${_daily_cap():.2f}'
             s.persist()
     def log(s,defer=False,**kw):
+        # In-memory append is immediate; the Mongo orderlog insert + state persist run on a background writer
+        # so a slow Mongo never sits between a signal and its order (was synchronous, under s.lock).
+        doc=dict(at=time.time(),**kw)
         with s.lock:
-            s.orders.append(dict(at=time.time(),**kw)); s.orders=s.orders[-200:]
+            s.orders.append(doc); s.orders=s.orders[-200:]
+        s._bg(doc,not defer)
+    def _bg(s,doc,persist):
+        q=getattr(s,'_logq',None)
+        if q is None:
+            with s.lock:
+                q=getattr(s,'_logq',None)
+                if q is None:
+                    q=s._logq=queue.Queue(); threading.Thread(target=s._logw,daemon=True).start()
+        q.put((doc,persist))
+    def _logw(s):
+        while True:
+            doc,per=s._logq.get(); batch=[(doc,per)]
+            try:
+                while True: batch.append(s._logq.get_nowait())
+            except queue.Empty: pass
             if getattr(s,'orderlog',None) is not None:
-                try: s.orderlog.insert_one(dict(at=time.time(),**kw))
-                except Exception as e: s.lastError=f'orderlog: {e}'
-            if not defer: s.persist()
+                for d,_ in batch:
+                    try: s.orderlog.insert_one(dict(d))
+                    except Exception as e: s.lastError=f'orderlog: {e}'
+            if any(p for _,p in batch):
+                try: s.persist()
+                except Exception as e: s.lastError=f'persist: {e}'
+    def flush_log(s,timeout=5.0):
+        """Test/shutdown helper: wait until queued log writes are done."""
+        end=time.time()+timeout
+        while getattr(s,'_logq',None) is not None and not s._logq.empty() and time.time()<end: time.sleep(0.02)
     def balance(s):
         # Kalshi balance endpoint: 1 call/sec, no burst. Space calls >=2s apart and reuse the last value in between.
         with s.lock:
@@ -341,6 +374,9 @@ class Live:
     def buy(s,asset,ticker,side,frac,ref,sizer=None,shadow=False,mode='live',usd=None,quote_wait=0.0):
         """Synchronous real buy. Returns dict(contracts,price,fee,cost,orderId,cash) when anything filled, else None (logged)."""
         a=dict(asset=asset,ticker=ticker,side=side)
+        T=s.lastBuyTiming={}; _t=[time.time()]
+        def mark(k):
+            n=time.time(); T[k]=round(T.get(k,0)+n-_t[0],3); _t[0]=n
         # Diagnostics only (t1022): every None return records a specific reason in lastBuy/lastBuyDetail.
         # Exact codes 'blocked'/'edge'/'nofill' are kept for existing callers; trading logic unchanged.
         s.lastBuy=None; s.lastBuyDetail=None; s.lastBuyRetry=False
@@ -354,16 +390,29 @@ class Live:
         if ticker in s.tried: s.lastBuy=s.lastBuyDetail='already tried this ticker'; return None
         s.tried.add(ticker)
         if s.killed: s.lastBuy=s.lastBuyDetail=f'kill switch: {s.killReason}'; s.log(action='buy-skip',error=f'kill switch: {s.killReason}',**a); return None
-        stale_reset=True
+        mark('guards')
+        # gap-live fixed stake: fetch cash in parallel with the quote checks (same single balance call as before), or
+        # reuse a recent cash value (< 5 min, >= $2) since the stake is a fixed $1 capped by HARD_MAX_USD.
+        bal=None
+        if usd is not None and quote_wait>0:
+            if s.cash is not None and s.cashAt and time.time()-s.cashAt<GAP_CASH_CACHE_SEC and s.cash>=2.0: pass
+            elif not (s.cash is not None and s.cashAt and time.time()-s.cashAt<45):
+                bal={}
+                def _pre(b=bal):
+                    try: b['v']=s.balance()
+                    except Exception as e: b['e']=e
+                bal['th']=threading.Thread(target=_pre,daemon=True); bal['th'].start()
+        rest=None; stale_reset=True
         if STALE_GUARD and s.ws and not shadow and s.wsq(ticker) is None:
             w=None
-            if quote_wait>0:   # gap-live: make sure it is subscribed, then wait briefly for the first/next push
+            if quote_wait>0 and not s.ws_info(ticker).get('have'):   # gap-live: no first push yet -> subscribe, wait briefly
                 s.prewatch(ticker); end=time.time()+quote_wait
-                while w is None and time.time()<end: time.sleep(0.25); w=s.wsq(ticker)
+                while w is None and time.time()<end: time.sleep(0.1); w=s.wsq(ticker)
             if w is None:
                 info=s.ws_info(ticker)
                 first=bool(info.get('connected')) and not info.get('have')   # just subscribed, no first push yet
                 rest=s._rest_ask(ticker,side) if quote_wait>0 else None
+                mark('quote')
                 if rest is None:
                     if not first:   # genuine staleness (quote went stale / WS down) still counts toward the kill
                         s.staleN=getattr(s,'staleN',0)+1
@@ -378,7 +427,16 @@ class Live:
                 stale_reset=False   # WS stale but REST public quote is live: trade on REST price, leave staleN untouched
                 s.log(action='ws-stale-rest-ok',error=None,wsHave=info.get('have'),wsConnected=info.get('connected'),**a)
         if stale_reset: s.staleN=0
-        try: cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
+        mark('quote')
+        try:
+            if bal is not None and bal.get('th') is not None:
+                bal['th'].join(15)
+                if 'e' in bal: raise bal['e']
+                if 'v' not in bal: raise TimeoutError('balance prefetch timed out')
+                cash=bal['v']
+            elif usd is not None and quote_wait>0 and s.cash is not None and s.cashAt and time.time()-s.cashAt<GAP_CASH_CACHE_SEC and s.cash>=2.0: cash=s.cash
+            else: cash=s.cash if (s.cash is not None and s.cashAt and time.time()-s.cashAt<45) else s.balance()
+            mark('balance')
         except Exception as e: s.lastBuy=s.lastBuyDetail=f'balance error: {type(e).__name__}'; s.lastError=f'balance: {e}'; s.log(action='buy-skip',error=s.lastError,**a); return None
         maxpx=min(0.99,round(ref+MAX_CHASE,2)) if sizer is None else 0.99
         fixed=usd; usd=frac*cash
@@ -388,7 +446,8 @@ class Live:
         usd=min(usd,HARD_MAX_USD)
         c=fc=0; fee=0.0; oid=None; err=None; px=None; n=0; cost=0.0
         for attempt in range(2):
-            ask=s._quote(ticker,side,'ask')
+            ask=rest if (attempt==0 and rest is not None) else s._quote(ticker,side,'ask')   # REST ask fetched just above
+            mark('price')
             px=round(ask,2) if ask else min(0.99,round(ref+BUY_SLIP,2))
             if sizer is not None:
                 f2=sizer(px)
@@ -407,7 +466,7 @@ class Live:
             if n<mn:
                 if not fc: s.lastBuy=s.lastBuyDetail=f'<{mn} contract affordable (usd {usd:.2f}, px {px})'; s.log(action='buy-skip',error=f'<{mn} contract affordable (cash ${cash:.2f}, frac {frac:.3f}, px {px})',**a); return None
                 break
-            c,f1,p1,fe1,oid,err=s._order(ticker,side,'buy',n,px)
+            c,f1,p1,fe1,oid,err=s._order(ticker,side,'buy',n,px); mark('order')
             if s.fracOK is None and n!=int(n):
                 if err and c not in (200,201) and not f1 and 'insufficient' not in str(err):
                     s.fracOK=False; s.log(action='frac-test',error=f'Kalshi rejected fractional count {n}: {err}; using whole contracts',**a)

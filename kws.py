@@ -1,6 +1,7 @@
 # Kalshi WebSocket price feed (ticker channel). Pushes best bid/ask so the bot doesn't poll REST.
 # Purely a data source: callers use quote() when fresh and fall back to REST otherwise. Never raises into callers.
-import json, time, threading, collections
+import json, time, threading, collections, queue
+CBQ_MAX=50000
 TRADE_MAX=200000; TRADE_KEEP=4*3600
 WS_URL=None; FRESH=3.0
 class Feed:
@@ -8,7 +9,16 @@ class Feed:
         s.url=url; s.hdr=headers_fn; s.q={}; s.want=set(); s.subbed=set(); s.ws=None; s.connected=False
         s.lastMsg=None; s.err=None; s.lock=threading.Lock(); s.mid=0; s.reconnects=0; s.on_quote=None
         s.trades=collections.deque(maxlen=TRADE_MAX); s.tradeSeen=0; s.tradeLast=None; s.wantAt={}
+        s.cbq=queue.Queue(maxsize=CBQ_MAX); s.cbDropped=0
         threading.Thread(target=s._run,daemon=True).start()
+        threading.Thread(target=s._cbw,daemon=True).start()
+    def _cbw(s):
+        # on_quote callbacks (exits, tick recorder, lead-lag) run here so a slow callback never delays recv/quote cache
+        while True:
+            tk,v=s.cbq.get(); cb=s.on_quote
+            if not cb: continue
+            try: cb(tk,v)
+            except Exception as e: s.err=f'on_quote: {e}'
     def watch(s,ticker):
         if not ticker: return
         with s.lock:
@@ -52,12 +62,14 @@ class Feed:
         yb=f('yes_bid'); ya=f('yes_ask')
         ts=m.get('ts_ms'); ts=ts/1000 if isinstance(ts,(int,float)) else (m.get('ts') if isinstance(m.get('ts'),(int,float)) else None)
         lp=f('price')
+        if ts:
+            s.lag=round(time.time()-ts,2)   # consumer lag: receipt/processing time minus Kalshi's update time
+            if s.lag>getattr(s,'lagMax',0) or time.time()-getattr(s,'lagMaxAt',0)>60: s.lagMax=s.lag; s.lagMaxAt=time.time()
         s.q[tk]=dict(yesBid=yb if yb is not None else old.get('yesBid'),yesAsk=ya if ya is not None else old.get('yesAsk'),ts=ts,rx=time.time(),last=lp if lp is not None else old.get('last'),
                      noBid=f('no_bid'),noAsk=f('no_ask'))
-        cb=s.on_quote
-        if cb:
-            try: cb(tk,s.q[tk])
-            except Exception as e: s.err=f'on_quote: {e}'
+        if s.on_quote:
+            try: s.cbq.put_nowait((tk,dict(s.q[tk])))
+            except queue.Full: s.cbDropped+=1
     def _trade(s,m):
         try:
             ts=m.get('ts_ms')
@@ -130,4 +142,4 @@ class Feed:
                     rxAge=round(now-v['rx'],2) if v else None,tsAge=round(now-v['ts'],2) if (v and v.get('ts')) else None,
                     fresh=s.quote(ticker) is not None)
     def status(s):
-        return dict(connected=s.connected,subscribed=len(s.subbed),quotes=len(s.q),lastMsgAge=round(time.time()-s.lastMsg,1) if s.lastMsg else None,reconnects=s.reconnects,error=s.err)
+        return dict(lag=getattr(s,'lag',None),lagMax60=getattr(s,'lagMax',None),cbBacklog=s.cbq.qsize() if hasattr(s,'cbq') else None,cbDropped=getattr(s,'cbDropped',0),connected=s.connected,subscribed=len(s.subbed),quotes=len(s.q),lastMsgAge=round(time.time()-s.lastMsg,1) if s.lastMsg else None,reconnects=s.reconnects,error=s.err)
