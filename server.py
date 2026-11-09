@@ -187,6 +187,8 @@ class PaperTrader:
         t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,asset=asset,side=side,price=round(ask,4),stake=stake,stakePct=0 if sh else round(100*stake/bal,2),contracts=round(max(stake-kalshi_fee(stake/ask,ask),0.01)/ask,3),entryFee=kalshi_fee(stake/ask,ask),
                edge=round(edge,3),modelP=round(q,4),strike=strike,ticker=ticker,openedAt=time.time(),closesAt=close,status='open',**meta)
         t['perpPremium']=perp_premium(asset); t['regime']=regime(asset); t['flowAtEntry']=flow(asset)
+        try: FS.tag(t,'spec',[x for x in s.trades if FS.is_spec(x)],asset,t['price'],spec=True)  # SHADOW-ONLY tag; decision already made
+        except Exception as _e: print('filter tag err',_e,flush=True)
         s.trades.append(t); s.save(); print('OPEN',t['id'],ticker,side,ask,stake,flush=True)
         return t
     def close(s,t,win,how,val=None):
@@ -340,6 +342,7 @@ SHADOW_USD=1.00
 # Owner request Nov 8: paper trades bet flat $1 like live, not Kelly of the paper balance. Set False to restore.
 PAPER_FLAT=True
 LV=None
+import filtershadow as FS
 lock=threading.Lock(); pt=PaperTrader()
 for _t in pt.trades:
     if _t.get('status')=='open' and _t.pop('exiting',None): _t['liveSellError']='sell thread lost in restart; exit/settle re-armed'  # a dead sell thread must not block settlement forever
@@ -749,6 +752,8 @@ def tick_once():
         except Exception as e: src['kraken-futures' if a in METALS else 'coinbase']=f'error: {e}'; sigs[a]=dict(action='skip: coinbase down'); continue
         try:
             k=kalshi(a); src['kalshi']='live' if k else 'no open market'; sg['kalshi']=k
+            try: FS.observe(a,k)  # SHADOW-ONLY filter research: mid-cross/outcome history (never affects trading)
+            except Exception: pass
             if k and LV and LV.enabled(): LV.wsq(k['ticker'])
         except Exception as e: k=None; src['kalshi']=f'error: {e}'
         est,wins=elo_est,elo_wins
@@ -1041,6 +1046,15 @@ try: _persist_boot()
 except Exception as e: print('persist boot err',e,flush=True)
 # gap PAPER fills re-check the fresh websocket quote (same as Spec paper PAPER_FRESH_FILL); read-only quote cache
 GAPS.QUOTE[0]=lambda tk:(LV.wsq(tk) if LV is not None else None)
+# SHADOW-ONLY entry filters on gap trades (tags only; skip2L per book: gapShadow = rules A/B/C combined, gapPaper = paper book)
+def _gap_ftag(t,book):
+    if book=='paper': FS.tag(t,'gapPaper',list(GAPS.PAPER),t.get('laggard') or t.get('asset'),t.get('price') or t.get('entry'))
+    elif t.get('rule') in FS.GAP_SHADOW_RULES: FS.tag(t,'gapShadow',[x for x in GAPS.TRADES if x.get('rule') in FS.GAP_SHADOW_RULES],t.get('laggard'),t.get('entry'))
+GAPS.FILTER[0]=_gap_ftag
+def _fs_summary():
+    with lock: sp=[dict(t) for t in pt.trades if FS.is_spec(t)]
+    return FS.summarize(dict(spec=sp,gapShadow=[t for t in GAPS.snapshot() if t.get('rule') in FS.GAP_SHADOW_RULES],gapPaper=GAPS.paper_snapshot()),
+                        et=lambda c:datetime.fromtimestamp(c,ET).strftime('%Y-%m-%d %H:%M'))
 # research trigger logs (leadlag / ethlead): capped snapshot doc each, reloaded on boot (display/research only)
 def _rs_reload(name,dq):
     try:
@@ -1051,6 +1065,9 @@ try:
     _rs_reload('leadlag_events',LL.events); _rs_reload('ethlead_events',EL.events)
     GP.register_snapshot('leadlag_events',lambda:[dict(e) for e in list(LL.events)])
     GP.register_snapshot('ethlead_events',lambda:[dict(e) for e in list(EL.events)])
+    try: FS.restore((GP.load_doc('research_state','filtershadow_state') or {}).get('items'))
+    except Exception as _e: print('filtershadow restore err',_e,flush=True)
+    GP.register_snapshot('filtershadow_state',FS.state)
 except Exception as e: print('research_state err',e,flush=True)
 # open paper positions' lock/stop state (peakBid etc.) is mutated on websocket quotes without a save; flush it to the
 # existing paper_desk_state doc at most once a minute when it changed (background, never in the trading path)
@@ -1338,6 +1355,7 @@ class H(SimpleHTTPRequestHandler):
         elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapexits' or (p=='/api/gapshadow' and 'summary=1' in s.path): b=json.dumps(dict(shadow=GAPS.variant_summary('shadow'),paper=GAPS.variant_summary('paper')),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/filtershadow': b=json.dumps(_fs_summary(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapshadow': b=json.dumps(GAPS.snapshot(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/metalgap': b=json.dumps(list(SPEC.METAL_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/predstats': b=json.dumps(PL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)

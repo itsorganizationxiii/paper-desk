@@ -57,6 +57,7 @@ TRADES=[]; _seen=set(); _lk=threading.Lock(); _path=[None]
 PAPER=[]; _pseen=set()
 QUOTE=[None]   # fn(ticker)->{'yesBid','yesAsk'} fresh quote (server: websocket cache) or None
 SINK=[None]    # fn(trade) persistence hook; must be non-blocking
+FILTER=[None]  # fn(trade,book) SHADOW-ONLY filter tagger (filtershadow); adds t['filters'] only, never blocks a trade
 PSTAT=dict(opened=0,nofill=0,skipped=0)
 # SHADOW exit variants (Nov 9, research only): every gap trade (shadow + paper) logs what each take-profit variant WOULD have
 # done; the trade itself is untouched (still held to settlement / B cash-out). Env GAP_EXIT_VARIANTS, comma list of
@@ -251,9 +252,14 @@ def _add(t,out,m=None):
     if k in _seen: return
     with _lk:
         _seen.add(k); t['id']=f'G{len(TRADES)+1}'; TRADES.append(t)
+    _ftag(t,'shadow')
     out.append(t); print('GAPSHADOW open',t['id'],t['rule'],t['pair'],t['laggard'],t['side'],t['entry'],flush=True); _emit(t)
     try: paper_open(t,m)
     except Exception as e: print('gappaper open err',e,flush=True)
+def _ftag(t,book):
+    if FILTER[0] is None: return
+    try: FILTER[0](t,book)
+    except Exception as e: print('gap filter tag err',e,flush=True)
 def confidence(st,now=None):
     """'strong' or 'normal' for a Rule A signal (pure)."""
     try:
@@ -290,6 +296,7 @@ def paper_open(st,m=None,now=None):
            gapDown=st.get('gapDown'),leaderYesMid=st.get('leaderYesMid'),laggardYesMid=st.get('laggardYesMid'),confirm=st.get('confirm'))
     with _lk:
         _pseen.add(k); t['id']=f'GP{len(PAPER)+1}'; PAPER.append(t)
+    _ftag(t,'paper')
     PSTAT['opened']+=1; PSTAT['strong' if conf=='strong' else 'normal']=PSTAT.get('strong' if conf=='strong' else 'normal',0)+1
     print('GAPPAPER open',t['id'],t['rule'],t['pair'],t['asset'],side,t['price'],conf,stake,flush=True); _emit(t)
     return t
