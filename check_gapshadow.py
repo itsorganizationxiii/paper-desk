@@ -150,4 +150,34 @@ ssrc=open('server.py').read()
 chk('server never puts gap trades into pt.trades',all(x not in ssrc for x in ('pt.trades.append(g','pt.trades+GAPS','pt.merge(GAPS')))
 chk('openLive rejects gap metadata',"meta.get('gap') or str(meta.get('signalSource','')).startswith('gap')" in ssrc)
 chk('csv labels gap paper + shadow rule:pair',"'gap:'+str(g.get('rule'))+':'+str(g.get('pair',''))" in ssrc and "'gapshadow:'+str(g.get('rule','gap20'))+':'+str(g.get('pair',''))" in ssrc)
+# ---- Nov 9: confidence sizing for gap PAPER (strong=$3 / normal=$1); shadow stays $1 ----
+G=importlib.reload(G); G.load(tempfile.mkdtemp()); G.HIST.clear(); G.QUOTE[0]=None; G.SINK[0]=None
+chk('strong gate defaults',G.STRONG_STAKE==3.0 and G.PAPER_STAKE==1.0 and abs(G.STRONG_GAP-0.08)<1e-12 and G.STRONG_MIN_OF==3 and (G.STRONG_MIN_LEFT,G.STRONG_MAX_LEFT)==(120.0,780.0))
+C4=9000.0
+def strongset(c,doge=0.7,sol=0.6,xrp=0.55,btc=0.46,eth=0.58):
+    d={'BTC':mm('KXBTC-S%d'%c,btc,c),'ETH':mm('KXETH-S%d'%c,eth,c),'SOL':mm('KXSOL-S%d'%c,sol,c),'XRP':mm('KXXRP-S%d'%c,xrp,c)}
+    if doge is not None: d['DOGE']=mm('KXDOGE-S%d'%c,doge,c)
+    return d
+G.on_tick(strongset(C4),C4-400)
+sp=[t for t in G.PAPER if t['closesAt']==C4][0]; sh=[t for t in G.TRADES if t['closesAt']==C4 and t['rule']=='A'][0]
+chk('unanimous 3/3 + 12pt gap + 400s -> strong $3',sp['conf']=='strong' and sp['stake']==3.0 and sp['tag']=='gap-paper-strong')
+chk('strong contracts sized from $3',abs(sp['contracts']-round((3.0-G.fee(3.0/sp['price'],sp['price']))/sp['price'],4))<1e-9)
+chk('shadow twin stays $1',sh['stake']==1.0 and sh['mode']=='shadow')
+C5=C4+900; G.on_tick(strongset(C5,doge=0.3),C5-400)
+chk('2/3 agree -> normal $1',[t for t in G.PAPER if t['closesAt']==C5][0]['conf']=='normal' and [t for t in G.PAPER if t['closesAt']==C5][0]['stake']==1.0)
+C6=C5+900; G.on_tick(strongset(C6,doge=None),C6-400)
+chk('no DOGE (of=2) -> normal',[t for t in G.PAPER if t['closesAt']==C6][0]['conf']=='normal')
+C7=C6+900; G.on_tick(strongset(C7,btc=0.53,eth=0.58),C7-400)
+chk('gap 5pt <8 -> normal',[t for t in G.PAPER if t['closesAt']==C7][0]['conf']=='normal')
+C8=C7+900; G.on_tick(strongset(C8),C8-100)
+chk('100s left (<120) -> normal',[t for t in G.PAPER if t['closesAt']==C8][0]['conf']=='normal')
+chk('confidence() pure edges',G.confidence(dict(confirm=dict(agree=3,of=3),gapDown=-0.08,closesAt=1000,openedAt=880))=='strong' and G.confidence(dict(confirm=None,gapDown=0.5,closesAt=1000,openedAt=500))=='normal' and G.confidence({})=='normal')
+G.settle(lambda tk:'yes',C8+900)
+sm=G.paper_summary(); bt=sm['byTier']
+chk('summary per tier count/W/L/P&L',bt['strong']['trades']==1 and bt['normal']['trades']==len(G.PAPER)-1 and bt['strong']['wins']+bt['strong']['losses']==1 and 'pnl' in bt['normal'] and sm['strongStake']==3.0 and sm['strongGate']['minGap']==G.STRONG_GAP)
+chk('strong win pays on $3',bt['strong']['pnl']>1.0)
+import os as _os; _os.environ['GAP_PAPER_STRONG_STAKE']='2'; _os.environ['GAP_STRONG_GAP']='0.20'
+G=importlib.reload(G); chk('env tunable stakes/gate',G.STRONG_STAKE==2.0 and abs(G.STRONG_GAP-0.20)<1e-12)
+del _os.environ['GAP_PAPER_STRONG_STAKE']; del _os.environ['GAP_STRONG_GAP']; G=importlib.reload(G)
+chk('csv tags strong tier',"g.get('tag') or 'gap-paper'" in open('server.py').read() and ":conf='+str(g.get('conf') or 'normal')" in open('server.py').read())
 print('ALL PASS' if ok else 'SOME FAILED'); raise SystemExit(0 if ok else 1)

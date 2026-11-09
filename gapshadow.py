@@ -48,7 +48,11 @@ STAKE=1.0
 PAPER_ENABLED=E('GAP_PAPER','1')!='0'
 PAPER_RULES=set(x.strip() for x in E('GAP_PAPER_RULES','A').split(',') if x.strip())
 PAPER_PAIRS=set(f'{a}-{b}' for a,b in _pairs(E('GAP_PAPER_PAIRS','BTC-ETH,SOL-XRP')))
-PAPER_STAKE=1.0; PAPER_SLIP=0.01
+PAPER_STAKE=float(E('GAP_PAPER_STAKE','1')); PAPER_SLIP=0.01
+# Confidence sizing (Nov 9, owner-approved): strong = unanimous confirmation (agree==of, of>=GAP_STRONG_MIN_OF, DOGE incl.)
+# AND |gap|>=GAP_STRONG_GAP AND GAP_STRONG_MIN_LEFT<=leftSec<=GAP_STRONG_MAX_LEFT -> GAP_PAPER_STRONG_STAKE, else GAP_PAPER_STAKE.
+STRONG_STAKE=float(E('GAP_PAPER_STRONG_STAKE','3')); STRONG_GAP=float(E('GAP_STRONG_GAP','0.08'))
+STRONG_MIN_OF=int(E('GAP_STRONG_MIN_OF','3')); STRONG_MIN_LEFT=float(E('GAP_STRONG_MIN_LEFT','120')); STRONG_MAX_LEFT=float(E('GAP_STRONG_MAX_LEFT','780'))
 TRADES=[]; _seen=set(); _lk=threading.Lock(); _path=[None]
 PAPER=[]; _pseen=set()
 QUOTE=[None]   # fn(ticker)->{'yesBid','yesAsk'} fresh quote (server: websocket cache) or None
@@ -231,6 +235,15 @@ def _add(t,out,m=None):
     out.append(t); print('GAPSHADOW open',t['id'],t['rule'],t['pair'],t['laggard'],t['side'],t['entry'],flush=True); _emit(t)
     try: paper_open(t,m)
     except Exception as e: print('gappaper open err',e,flush=True)
+def confidence(st,now=None):
+    """'strong' or 'normal' for a Rule A signal (pure)."""
+    try:
+        cf=st.get('confirm') or {}
+        ag,of=int(cf.get('agree') or 0),int(cf.get('of') or 0)
+        left=float(st['closesAt'])-float(st.get('openedAt') if now is None else now)
+        if of>=STRONG_MIN_OF and ag==of and abs(float(st.get('gapDown') or 0))>=STRONG_GAP-1e-9 and STRONG_MIN_LEFT<=left<=STRONG_MAX_LEFT: return 'strong'
+    except Exception: pass
+    return 'normal'
 def paper_open(st,m=None,now=None):
     """Promote a shadow trade to a real PAPER trade (separate gap paper book). Never live. Returns trade or None."""
     if not PAPER_ENABLED or st.get('rule') not in PAPER_RULES or st.get('pair') not in PAPER_PAIRS: return None
@@ -248,15 +261,18 @@ def paper_open(st,m=None,now=None):
         if fa>ask+PAPER_SLIP+1e-9: PSTAT['nofill']+=1; print('GAPPAPER NOFILL',st['ticker'],side,ask,fa,flush=True); return None
         ask=fa
     if not (0.10<=ask<=0.90): PSTAT['skipped']+=1; return None
-    c0=PAPER_STAKE/ask; ef=fee(c0,ask); contracts=round(max(PAPER_STAKE-ef,0.001)/ask,4)
+    conf=confidence(st,now)
+    stake=STRONG_STAKE if conf=='strong' else PAPER_STAKE
+    c0=stake/ask; ef=fee(c0,ask); contracts=round(max(stake-ef,0.001)/ask,4)
     t=dict(id=None,mode='paper',shadow=False,gap=True,book='gap-paper',signalSource='gap',rule=st['rule'],pair=st['pair'],
            asset=st['laggard'],laggard=st['laggard'],leader=st.get('leader'),ticker=st['ticker'],side=side,price=round(ask,4),entry=round(ask,4),
-           signalAsk=st['entry'],freshAsk=fa,stake=PAPER_STAKE,contracts=contracts,entryFee=ef,leftSec=st.get('leftSec'),closesAt=st['closesAt'],
+           signalAsk=st['entry'],freshAsk=fa,stake=stake,conf=conf,tag='gap-paper-strong' if conf=='strong' else 'gap-paper',contracts=contracts,entryFee=ef,leftSec=st.get('leftSec'),closesAt=st['closesAt'],
            openedAt=now,status='open',settle=None,exit=None,pnl=None,hold_pnl=None,shadowKey=doc_id(st),
            gapDown=st.get('gapDown'),leaderYesMid=st.get('leaderYesMid'),laggardYesMid=st.get('laggardYesMid'),confirm=st.get('confirm'))
     with _lk:
         _pseen.add(k); t['id']=f'GP{len(PAPER)+1}'; PAPER.append(t)
-    PSTAT['opened']+=1; print('GAPPAPER open',t['id'],t['rule'],t['pair'],t['asset'],side,t['price'],flush=True); _emit(t)
+    PSTAT['opened']+=1; PSTAT['strong' if conf=='strong' else 'normal']=PSTAT.get('strong' if conf=='strong' else 'normal',0)+1
+    print('GAPPAPER open',t['id'],t['rule'],t['pair'],t['asset'],side,t['price'],conf,stake,flush=True); _emit(t)
     return t
 def manage_exits(mkts,now=None):
     """Rule B early cash-out (paper). Returns list of trades cashed this tick."""
@@ -335,8 +351,12 @@ def paper_summary():
     with _lk: ps=[dict(t) for t in PAPER]
     def agg(ts):
         c=[t for t in ts if t.get('status') not in ('open',None)]
-        return dict(trades=len(ts),closed=len(c),open=len(ts)-len(c),wins=sum(1 for t in c if (t.get('pnl') or 0)>0),pnl=round(sum(t.get('pnl') or 0 for t in c),2))
+        w=sum(1 for t in c if (t.get('pnl') or 0)>0)
+        return dict(trades=len(ts),closed=len(c),open=len(ts)-len(c),wins=w,losses=len(c)-w,staked=round(sum(t.get('stake') or 0 for t in c),2),pnl=round(sum(t.get('pnl') or 0 for t in c),2))
     by={}
     for t in ps: by.setdefault(f"{t.get('rule')} {t.get('pair')}",[]).append(t)
-    return dict(enabled=PAPER_ENABLED,rules=sorted(PAPER_RULES),pairs=sorted(PAPER_PAIRS),stake=PAPER_STAKE,all=agg(ps),byRulePair={k:agg(v) for k,v in by.items()},
+    tiers={k:agg([t for t in ps if (t.get('conf') or 'normal')==k]) for k in ('strong','normal')}
+    return dict(enabled=PAPER_ENABLED,rules=sorted(PAPER_RULES),pairs=sorted(PAPER_PAIRS),stake=PAPER_STAKE,strongStake=STRONG_STAKE,
+                strongGate=dict(unanimousConfirm=True,minOf=STRONG_MIN_OF,minGap=STRONG_GAP,leftSec=[STRONG_MIN_LEFT,STRONG_MAX_LEFT]),
+                all=agg(ps),byTier=tiers,byRulePair={k:agg(v) for k,v in by.items()},
                 stats=dict(PSTAT),note='gap PAPER book: separate from Spec paper balance/ledger math; never live')
