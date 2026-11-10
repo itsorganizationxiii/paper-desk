@@ -80,6 +80,10 @@ def _loop():
         except Exception as e: ST['lastErr']=f'loop {e}'[:120]
 def stats():
     out=dict(ST,openWindows=len(_win))
+    skips=collections.Counter()
+    for r in _win.values():
+        skips.update(r.get('skipReasons') or {})
+    out['openSkipReasons']=dict(skips)
     if _col is not None:
         try: out.update(records=_col.count_documents({}),traded=_col.count_documents({'traded':True}))
         except Exception: pass

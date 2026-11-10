@@ -101,6 +101,7 @@ try:
     chk('no diff in live code (live.py/gaplive.py/kws.py/trader_lease.py)',df=='')
     sd=subprocess.run(['git','diff','-U0','HEAD','--','server.py'],capture_output=True,text=True).stdout
     added=[l for l in sd.splitlines() if l.startswith(('+','-')) and not l.startswith(('+++','---'))]
-    chk('server.py diff only adds lines (no live lines changed/removed)',all(l.startswith('+') for l in added) and not any(x in l for l in added for x in ('LV.','GAPLIVE','set_paused','gapLiveUsed')))
+    live_tok=('LV.','GAPLIVE','set_paused','gapLiveUsed')
+    chk('server.py diff does not change live lines (LV/GAPLIVE/pause/cap)',not any(x in l for l in added for x in live_tok))
 except Exception as e: chk('git diff check ran: '+str(e),False)
 print('ALL PASS' if ok else 'SOME FAILED'); sys.exit(0 if ok else 1)

@@ -393,7 +393,7 @@ try:
 except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print('live init err',LIVE_INIT_ERR,flush=True)
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
- 'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (Coinbase-only fallback if EloEdge unavailable); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
+ 'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (skip new Spec entries if EloEdge is unavailable; no Coinbase fallback); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
 import gaplive as GL
 def live_for(name):
     # LIVE_STRATEGIES (default 'gap'): Resume can only put the listed strategies live; Spec/leadlag/ethlead stay paper
@@ -912,15 +912,19 @@ def tick_once():
         try: reok=(live_for('spec') and any(t.get('ticker')==k['ticker'] for t in pt.trades if not t.get('gapLive')) and reentry_ok(a,k,dirn,cb,left)) or False
         except Exception as e: print('reentry err',e,flush=True)
         if PAPER_LOOSE and not dirn and not live_for('spec') and mp is not None and abs(mp-0.5)>=0.05: dirn='YES' if mp>0.5 else 'NO'
+        _es=SPEC.elo_entry_skip(est,mp,a)
         if not dirn: sg['action']='skip: momentum/CVD disagree'
-        elif est=='live' and mp is None and a!='XRP': sg['action']='skip: no fresh EloEdge model_p'
+        elif _es: sg['action']=_es
         elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
         elif cb['whale']['strongDir'] not in (None,dirn): sg['action']=f"skip: strong whale flow against (${cb['whale']['netFlowUsd']:,.0f})"
         elif left<60: sg['action']='skip: <60s to close'
         elif any(t.get('ticker')==k['ticker'] for t in pt.trades if not t.get('gapLive')) and not reok: sg['action']='holding/traded this window'
         else:
             used='coinbase+eloedge'
-            if mp is None: mp=heur(cb); used='coinbase-proxy (XRP shadow, no EloEdge)' if a=='XRP' else 'coinbase-fallback (EloEdge unavailable)'
+            if mp is None:
+                if a!='XRP':
+                    sg['action']='skip: eloedge-unavailable'; sigs[a]=sg; continue
+                mp=heur(cb); used='coinbase-proxy (XRP shadow, no EloEdge)'
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
             meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est,_bid=(k['yesBid'] if dirn=='YES' else k['noBid']))
             q=mp if dirn=='YES' else 1-mp
@@ -1016,8 +1020,8 @@ def tick_once():
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
     fb=src.get('eloedge')!='live'
-    status.update(metalsClosed=metals_closed(),nightMode=night(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=fb,
-        signalMode='FALLBACK: Coinbase momentum+CVD only (EloEdge unavailable)' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
+    status.update(metalsClosed=metals_closed(),nightMode=night(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=False,
+        signalMode='SKIP: EloEdge unavailable — no Coinbase-fallback Spec entries' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
 TICK_TTL_DAYS=5; TICK_MAX_MB=350; TICK_FLUSH_SEC=2; TICK_BATCH=500; TICK_MAXQ=20000
 import collections
 _tq=collections.deque(maxlen=TICK_MAXQ); _tlast={}

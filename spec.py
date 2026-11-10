@@ -323,3 +323,15 @@ def log_crypto_gap(mkts, now=None):
         if r: CRYPTO_GAP.append(r); _sink(r); append_research(r)
         return r
     except Exception: return None
+
+
+def elo_entry_skip(est, model_p, asset):
+    """Skip a new Spec entry when EloEdge p is unusable. Returns the skip action or None.
+    Covers HTTP 402 / any EloEdge error (est != 'live') and stale / not-open / missing model_p.
+    XRP has no EloEdge feed and may still use the coinbase-proxy path.
+    Does not apply to already-open positions (exits and settlement stay unchanged)."""
+    if model_p is not None or asset=='XRP':
+        return None
+    if est=='live':
+        return 'skip: no fresh EloEdge model_p'
+    return 'skip: eloedge-unavailable'
