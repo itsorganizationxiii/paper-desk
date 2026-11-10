@@ -1,4 +1,4 @@
-"""Gap NIGHT-MODE SHADOW (owner t1093u/t1095u/t1102u/t1107u, Nov 10 2026). PAPER/SHADOW ONLY: no order path, imports nothing from
+"""Gap NIGHT-MODE SHADOW (owner t1093u/t1095u/t1102u/t1107u/t1115u, Nov 10 2026). PAPER/SHADOW ONLY: no order path, imports nothing from
 live/gaplive, never touches pt.trades, the gap paper book, gap live (cap/used/paused), Spec, MoogleEdge's book,
 the limit shadow or the regime shadow books. Night = 5 PM-6 AM ET; day rounds are logged as not-applicable only.
 Applied to gap Rule A SHADOW signals on BTC-ETH, and SOL-XRP when XRP is not the laggard, $1 flat.
@@ -17,6 +17,9 @@ VARIANTS (each its own $1 book on every eligible night signal):
                           median (gapregime HIST / volume_ctx, last <=24 settled rounds). Unknown volume does not skip.
   n3       'moogle-55'  : enter only if the live MoogleEdge shadow p for the traded side is >= 0.55 at entry
                           (same moogle-not-warm skip; no volume filter). Same hold/trail15/trail25 exits.
+  n4       'moogle-60+vol': enter only if the live MoogleEdge shadow p for the traded side is >= 0.60 at entry
+                          AND skip when previous-round volume is below the 6h median (same volume rule as n2;
+                          unknown volume does not skip). Same moogle-not-warm skip and hold/trail15/trail25 exits.
 Volume is reused from gapregime (no new market polling). Quotes are read-only WS / tick cache."""
 import json, math, os, threading, time
 from datetime import datetime
@@ -26,11 +29,12 @@ E=os.environ.get
 ENABLED=E('GAP_NIGHT','1')!='0'
 MOOGLE_BAR=float(E('GAP_NIGHT_MOOGLE_BAR','0.65'))
 MOOGLE_BAR55=float(E('GAP_NIGHT_MOOGLE_BAR55','0.55'))
+MOOGLE_BAR60=float(E('GAP_NIGHT_MOOGLE_BAR60','0.60'))
 ARM=0.15; ARM25=0.25; DROP=0.10; STAKE=1.0; FRESH_SEC=15.0; MAX_KEEP=int(E('GAP_NIGHT_MAX_KEEP','3000'))
 FILE_SAVE_SEC=60.0; TTL_DAYS=int(E('GAP_NIGHT_TTL_DAYS','120'))
 PAIRS=frozenset(('BTC-ETH','SOL-XRP'))
-VARIANTS=('baseline','n1','n2','n3')
-VNAME={'baseline':'unfiltered','n1':'moogle-65','n2':'moogle-65+vol','n3':'moogle-55'}
+VARIANTS=('baseline','n1','n2','n3','n4')
+VNAME={'baseline':'unfiltered','n1':'moogle-65','n2':'moogle-65+vol','n3':'moogle-55','n4':'moogle-60+vol'}
 BANDS=('<0.50','0.50-0.55','0.55-0.60','0.60-0.65','>=0.65')
 # Field maps for the two trail exit variants. trail15 keeps the original field names so existing records stay valid.
 T15=dict(peak='peakBid',armed='trailArmedAt',exit='exit',exitFee='exitFee',pnl='pnl',
@@ -105,7 +109,9 @@ def moogle_band(mp):
     if mp<0.65-1e-12: return '0.60-0.65'
     return '>=0.65'
 def _bar(v):
-    return MOOGLE_BAR55 if v=='n3' else MOOGLE_BAR
+    if v=='n3': return MOOGLE_BAR55
+    if v=='n4': return MOOGLE_BAR60
+    return MOOGLE_BAR
 def _reason(v,night,pair,lag,mp,vol):
     if night is None: return 'hour-unknown'
     if pair=='SOL-XRP' and lag=='XRP': return 'xrp-laggard'
@@ -113,8 +119,8 @@ def _reason(v,night,pair,lag,mp,vol):
     if v=='baseline': return None
     if mp is None: return 'moogle-not-warm'
     bar=_bar(v)
-    if v in ('n1','n2','n3') and mp<bar-1e-9: return f'moogle-below-bar: {mp} < {bar}'
-    if v=='n2' and _low_vol(vol):
+    if v in ('n1','n2','n3','n4') and mp<bar-1e-9: return f'moogle-below-bar: {mp} < {bar:.2f}'
+    if v in ('n2','n4') and _low_vol(vol):
         return f"low-volume: prev {vol.get('prevVol')} < median {vol.get('medianVol')}"
     return None
 def make_items(st,m,now):
@@ -133,7 +139,7 @@ def make_items(st,m,now):
     vol=volume_ctx(lag)
     band=moogle_band(mp)
     tags=dict(hourET=hour,session=session,moogleP=mp,moogleWarm=mp is not None,moogleBar=MOOGLE_BAR,
-              moogleBar55=MOOGLE_BAR55,moogleBand=band,volume=vol,lowVol=_low_vol(vol))
+              moogleBar55=MOOGLE_BAR55,moogleBar60=MOOGLE_BAR60,moogleBand=band,volume=vol,lowVol=_low_vol(vol))
     out=[]
     for v in VARIANTS:
         o=dict(id=f'{sk}|{v}',shadowKey=sk,variant=v,variantName=VNAME[v],mode='shadow',book='gap-night',rule='A',
@@ -320,8 +326,8 @@ def summary():
         if v=='baseline': rec['bands']=_band_rows(ent)
         books[v]=rec
     return dict(enabled=ENABLED,shadowOnly=True,stats=dict(STAT),session=session_now(),
-                thresholds=dict(moogleBar=MOOGLE_BAR,moogleBar55=MOOGLE_BAR55,nightWindow='5 PM (17:00) through 5:59 AM ET',
-                                volumeSkip='n2 only: previous settled round Kalshi volume_fp < 6h median (gapregime volume_ctx, last <=24 rounds)',
+                thresholds=dict(moogleBar=MOOGLE_BAR,moogleBar55=MOOGLE_BAR55,moogleBar60=MOOGLE_BAR60,nightWindow='5 PM (17:00) through 5:59 AM ET',
+                                volumeSkip='n2 and n4: previous settled round Kalshi volume_fp < 6h median (gapregime volume_ctx, last <=24 rounds)',
                                 pairs='BTC-ETH, and SOL-XRP when XRP is not the laggard',
                                 trail15='arm entry+15c / 10c giveback, sell at bid',
                                 trail25='arm entry+25c / 10c giveback, sell at bid; pre-deploy fills without a trail25 path (no pnl25) are excluded from the trail25 book, not counted as $0; n is the included count',
@@ -332,8 +338,8 @@ def summary():
                 nightExits=_exits([o for o in night if o['status']=='filled']),
                 dayLogged=len(day),daySkipReasons=_reasons(day),
                 persist=dict(collection='gap_night',ttlDays=TTL_DAYS,
-                             note=f'4 docs per Rule A signal (baseline/n1/n2/n3); trail15/trail25/hold stored on the same doc. Mongo TTL {TTL_DAYS}d on openedAtDt; in-memory cap {MAX_KEEP}. Night-only entries, day logged as not-applicable. Volume reused from gapregime HIST (no extra polling).'),
-                note='SHADOW ONLY: never places, sizes or blocks a trade. baseline = unfiltered night Rule A (with Moogle p-band tallies); n1 = MoogleEdge side p>=0.65; n2 = n1 + skip previous-round volume below 6h median; n3 = MoogleEdge side p>=0.55. Each book reports trail15, trail25 and hold W-L/PnL; trail25 n counts only fills with a trail25 path.')
+                             note=f'5 docs per Rule A signal (baseline/n1/n2/n3/n4); trail15/trail25/hold stored on the same doc. Mongo TTL {TTL_DAYS}d on openedAtDt; in-memory cap {MAX_KEEP}. Night-only entries, day logged as not-applicable. Volume reused from gapregime HIST (no extra polling).'),
+                note='SHADOW ONLY: never places, sizes or blocks a trade. baseline = unfiltered night Rule A (with Moogle p-band tallies); n1 = MoogleEdge side p>=0.65; n2 = n1 + skip previous-round volume below 6h median; n3 = MoogleEdge side p>=0.55; n4 = MoogleEdge side p>=0.60 + skip previous-round volume below 6h median. Each book reports trail15, trail25 and hold W-L/PnL; trail25 n counts only fills with a trail25 path.')
 def api(limit=300,items=True):
     its=snapshot()[-limit:] if items else []
     return dict(summary=summary(),items=its[::-1])

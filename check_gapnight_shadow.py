@@ -56,14 +56,15 @@ chk('session tagged night at 3 AM ET',it['baseline']['session']=='night' and it[
 chk('baseline enters unfiltered at the signal ask 0.61',it['baseline']['status']=='filled' and it['baseline']['entry']==0.61 and it['baseline']['side']=='YES')
 chk('n1 enters when MoogleEdge side p 0.70 >= 0.65',it['n1']['status']=='filled' and it['n1']['tags']['moogleP']==0.70)
 chk('n2 skips low volume even when MoogleEdge passes',it['n2']['status']=='skipped' and 'low-volume' in it['n2']['skipReason'])
-chk('one set per signal (no duplicates on the next tick)',N.on_tick(m0,NIGHT+1,signals=G.TRADES)==[] and len([o for o in N.ITEMS if o['pair']=='BTC-ETH'])==4)
+chk('n4 moogle-60+vol also skips low volume when MoogleEdge p 0.70 >= 0.60',it['n4']['status']=='skipped' and 'low-volume' in it['n4']['skipReason'] and it['n4']['tags']['moogleP']==0.70)
+chk('one set per signal (no duplicates on the next tick)',N.on_tick(m0,NIGHT+1,signals=G.TRADES)==[] and len([o for o in N.ITEMS if o['pair']=='BTC-ETH'])==5)
 chk('persisted via SINK',all(f"{it['baseline']['shadowKey']}|{v}" in SUNK for v in N.VARIANTS))
 # MoogleEdge below bar
 N.ITEMS.clear(); N._by.clear(); N._seen.clear(); SUNK.clear()
 st=dict(sig[0]); st['closesAt']=CLOSE_N+900; st['openedAt']=NIGHT; st['ticker']='KXETH15M-W2'
 M.CUR['ETH']=dict(p=0.50,ticker='KXETH15M-W2',t=NIGHT-1)
 N.on_tick({},NIGHT,signals=[st]); itb={o['variant']:o for o in N.ITEMS}
-chk('n1/n2/n3 skip when MoogleEdge p 0.50 is below each bar; baseline still enters',itb['baseline']['status']=='filled' and itb['n1']['status']=='skipped' and 'moogle-below-bar' in itb['n1']['skipReason'] and '0.65' in itb['n1']['skipReason'] and itb['n2']['status']=='skipped' and itb['n3']['status']=='skipped' and '0.55' in itb['n3']['skipReason'] and itb['baseline'].get('moogleBand')=='0.50-0.55')
+chk('n1/n2/n3/n4 skip when MoogleEdge p 0.50 is below each bar; baseline still enters',itb['baseline']['status']=='filled' and itb['n1']['status']=='skipped' and 'moogle-below-bar' in itb['n1']['skipReason'] and '0.65' in itb['n1']['skipReason'] and itb['n2']['status']=='skipped' and itb['n3']['status']=='skipped' and '0.55' in itb['n3']['skipReason'] and itb['n4']['status']=='skipped' and '0.60' in itb['n4']['skipReason'] and itb['baseline'].get('moogleBand')=='0.50-0.55')
 # MoogleEdge in the 0.55-0.60 band: n3 enters, n1/n2 skip
 st55=dict(st); st55['closesAt']=CLOSE_N+950; st55['ticker']='KXETH15M-W55'; st55['openedAt']=NIGHT
 M.CUR['ETH']=dict(p=0.58,ticker='KXETH15M-W55',t=NIGHT-1)
@@ -79,11 +80,23 @@ st550=dict(st); st550['closesAt']=CLOSE_N+960; st550['ticker']='KXETH15M-W550'
 M.CUR['ETH']=dict(p=0.55,ticker='KXETH15M-W550',t=NIGHT-1)
 N.on_tick({},NIGHT,signals=[st550]); it550={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-W550'}
 chk('n3 enters at the 0.55 bar exactly; n1 still skips',it550['n3']['status']=='filled' and it550['n1']['status']=='skipped' and it550['baseline']['moogleBand']=='0.55-0.60')
+# MoogleEdge in the 0.55-0.60 band: n4 is below the 0.60 bar (checked before volume)
+chk('n4 skips below the 0.60 bar at side p 0.58 (moogle-below-bar, not low-volume)',
+    it55['n4']['status']=='skipped' and 'moogle-below-bar' in it55['n4']['skipReason'] and '0.60' in it55['n4']['skipReason'])
+# MoogleEdge in the 0.60-0.65 band, ETH still low volume: n4 skips vol, n3 enters, n1/n2 skip bar
+st60=dict(st); st60['closesAt']=CLOSE_N+970; st60['ticker']='KXETH15M-W60'; st60['openedAt']=NIGHT
+M.CUR['ETH']=dict(p=0.62,ticker='KXETH15M-W60',t=NIGHT-1)
+N.on_tick({},NIGHT,signals=[st60]); it60={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-W60'}
+chk('n4 skips low volume at side p 0.62; n3 enters (no vol filter); n1/n2 skip below 0.65; band is 0.60-0.65',
+    it60['n4']['status']=='skipped' and 'low-volume' in it60['n4']['skipReason']
+    and it60['n3']['status']=='filled'
+    and it60['n1']['status']=='skipped' and '0.65' in it60['n1']['skipReason']
+    and it60['n2']['status']=='skipped' and it60['baseline'].get('moogleBand')=='0.60-0.65')
 # MoogleEdge not warm
 stc=dict(st); stc['closesAt']=CLOSE_N+1800; stc['ticker']='KXETH15M-W3'
 M.CUR['ETH']=dict(p=0.80,ticker='KXETH15M-W3',t=NIGHT-60)
 N.on_tick({},NIGHT,signals=[stc]); itc={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-W3'}
-chk('stale MoogleEdge is not warm -> n1/n2/n3 skip moogle-not-warm, baseline enters',N.moogle_side_p('ETH','KXETH15M-W3','YES',NIGHT) is None and itc['baseline']['status']=='filled' and itc['n1']['skipReason']=='moogle-not-warm' and itc['n2']['skipReason']=='moogle-not-warm' and itc['n3']['skipReason']=='moogle-not-warm' and itc['baseline'].get('moogleBand') is None)
+chk('stale MoogleEdge is not warm -> n1/n2/n3/n4 skip moogle-not-warm, baseline enters',N.moogle_side_p('ETH','KXETH15M-W3','YES',NIGHT) is None and itc['baseline']['status']=='filled' and itc['n1']['skipReason']=='moogle-not-warm' and itc['n2']['skipReason']=='moogle-not-warm' and itc['n3']['skipReason']=='moogle-not-warm' and itc['n4']['skipReason']=='moogle-not-warm' and itc['baseline'].get('moogleBand') is None)
 M.CUR.pop('ETH',None)
 stc2=dict(st); stc2['closesAt']=CLOSE_N+2700; stc2['ticker']='KXETH15M-W3b'
 N.on_tick({},NIGHT,signals=[stc2]); itc2={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-W3b'}
@@ -93,7 +106,15 @@ sts=dict(rule='A',mode='shadow',pair='SOL-XRP',laggard='SOL',leader='XRP',ticker
          closesAt=CLOSE_N+3600,openedAt=NIGHT,gapDown=0.2,leaderYesMid=0.80,laggardYesMid=0.55)
 M.CUR['SOL']=dict(p=0.80,ticker='KXSOL15M-W4',t=NIGHT-1)
 N.on_tick({},NIGHT,signals=[sts]); its={o['variant']:o for o in N.ITEMS if o['ticker']=='KXSOL15M-W4'}
-chk('SOL-XRP SOL laggard: n1, n2 and n3 all enter (vol at median, moogle 0.80)',its['baseline']['status']=='filled' and its['n1']['status']=='filled' and its['n2']['status']=='filled' and its['n3']['status']=='filled' and its['n2']['entry']==0.55 and its['n3']['entry']==0.55)
+chk('SOL-XRP SOL laggard: n1, n2, n3 and n4 all enter (vol at median, moogle 0.80)',its['baseline']['status']=='filled' and its['n1']['status']=='filled' and its['n2']['status']=='filled' and its['n3']['status']=='filled' and its['n4']['status']=='filled' and its['n2']['entry']==0.55 and its['n4']['entry']==0.55)
+# n4 enters at the 0.60 bar exactly when volume is at median; n1/n2 skip below 0.65
+sts60=dict(sts); sts60.update(ticker='KXSOL15M-W60',closesAt=CLOSE_N+3650,entry=0.55)
+M.CUR['SOL']=dict(p=0.60,ticker='KXSOL15M-W60',t=NIGHT-1)
+N.on_tick({},NIGHT,signals=[sts60]); its60={o['variant']:o for o in N.ITEMS if o['ticker']=='KXSOL15M-W60'}
+chk('n4 moogle-60+vol enters at the 0.60 bar exactly when vol is at median; n1/n2 skip below 0.65; n3 enters',
+    its60['n4']['status']=='filled' and its60['n4']['entry']==0.55
+    and its60['n3']['status']=='filled' and its60['n1']['status']=='skipped' and its60['n2']['status']=='skipped'
+    and its60['baseline'].get('moogleBand')=='0.60-0.65')
 # XRP laggard blocked
 stx=dict(sts); stx.update(laggard='XRP',leader='SOL',ticker='KXXRP15M-W5',closesAt=CLOSE_N+4500,entry=0.40)
 M.CUR['XRP']=dict(p=0.90,ticker='KXXRP15M-W5',t=NIGHT-1)
@@ -145,9 +166,9 @@ std2=dict(st); std2.update(closesAt=CLOSE_D+900,openedAt=DAY,ticker='KXETH15M-DA
 M.CUR['ETH']=dict(p=0.80,ticker='KXETH15M-DAY2',t=DAY-1)
 N.on_tick({},DAY,signals=[std2])
 s=N.summary(); json.dumps(N.api(),default=str)
-chk('summary: four books + skip reasons + persist TTL note',set(s['books'])=={'baseline','n1','n2','n3'} and s['books']['n2']['skipReasons'] and s['persist']['collection']=='gap_night' and s['persist']['ttlDays']==120 and s['thresholds']['moogleBar55']==0.55)
+chk('summary: five books + skip reasons + persist TTL note',set(s['books'])=={'baseline','n1','n2','n3','n4'} and s['books']['n2']['skipReasons'] and s['persist']['collection']=='gap_night' and s['persist']['ttlDays']==120 and s['thresholds']['moogleBar55']==0.55 and s['thresholds']['moogleBar60']==0.60)
 chk('summary W-L counts night entries only (day logged separately)',s['dayLogged']>=3 and 'day-not-applicable' in s['daySkipReasons'] and all(o['status']!='filled' or o.get('session')=='night' for o in N.ITEMS))
-chk('brief is a short string with Night mode variant names',isinstance(N.brief(),str) and 'unfiltered' in N.brief() and 'moogle-65' in N.brief() and 'moogle-55' in N.brief())
+chk('brief is a short string with Night mode variant names',isinstance(N.brief(),str) and 'unfiltered' in N.brief() and 'moogle-65' in N.brief() and 'moogle-55' in N.brief() and 'moogle-60+vol' in N.brief())
 sess=N.session_now(NIGHT); chk('session_now reports night at 3 AM ET',sess['isNight'] is True and sess['label']=='night' and sess['window']=='5 PM-6 AM ET')
 # ---- trail25: arms later than trail15, keeps tracking after trail15 exits, sell at bid, $1 flat ----
 N.ITEMS.clear(); N._by.clear(); N._seen.clear(); SUNK.clear()
@@ -158,7 +179,7 @@ def _eth(tk,bidask,close):
     m=mkts(eth=bidask,close=close); m['ETH']['ticker']=tk; return m
 N.on_tick(_eth('KXETH15M-T25',(0.59,0.61),CLOSE_N+7200),NIGHT,signals=[st25])
 it25={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-T25'}
-chk('trail25 fixture: baseline/n1/n3 fill at 0.61, $1 stake',it25['baseline']['status']=='filled' and it25['baseline']['entry']==0.61 and it25['n1']['status']=='filled' and it25['n3']['status']=='filled' and N.STAKE==1.0)
+chk('trail25 fixture: baseline/n1/n3 fill at 0.61, $1 stake; n4 skips ETH low volume',it25['baseline']['status']=='filled' and it25['baseline']['entry']==0.61 and it25['n1']['status']=='filled' and it25['n3']['status']=='filled' and it25['n4']['status']=='skipped' and 'low-volume' in it25['n4']['skipReason'] and N.STAKE==1.0)
 N.on_tick(_eth('KXETH15M-T25',(0.80,0.82),CLOSE_N+7200),NIGHT+30,signals=[])
 chk('bid 0.80 arms trail15 only (0.61+0.15), not trail25 (need 0.86)',it25['baseline'].get('trailArmedAt') is not None and it25['baseline'].get('trailArmedAt25') is None and it25['baseline'].get('exit') is None and it25['baseline'].get('exit25') is None)
 N.on_tick(_eth('KXETH15M-T25',(0.69,0.71),CLOSE_N+7200),NIGHT+60,signals=[])
@@ -201,7 +222,7 @@ s=N.summary(); N._bc[0]=0; br=N.brief()
 chk('each night book reports trail15/trail25/hold W-L and P&L',
     all(set(s['books'][v]['exits'])=={'trail15','trail25','hold'} and all(k in s['books'][v]['exits'][x] for k in ('wins','losses','pnl') for x in s['books'][v]['exits']) for v in N.VARIANTS)
     and set(s['nightExits'])=={'trail15','trail25','hold'})
-chk('brief names t15/t25/hold next to each book and shows trail25 n','t15' in br and 't25' in br and ' hold ' in br and 'unfiltered' in br and 'moogle-55' in br and 'n=' in br)
+chk('brief names t15/t25/hold next to each book and shows trail25 n','t15' in br and 't25' in br and ' hold ' in br and 'unfiltered' in br and 'moogle-55' in br and 'moogle-60+vol' in br and 'n=' in br)
 chk('hold-path book: trail25 P&L matches hold, trail15 does not',
     s['books']['baseline']['exits']['trail25']['pnl']!=0 or s['books']['baseline']['exits']['hold']['wins']>=1)
 chk('ARM25 is +25c with the same 10c giveback and $1 stake',N.ARM25==0.25 and N.DROP==0.10 and N.ARM==0.15 and N.STAKE==1.0)
