@@ -1,5 +1,8 @@
 """Offline checks for manual-flip logging (owner t1141u). No network, no real orders."""
 import os, re, time
+from datetime import datetime
+from paper_tz import ET
+DAY=datetime(2026,11,10,10,22,tzinfo=ET).timestamp()
 os.environ.pop('LIVE_STRATEGIES',None); os.environ['LIVE_TRADING']='0'
 import manualflip as MF, gaplive as GL, live as L, moogle as M
 ok=True
@@ -49,7 +52,7 @@ chk('backfill creates the 3:14 record only (bot ETH sell skipped)',n==1 and len(
 chk('backfill first-seen from order-submitted, ~47s left',its[0]['secondsLeft'] is not None and 40<=its[0]['secondsLeft']<=55)
 chk('backfill sell + entry null (no fills in the log)',len(its[0]['sells'])==1 and its[0]['sells'][0]['price']==0.51 and its[0].get('entry') is None)
 chk('backfill does not invent pnl without entry',its[0].get('pnl') is None)
-# --- cap: manual positions never increment test #3 ---
+# --- used counter: manual positions never increment session #4 ---
 class FakeLV:
     def __init__(s,enabled=True,fill=1.0):
         s.on=enabled; s.calls=[]; s.saved=[]; s.gapLiveUsed=0; s.gapLiveDisabled=False; s.paused=not enabled; s.killed=False; s.fill=fill
@@ -69,12 +72,12 @@ man=dict(id=500,mode='live',shadow=False,adopted=True,tag='manual-flip',manualFl
 MF.seen(man); MF.on_sell(dict(man,status='exited'),0.57,0.51,fee=0.01,at=now)
 chk('manual seen/sell does not increment cap',g.used()==0 and lv.gapLiveUsed==0 and not lv.calls and not lv.gapLiveDisabled)
 sm=g.summary([man, dict(man,status='exited',pnl=0.12)])
-chk('manual flip (no gapLive / no liveOrderId) is excluded from test #3 stats',sm['thisTest']['trades']==0 and sm['thisTest']['closed']==0 and sm['used']==0)
+chk('manual flip (no gapLive / no liveOrderId) is excluded from session 4 stats',sm['thisTest']['trades']==0 and sm['thisTest']['closed']==0 and sm['used']==0)
 # a real gap-live fill still counts
 sig=dict(id='GP1',mode='paper',shadow=False,gap=True,rule='A',pair='BTC-ETH',asset='BTC',laggard='BTC',ticker='KXBTC15M-X1',side='YES',price=0.5,entry=0.5,stake=1,conf='normal',closesAt=time.time()+1000)
 M.CUR['BTC']=dict(ticker=sig['ticker'],t=time.time(),p=0.70)
-g.on_paper(sig)
-chk('real gap-live fill still counts 1/5',lv.gapLiveUsed==1 and g.used()==1 and len(lv.calls)==1)
+g.on_paper(sig,now=DAY)
+chk('real gap-live fill still counts used=1',lv.gapLiveUsed==1 and g.used()==1 and len(lv.calls)==1 and not lv.gapLiveDisabled)
 # --- api / brief / dashboard ---
 MF.reset()
 MF.backfill(orders=orders,trades=[])

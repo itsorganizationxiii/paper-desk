@@ -1,5 +1,8 @@
 """Offline: gap-live WS pre-subscribe, first-quote wait, REST fallback, capped stale retries, staleN rules. No network/orders."""
 import os, time
+from datetime import datetime
+from paper_tz import ET
+DAY=datetime(2026,11,10,10,22,tzinfo=ET).timestamp()
 os.environ['LIVE_TRADING']='0'
 import live as L, gaplive as GL, kws
 GL.moogle_side_p=lambda *a,**k:0.70
@@ -72,20 +75,20 @@ def spy(*a,**k): calls.append(1); return ob(*a,**k)
 lb.buy=spy
 g=GL.GapLive(lb,lambda p,f,st:dict(id=1),log=lambda *a:None)
 P=lambda tk:dict(id='G',mode='paper',shadow=False,gap=True,rule='A',pair='BTC-ETH',asset='BTC',laggard='BTC',ticker=tk,side='YES',price=0.50,openedAt=time.time())
-g.on_paper(P('KXBTC15M-T1'))
+g.on_paper(P('KXBTC15M-T1'),now=DAY)
 chk('stale signal queued for retry','KXBTC15M-T1' in g.pending and len(calls)==1)
-for i in range(10): g.tick()
+for i in range(10): g.tick(now=DAY)
 chk('retries capped at 5 tries total',len(calls)==5 and not g.pending and g.used()==0)
 # 9. retry succeeds once the quote shows up
 lb=mk(rest=None); g=GL.GapLive(lb,lambda p,f,st:dict(id=7),log=lambda *a:None)
-g.on_paper(P('KXBTC15M-T2'))
+g.on_paper(P('KXBTC15M-T2'),now=DAY)
 lb.ws.q['KXBTC15M-T2']=dict(yesBid=0.49,yesAsk=0.50,rx=time.time(),ts=time.time())
-g.tick()
+g.tick(now=DAY)
 chk('retry fills after quote arrives; counts 1/3',lb.sent and g.used()==1 and not g.pending and g.stat['filled']==1)
 chk('recentAttempts carry retry/latency',g.recent[-1]['reason']=='filled' and g.recent[-1]['retry']==1 and 'buySec' in g.recent[-1])
 # 10. retry dropped when live is paused meanwhile
 lb=mk(rest=None); g=GL.GapLive(lb,lambda p,f,st:dict(id=1),log=lambda *a:None)
-g.on_paper(P('KXBTC15M-T3')); lb.enabled=lambda:False; n=len(lb.sent); g.tick()
+g.on_paper(P('KXBTC15M-T3'),now=DAY); lb.enabled=lambda:False; n=len(lb.sent); g.tick(now=DAY)
 chk('paused -> pending retry dropped, no order',not g.pending and len(lb.sent)==n and 'Resume' in g.recent[-1]['reason'])
 # 11. kws prune keeps the most recently watched (current) tickers, not alphabetical
 f=kws.Feed.__new__(kws.Feed); import threading; f.lock=threading.Lock(); f.want=set(); f.wantAt={}; f.ws=None; f.connected=False

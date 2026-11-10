@@ -1,5 +1,8 @@
 """Offline checks for gap-live test #2 (owner t1050): trailing exit -> real sell, 5-trade cap reset. No network, no real orders."""
 import os, time
+from datetime import datetime
+from paper_tz import ET
+DAY=datetime(2026,11,10,10,22,tzinfo=ET).timestamp()
 os.environ.pop('LIVE_STRATEGIES',None); os.environ['LIVE_TRADING']='0'
 import gaplive as GL, live as L
 GL.moogle_side_p=lambda *a,**k:0.70
@@ -34,7 +37,7 @@ def T(contracts=1.87,price=0.50,close=None,tk='KXBTC15M-T1'):
                 liveOrderId='b1',openedAt=time.time()-60,closesAt=close or time.time()+600)
 SELL_ACTS=lambda lv:[o['action'] for o in lv.orders]
 # --- config
-chk('defaults: trail +15c arm / 10c giveback, cap 5, $1, test id 3, Moogle 65%',GL.EXIT==('trail',0.15,0.10) and GL.MAX_TRADES==5 and GL.USD==1.0 and GL.TEST_ID=='3' and GL.MOOGLE_BAR==0.65 and GL.MOOGLE_STALE_SEC==60)
+chk('defaults: trail +15c arm / 10c giveback, no cap, $1, test id 4, Moogle 65%',GL.EXIT==('trail',0.15,0.10) and GL.MAX_TRADES==0 and not GL._has_cap() and GL.USD==1.0 and GL.TEST_ID=='4' and GL.MOOGLE_BAR==0.65 and GL.MOOGLE_STALE_SEC==60)
 chk('guards unchanged: HARD_MAX_USD $2, MAX_CHASE 5c, daily loss $5',L.HARD_MAX_USD==2.0 and L.MAX_CHASE==0.05 and L.DAILY_LOSS==5.0)
 # --- 1. arming
 t=T(); now=time.time()
@@ -109,9 +112,9 @@ lv=L.Live(store_load=lambda:dict(gapLiveUsed=3,gapLiveDisabled=True,paused=False
 g=GL.GapLive(lv,lambda p,f,st:dict(id=1),log=lambda *a:None)
 chk('before reset: test #1 counters loaded (3, disabled)',lv.gapLiveUsed==3 and lv.gapLiveDisabled)
 chk('reset_for_test runs once',g.reset_for_test() is True and g.reset_for_test() is False)
-chk('after reset: used 0 / max 5, auto-disable cleared',g.used()==0 and not g.disabled() and GL.MAX_TRADES==5)
+chk('after reset: used 0, auto-disable cleared, no cap',g.used()==0 and not g.disabled() and not GL._has_cap())
 lv.allowed=lambda:True
-chk('after reset: live PAUSED (owner must Resume)',lv.paused is True and 'Resume' in str(g.block_reason(dict(rule='A',pair='BTC-ETH',asset='BTC',laggard='BTC',ticker='KXBTC15M-Z',mode='paper',gap=True))))
+chk('after reset: live PAUSED (owner must Resume)',lv.paused is True and 'Resume' in str(g.block_reason(dict(rule='A',pair='BTC-ETH',asset='BTC',laggard='BTC',ticker='KXBTC15M-Z',mode='paper',gap=True),now=DAY)))
 st=saved[-1] if saved else {}
 chk('reset persisted with test id + previous test record',st.get('gapLiveTest')==GL.TEST_ID and st.get('gapLiveUsed')==0 and st.get('paused') is True and st.get('gapLivePrev',[{}])[-1].get('used')==3)
 lv2=L.Live(store_load=lambda:st); g2=GL.GapLive(lv2,lambda *a:None,log=lambda *a:None)
@@ -125,13 +128,13 @@ class F:
     def buy(s,asset,tk,side,frac,ref,**kw): s.calls.append(kw); return dict(contracts=2.0,price=0.5,fee=0.02,cost=1.0,orderId=f'o{len(s.calls)}',cash=20,frac=1,side=side)
 f=F(); opened=[]; g=GL.GapLive(f,lambda p,fl,st:(opened.append(dict(p)),dict(id=len(opened)))[1],log=lambda *a:None)
 P=lambda i,**k:dict(dict(id=f'G{i}',mode='paper',shadow=False,gap=True,rule='A',pair='BTC-ETH',asset='BTC',laggard='BTC',ticker=f'KXBTC15M-C{i}',side='YES',price=0.5,stake=1.0,conf='normal',closesAt=9e9),**k)
-for i in range(5): g.on_paper(P(i))
-chk('5 fills then auto-disabled',f.gapLiveUsed==5 and f.gapLiveDisabled and len(f.calls)==5)
-chk('6th signal: no order',g.on_paper(P(6)) is None and len(f.calls)==5 and 'cap reached' in g.stat['lastReason'])
+for i in range(5): g.on_paper(P(i),now=DAY)
+chk('5 fills do not auto-disable (no cap)',f.gapLiveUsed==5 and not f.gapLiveDisabled and len(f.calls)==5 and g.active())
+chk('6th signal still fills',g.on_paper(P(6),now=DAY) is not None and len(f.calls)==6 and f.gapLiveUsed==6 and not f.gapLiveDisabled)
 chk('opened trades tagged trail exit + test id',opened and opened[0].get('_gapLiveExit')=='trail' and opened[0].get('_gapLiveTest')==GL.TEST_ID)
 # --- 6. strong tier never live
 f=F(); g=GL.GapLive(f,lambda *a:dict(id=1),log=lambda *a:None)
-g.on_paper(P(1,stake=3.0,conf='strong'))
+g.on_paper(P(1,stake=3.0,conf='strong'),now=DAY)
 chk('strong $3 paper signal -> live usd=$1',f.calls and f.calls[-1].get('usd')==1.0)
 lb=L.Live(); lb.enabled=lambda:True; lb.owner=lambda:True; lb.balance=lambda:50.0; lb._quote=lambda tk,side,k:0.50
 ords=[]; lb._order=lambda tk,side,act,n,px,confirm=None:(ords.append(n),(200,n,px,0.02,'o',None))[1]; lb.pending=lambda *a,**k:None; lb.log=lambda **k:None; lb.verify=lambda *a:None
@@ -139,15 +142,15 @@ lb.buy('BTC','KXBTC15M-S1','YES',1.0,0.50,usd=3.0)
 chk('even usd=3 is capped at HARD_MAX_USD $2 in Live.buy',ords and ords[-1]==4.0)
 # --- 7. XRP laggard block
 f=F(); g=GL.GapLive(f,lambda *a:dict(id=1),log=lambda *a:None)
-chk('SOL-XRP with XRP laggard blocked, no order',g.on_paper(P(1,pair='SOL-XRP',asset='XRP',laggard='XRP',ticker='KXXRP15M-X1')) is None and not f.calls and 'XRP' in g.stat['lastReason'])
-chk('SOL-XRP with SOL laggard allowed',g.on_paper(P(2,pair='SOL-XRP',asset='SOL',laggard='SOL',ticker='KXSOL15M-X2')) is not None and len(f.calls)==1)
+chk('SOL-XRP with XRP laggard blocked, no order',g.on_paper(P(1,pair='SOL-XRP',asset='XRP',laggard='XRP',ticker='KXXRP15M-X1'),now=DAY) is None and not f.calls and 'XRP' in g.stat['lastReason'])
+chk('SOL-XRP with SOL laggard allowed',g.on_paper(P(2,pair='SOL-XRP',asset='SOL',laggard='SOL',ticker='KXSOL15M-X2'),now=DAY) is not None and len(f.calls)==1)
 ex=Ex(pos=1.0); lv=mklive(ex); g=GL.GapLive(lv,lambda *a:None,log=lambda *a:None)
 xt=T(tk='KXXRP15M-T1'); g.manage_exits([xt],lambda x:0.70); g.manage_exits([xt],lambda x:0.60)
 chk('XRP ticker never sold by trail; Live.sell XRP hard block intact',not ex.posts and lv.sell('KXXRP15M-T1','YES',1,0.6)[4].startswith('blocked'))
 # --- /api/gaplive summary + server wiring
 lv=L.Live(store_load=lambda:dict(gapLiveUsed=3,gapLiveDisabled=True)); lv.owner=lambda:True
 g=GL.GapLive(lv,lambda *a:None,log=lambda *a:None); g.reset_for_test(); sm=g.summary([])
-chk('summary: trail exit, cap 5, used 0, live disabled',sm['exitConfig']['mode']=='trail' and sm['exitConfig']['armC']==15 and sm['exitConfig']['givebackC']==10 and sm['max']==5 and sm['used']==0 and sm['liveEnabled'] is False and sm['liveEngine']['paused'] is True and sm['test']=='3' and sm['previousTests'][-1]['used']==3 and sm['moogleGate']['bar']==0.65 and sm['moogleGate']['staleSec']==60)
+chk('summary: trail exit, no cap, used 0, live paused, session 4',sm['exitConfig']['mode']=='trail' and sm['exitConfig']['armC']==15 and sm['exitConfig']['givebackC']==10 and sm['max'] is None and sm['used']==0 and sm['liveEnabled'] is False and sm['liveEngine']['paused'] is True and sm['test']=='4' and sm['previousTests'][-1]['used']==3 and sm['moogleGate']['bar']==0.65 and sm['moogleGate']['staleSec']==60 and sm['midnightSkip'] is True and sm['metals']['minGap']==0.06)
 src=open('server.py').read()
 chk('server: openLiveGap records exitMode/test id',"exitMode=p.get('_gapLiveExit') or 'hold',gapLiveTest=p.get('_gapLiveTest')" in src)
 chk('server: manage_exits wired in tick under lock',"with lock: GAPLIVE.manage_exits(pt.trades,lambda t:_gap_live_bid(t,_gm))" in src)

@@ -1,5 +1,8 @@
 """Offline: gap-live hot-path speed (owner cache, async log, balance cache/prefetch, stage timings, async dispatch, ws callback decoupling)."""
 import os, time, json, threading
+from datetime import datetime
+from paper_tz import ET
+DAY=datetime(2026,11,10,10,22,tzinfo=ET).timestamp()
 os.environ['LIVE_TRADING']='0'
 import live as L, gaplive as GL, kws
 GL.moogle_side_p=lambda *a,**k:0.70
@@ -76,19 +79,20 @@ emitted=[]
 g=GL.GapLive(lb,lambda p,f,st:dict(id=9),log=lambda *a:None); g.async_=True; g.emit=lambda p:emitted.append(p.get('liveTwinId'))
 P=lambda tk,asset='BTC':dict(id='G',mode='paper',shadow=False,gap=True,rule='A',pair='BTC-ETH' if asset!='SOL' else 'SOL-XRP',asset=asset,laggard=asset,ticker=tk,side='YES',price=0.50,openedAt=time.time())
 for tk in ('KXBTC15M-A1','KXSOL15M-A1'): lb.ws.q[tk]=dict(yesBid=0.49,yesAsk=0.50,rx=time.time(),ts=time.time())
-t0=time.time(); g.on_paper(P('KXBTC15M-A1')); g.on_paper(P('KXSOL15M-A1','SOL')); dt=time.time()-t0
+t0=time.time(); g.on_paper(P('KXBTC15M-A1'),now=DAY); g.on_paper(P('KXSOL15M-A1','SOL'),now=DAY); dt=time.time()-t0
 chk('on_paper returns immediately (buy on its own thread)',dt<0.1 and g.inflight==2)
 time.sleep(1.5)
-chk('both buys ran in parallel and filled; cap counted',g.used()==2 and g.inflight==0 and len(lb.sent)==2)
+chk('both buys ran in parallel and filled; used counted',g.used()==2 and g.inflight==0 and len(lb.sent)==2)
 chk('paper twin re-emitted with liveTwinId',emitted==[9,9])
 ra=g.summary([])['recentAttempts'][0]
 chk('recentAttempts include stage timings',isinstance(ra.get('stages'),dict) and 'order' in ra['stages'] and ra['buySec']<1.5)
-lb.gapLiveUsed=GL.MAX_TRADES-1; lb.tried.clear()
+# session 4: no cap — two more in-flight buys are both allowed, never auto-disabled
+lb.tried.clear()
 for tk in ('KXBTC15M-A2','KXSOL15M-A2'): lb.ws.q[tk]=dict(yesBid=0.49,yesAsk=0.50,rx=time.time(),ts=time.time())
-g.on_paper(P('KXBTC15M-A2')); g.on_paper(P('KXSOL15M-A2','SOL'))
-chk('cap reservation: max-1 used + 1 in flight blocks the 2nd signal',g.inflight==1 and 'cap reserved' in g.stat['lastReason'])
+g.on_paper(P('KXBTC15M-A2'),now=DAY); g.on_paper(P('KXSOL15M-A2','SOL'),now=DAY)
+chk('no cap reservation: both additional signals in flight',g.inflight==2)
 time.sleep(1.2)
-chk('cap reached at max, auto-disabled',g.used()==GL.MAX_TRADES and lb.gapLiveDisabled and len(lb.sent)==3)
+chk('no auto-disable after more fills',g.used()==4 and not lb.gapLiveDisabled and len(lb.sent)==4 and g.active())
 # 7. kws: slow on_quote callback no longer delays the quote cache
 f=kws.Feed('ws://127.0.0.1:1/x',lambda:{}); f.on_quote=lambda tk,q:time.sleep(0.5)
 now=time.time(); t0=time.time()

@@ -990,7 +990,7 @@ def tick_once():
     except Exception: _gm['DOGE']=None
     try: SPEC.log_crypto_gap({x:_gm.get(x) for x in ('BTC','ETH','SOL','XRP','DOGE')})  # research only
     except Exception: pass
-    try: GAPLIVE.presubscribe(_gm)   # warm WS quotes for the BTC/ETH/SOL gap legs before any signal (read-only market data)
+    try: GAPLIVE.presubscribe(_gm)   # warm WS quotes for the BTC/ETH/SOL/GOLD/SILVER gap legs before any signal (read-only market data)
     except Exception as e: print('gaplive presub err',e,flush=True)
     try:  # pairing-gap SHADOW only (separate book, never live, never pt.trades)
         with CPU.timed('gaps.on_tick'): GAPS.on_tick(_gm)
@@ -1242,7 +1242,7 @@ def _gap_live_open(p,fill,strike):
 GAPLIVE=GL.GapLive(LV,_gap_live_open,log=lambda *a:print(*a,flush=True))
 GAPS.LIVE[0]=GAPLIVE.on_paper
 GAPLIVE.async_=True; GAPLIVE.emit=GAPS._emit; GAPLIVE.tlock=lock; GAPLIVE.save=pt.save
-try: GAPLIVE.reset_for_test()   # test #3: once per GAP_LIVE_TEST id -> used 0/5, auto-disable cleared, live PAUSED until owner Resume
+try: GAPLIVE.reset_for_test()   # session #4: once per GAP_LIVE_TEST id -> used 0, auto-disable cleared, live PAUSED until owner Resume
 except Exception as e: print('gaplive reset err',e,flush=True)   # live buy on its own thread the moment the paper signal opens
 # SHADOW-ONLY entry filters on gap trades (tags only; skip2L per book: gapShadow = rules A/B/C combined, gapPaper = paper book)
 def _gap_ftag(t,book):

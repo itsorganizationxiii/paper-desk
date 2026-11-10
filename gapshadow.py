@@ -62,7 +62,7 @@ TRADES=[]; _seen=set(); _lk=threading.Lock(); _path=[None]
 PAPER=[]; _pseen=set()
 QUOTE=[None]   # fn(ticker)->{'yesBid','yesAsk'} fresh quote (server: websocket cache) or None
 SINK=[None]    # fn(trade) persistence hook; must be non-blocking
-LIVE=[None]    # fn(paper_trade,laggard_market) gap-LIVE hook (gaplive.GapLive.on_paper); hard-capped, Rule A only, never XRP
+LIVE=[None]    # fn(paper_trade,laggard_market) gap-LIVE hook (gaplive.GapLive.on_paper); Rule A paper twins + GOLD-SILVER shadow (liveFromShadow, not a paper trade)
 FILTER=[None]  # fn(trade,book) SHADOW-ONLY filter tagger (filtershadow); adds t['filters'] only, never blocks a trade
 PSTAT=dict(opened=0,nofill=0,skipped=0)
 # SHADOW exit variants (Nov 9, research only): every gap trade (shadow + paper) logs what each take-profit variant WOULD have
@@ -284,6 +284,13 @@ def _add(t,out,m=None):
         try:
             LIVE[0](p,m)
             if p.get('liveTwinId') is not None: _emit(p)
+        except Exception as e: print('gaplive hook err',e,flush=True)
+    elif (not p) and t.get('rule')=='A' and t.get('pair')=='GOLD-SILVER' and LIVE[0] is not None:
+        # Live session #4: offer GOLD-SILVER Rule A to the live hook without opening a paper trade.
+        # Payload is paper-shaped so gaplive.block_reason accepts it; liveFromShadow prevents emit into the paper book.
+        try:
+            sig=dict(t,mode='paper',shadow=False,gap=True,asset=t.get('laggard'),price=t.get('entry') or t.get('price'),liveFromShadow=True)
+            LIVE[0](sig,m)
         except Exception as e: print('gaplive hook err',e,flush=True)
 def _ftag(t,book):
     if FILTER[0] is None: return
