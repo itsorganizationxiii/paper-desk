@@ -115,8 +115,31 @@ chk('/api/moogleedge payload: status, feed lag, current p, trades, summary',all(
 chk('never called live.api / urlopen',CALLS==[])
 chk('live state unchanged (paused, used, test id)',json.dumps(lv.state(),sort_keys=True,default=str)==before and saved==[])
 ss=open('server.py').read(); mo=[l.strip() for l in ss.splitlines() if 'MOOG.' in l]
-chk('server uses MOOG only for boot/persist hook, tick shadow call, status brief and /api/moogleedge',
-    all(any(x in l for x in ('MOOG.load','MOOG.merge_in','MOOG.SINK','MOOG.start','MOOG.on_spec(sigs); MOOG.settle(_pl_result)','MOOG.brief()','MOOG.api(','MOOG.MAX_KEEP')) for l in mo) and len(mo)==7)
+chk('server uses MOOG only for boot/persist hook, tick shadow call, status brief, /api/moogleedge and display-only source indicator',
+    all(any(x in l for x in ('MOOG.load','MOOG.merge_in','MOOG.SINK','MOOG.start','MOOG.on_spec(sigs); MOOG.settle(_pl_result)','MOOG.brief()','MOOG.api(','MOOG.MAX_KEEP','MOOG.feed_status')) for l in mo) and len(mo)==8)
+chk('display-only moogleedge_source uses lastRxAgo vs 60s and does not touch trading hooks',
+    'def moogleedge_source(' in ss and 'now-last<=60' in ss and "src['moogleedge']=moogleedge_source()" in ss)
+# unit-test the 60s live/stale rule against feed_status's lastRxAgo (no server import)
+import types as _types
+_fn=[l for l in ss.splitlines() if 'def moogleedge_source' in l or 'MOOG.feed_status' in l or 'lastRxAgo' in l or 'now-last<=60' in l]
+# Reconstruct moogleedge_source against a stub feed
+def _run_ind(coins, now):
+    class _MOOG:
+        @staticmethod
+        def feed_status(t):
+            return dict(coins=coins)
+    g={'time':__import__('time'),'MOOG':_MOOG}
+    # exec only the helper from server.py
+    start=ss.index('def moogleedge_source(')
+    end=ss.index('try:\n    MOOG.load', start)
+    exec(ss[start:end], g)
+    # time.time not used if now passed
+    return g['moogleedge_source'](now)
+chk('moogleedge_source live when last successful read is 5s old', _run_ind({'BTC':dict(lastRxAgo=5.0)}, 1000.0)=='live')
+chk('moogleedge_source stale when last successful read is 61s old', _run_ind({'BTC':dict(lastRxAgo=61.0)}, 1000.0)=='stale')
+chk('moogleedge_source live at exactly 60s', _run_ind({'ETH':dict(lastRxAgo=60.0)}, 1000.0)=='live')
+chk('moogleedge_source live if any coin is fresh', _run_ind({'BTC':dict(lastRxAgo=90.0),'ETH':dict(lastRxAgo=10.0)}, 1000.0)=='live')
+chk('moogleedge_source stale when no successful read', _run_ind({'BTC':dict(lastRxAgo=None)}, 1000.0)=='stale')
 try:
     df=subprocess.run(['git','diff','--name-only','HEAD','--','live.py','gaplive.py','kws.py','trader_lease.py','spec.py','gapshadow.py','gaplimit.py'],capture_output=True,text=True).stdout.strip()
     chk('no diff in live/spec/gap code',df=='')

@@ -51,8 +51,9 @@ chk('gap live / limit / trail hooks unchanged in source',
     'GAPLIVE.tick()' in src and 'GAPLIVE.manage_exits' in src and 'gaplimit' in src)
 
 html=open('index.html').read()
-chk('dashboard banner says Spec skipping, not FALLBACK (Coinbase only)',
-    'EloEdge unavailable — Spec skipping (no Coinbase fallback)' in html
+chk('dashboard banner says Spec paused (EloEdge removed), not FALLBACK',
+    'Spec paused (EloEdge removed)' in html
+    and 'moogleedge' in html and "['coinbase','kalshi','moogleedge']" in html
     and 'FALLBACK (Coinbase only)' not in html)
 
 # ---- predlog skip counts surface the new reason ----

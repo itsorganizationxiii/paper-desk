@@ -1031,6 +1031,8 @@ def tick_once():
     except Exception: pass
     with lock: pt.settle(spot)
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
+    try: src['moogleedge']=moogleedge_source()
+    except Exception: src['moogleedge']='stale'
     fb=src.get('eloedge')!='live'
     status.update(metalsClosed=metals_closed(),nightMode=night(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=False,
         signalMode='SKIP: EloEdge unavailable — no Coinbase-fallback Spec entries' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
@@ -1113,6 +1115,20 @@ except Exception as e: print('gaplimit persist boot err',e,flush=True)
 GAPS.QUOTE[0]=lambda tk:(LV.wsq(tk) if LV is not None else None)
 GLIM.QUOTE[0]=GAPS.QUOTE[0]   # read-only quote cache for the limit shadow
 import moogle as MOOG   # MoogleEdge SHADOW (owner t1077u): read-only CF RTI feed + shadow book; no order path
+def moogleedge_source(now=None):
+    """DISPLAY ONLY: 'live' if the MoogleEdge CF RTI poller's last successful read is <=60s old, else 'stale'. Does not change trading."""
+    now=time.time() if now is None else now
+    try:
+        last=None
+        for v in (MOOG.feed_status(now).get('coins') or {}).values():
+            ago=v.get('lastRxAgo')
+            if ago is not None:
+                t=now-ago
+                if last is None or t>last: last=t
+        if last is not None and now-last<=60: return 'live'
+    except Exception:
+        pass
+    return 'stale'
 try:
     MOOG.load(DATA)
     if GP.enabled():
