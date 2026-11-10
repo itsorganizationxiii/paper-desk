@@ -104,6 +104,7 @@ N.on_tick(mkts(eth=(0.80,0.82)),NIGHT+30,signals=[]); chk('trail arms on bid 0.8
 N.on_tick(mkts(eth=(0.69,0.71)),NIGHT+60,signals=[])
 chk('trail exits baseline/n1 on 10c giveback (bid 0.69 <= 0.80-0.10)',it['baseline']['exit']==0.69 and it['n1']['exit']==0.69 and it['baseline']['pnl'] is not None)
 chk('n2 skipped item has no trail exit',it['n2'].get('exit') is None and it['n2']['status']=='skipped')
+chk('trail25 does not arm or exit on the +15c wick (peak 0.80 < entry 0.61+0.25)',it['baseline'].get('trailArmedAt25') is None and it['baseline'].get('exit25') is None and it['n1'].get('exit25') is None)
 for t_ in G.TRADES:
     if t_['rule']=='A' and t_['pair']=='BTC-ETH': t_['settle']='no'
 N.settle(lambda tk:None,CLOSE_N+10)
@@ -133,6 +134,62 @@ chk('summary: three books + skip reasons + persist TTL note',set(s['books'])=={'
 chk('summary W-L counts night entries only (day logged separately)',s['dayLogged']>=3 and 'day-not-applicable' in s['daySkipReasons'] and all(o['status']!='filled' or o.get('session')=='night' for o in N.ITEMS))
 chk('brief is a short string with Night mode variant names',isinstance(N.brief(),str) and 'unfiltered' in N.brief() and 'moogle-65' in N.brief())
 sess=N.session_now(NIGHT); chk('session_now reports night at 3 AM ET',sess['isNight'] is True and sess['label']=='night' and sess['window']=='5 PM-6 AM ET')
+# ---- trail25: arms later than trail15, keeps tracking after trail15 exits, sell at bid, $1 flat ----
+N.ITEMS.clear(); N._by.clear(); N._seen.clear(); SUNK.clear()
+st25=dict(rule='A',mode='shadow',pair='BTC-ETH',laggard='ETH',leader='BTC',ticker='KXETH15M-T25',side='YES',entry=0.61,
+          closesAt=CLOSE_N+7200,openedAt=NIGHT,gapDown=0.2,leaderYesMid=0.80,laggardYesMid=0.61)
+M.CUR['ETH']=dict(p=0.70,ticker='KXETH15M-T25',t=NIGHT-1)
+def _eth(tk,bidask,close):
+    m=mkts(eth=bidask,close=close); m['ETH']['ticker']=tk; return m
+N.on_tick(_eth('KXETH15M-T25',(0.59,0.61),CLOSE_N+7200),NIGHT,signals=[st25])
+it25={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-T25'}
+chk('trail25 fixture: baseline/n1 fill at 0.61, $1 stake',it25['baseline']['status']=='filled' and it25['baseline']['entry']==0.61 and it25['n1']['status']=='filled' and N.STAKE==1.0)
+N.on_tick(_eth('KXETH15M-T25',(0.80,0.82),CLOSE_N+7200),NIGHT+30,signals=[])
+chk('bid 0.80 arms trail15 only (0.61+0.15), not trail25 (need 0.86)',it25['baseline'].get('trailArmedAt') is not None and it25['baseline'].get('trailArmedAt25') is None and it25['baseline'].get('exit') is None and it25['baseline'].get('exit25') is None)
+N.on_tick(_eth('KXETH15M-T25',(0.69,0.71),CLOSE_N+7200),NIGHT+60,signals=[])
+chk('bid 0.69 exits trail15 and leaves trail25 open (not yet armed)',it25['baseline']['exit']==0.69 and it25['n1']['exit']==0.69 and it25['baseline'].get('exit25') is None and it25['baseline'].get('trailArmedAt25') is None)
+# trail25 keeps ticking after trail15 has exited
+N.on_tick(_eth('KXETH15M-T25',(0.90,0.92),CLOSE_N+7200),NIGHT+90,signals=[])
+chk('bid 0.90 arms trail25 (peak 0.90 >= 0.61+0.25) after trail15 already exited',it25['baseline'].get('trailArmedAt25') is not None and it25['baseline'].get('exit25') is None and it25['baseline']['exit']==0.69 and it25['baseline']['peakBid25']==0.90)
+N.on_tick(_eth('KXETH15M-T25',(0.79,0.81),CLOSE_N+7200),NIGHT+120,signals=[])
+want25=round(it25['baseline']['contracts']*0.79-N.fee(it25['baseline']['contracts'],0.79)-N.STAKE,2)
+chk('trail25 exits on 10c giveback at the bid (0.79 <= 0.90-0.10), same fee formula as trail15',
+    it25['baseline']['exit25']==0.79 and it25['n1']['exit25']==0.79
+    and it25['baseline']['pnl25']==want25 and it25['n1']['pnl25']==round(it25['n1']['contracts']*0.79-N.fee(it25['n1']['contracts'],0.79)-N.STAKE,2)
+    and it25['baseline']['exitReason25'].startswith('trail25:')
+    and it25['baseline']['id'] in SUNK)
+# trail25 never arms -> hold at settlement
+st25h=dict(st25); st25h.update(ticker='KXETH15M-T25H',closesAt=CLOSE_N+8100)
+M.CUR['ETH']=dict(p=0.70,ticker='KXETH15M-T25H',t=NIGHT-1)
+N.on_tick(_eth('KXETH15M-T25H',(0.59,0.61),CLOSE_N+8100),NIGHT,signals=[st25h])
+ith25={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-T25H'}
+N.on_tick(_eth('KXETH15M-T25H',(0.80,0.82),CLOSE_N+8100),NIGHT+30,signals=[])
+N.on_tick(_eth('KXETH15M-T25H',(0.69,0.71),CLOSE_N+8100),NIGHT+60,signals=[])
+chk('hold-path setup: trail15 exited, trail25 still open',ith25['baseline']['exit']==0.69 and ith25['baseline'].get('exit25') is None)
+for o in ith25.values(): o['closesAt']=CLOSE_N
+N.settle(lambda tk:'yes',CLOSE_N+10)
+chk('trail25 never armed -> pnl25 equals hold_pnl (YES win) and heldToSettle25',
+    ith25['baseline']['heldToSettle25'] is True and ith25['baseline']['pnl25']==ith25['baseline']['hold_pnl']
+    and ith25['baseline']['hold_pnl']>0 and ith25['baseline']['pnl']!=ith25['baseline']['hold_pnl']
+    and ith25['n1']['pnl25']==ith25['n1']['hold_pnl'])
+# pre-deploy record: seed peakBid25 from existing peakBid, then giveback exits trail25
+N.merge_in([dict(id='shadow|A|BTC-ETH|999.000|baseline',shadowKey='shadow|A|BTC-ETH|999.000',variant='baseline',
+                 variantName='unfiltered',mode='shadow',book='gap-night',rule='A',pair='BTC-ETH',laggard='ETH',
+                 leader='BTC',ticker='KXETH15M-SEED',side='YES',entry=0.61,contracts=ith25['baseline']['contracts'],
+                 entryFee=ith25['baseline']['entryFee'],status='filled',session='night',closesAt=CLOSE_N+9000,
+                 openedAt=NIGHT,exit=0.69,pnl=0.08,peakBid=0.90,trailArmedAt=NIGHT+10,settle=None)])
+mseed=mkts(eth=(0.79,0.81),close=CLOSE_N+9000); mseed['ETH']['ticker']='KXETH15M-SEED'
+N.on_tick(mseed,NIGHT+200,signals=[]); seed=N._by['shadow|A|BTC-ETH|999.000|baseline']
+chk('pre-deploy peakBid seeds trail25 peak and a 10c giveback can still exit',
+    seed.get('peakBid25')==0.90 and seed.get('trailArmedAt25') is not None and seed.get('exit25')==0.79)
+s=N.summary(); N._bc[0]=0; br=N.brief()
+chk('each night book reports trail15/trail25/hold W-L and P&L',
+    all(set(s['books'][v]['exits'])=={'trail15','trail25','hold'} and all(k in s['books'][v]['exits'][x] for k in ('wins','losses','pnl') for x in s['books'][v]['exits']) for v in N.VARIANTS)
+    and set(s['nightExits'])=={'trail15','trail25','hold'})
+chk('brief names t15/t25/hold next to each book','t15' in br and 't25' in br and ' hold ' in br and 'unfiltered' in br)
+chk('hold-path book: trail25 P&L matches hold, trail15 does not',
+    s['books']['baseline']['exits']['trail25']['pnl']!=0 or s['books']['baseline']['exits']['hold']['wins']>=1)
+chk('ARM25 is +25c with the same 10c giveback and $1 stake',N.ARM25==0.25 and N.DROP==0.10 and N.ARM==0.15 and N.STAKE==1.0)
 # persistence roundtrip
 snap=N.snapshot(); n0=len(snap); N.ITEMS.clear(); N._by.clear(); N._seen.clear(); N.merge_in(snap+[dict(snap[0],settle=None)])
 chk('merge_in restores items (settled beats open, no dupes)',len(N.ITEMS)==n0 and N._by[snap[0]['id']]['settle']==snap[0].get('settle'))

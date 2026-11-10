@@ -1,8 +1,11 @@
-"""Gap NIGHT-MODE SHADOW (owner t1093u/t1095u, Nov 9 2026). PAPER/SHADOW ONLY: no order path, imports nothing from
+"""Gap NIGHT-MODE SHADOW (owner t1093u/t1095u/t1102u, Nov 10 2026). PAPER/SHADOW ONLY: no order path, imports nothing from
 live/gaplive, never touches pt.trades, the gap paper book, gap live (cap/used/paused), Spec, MoogleEdge's book,
 the limit shadow or the regime shadow books. Night = 5 PM-6 AM ET; day rounds are logged as not-applicable only.
 Applied to gap Rule A SHADOW signals on BTC-ETH, and SOL-XRP when XRP is not the laggard, $1 flat.
-Exit = gap paper trail (arm entry+15c, 10c giveback, minus taker fee) else hold; hold_pnl always recorded at settle.
+Each night book tracks three EXIT variants on the same fill (same $1, same bid feed as the gap paper trail):
+  trail15 : arm entry+15c / 10c giveback, sell at bid (original night shadow exit; also stored in exit/pnl).
+  trail25 : arm entry+25c / 10c giveback, sell at bid (shadow only; stored in exit25/pnl25).
+  hold    : hold to settlement (hold_pnl). A trail that never fires also falls through to hold at settle.
 VARIANTS (each its own $1 book on every eligible night signal):
   baseline 'unfiltered' : enter every eligible night Rule A signal (comparison book).
   n1       'moogle-65'  : enter only if the live MoogleEdge shadow p for the traded side is >= 0.65 at entry.
@@ -17,15 +20,20 @@ except Exception: ET=None
 E=os.environ.get
 ENABLED=E('GAP_NIGHT','1')!='0'
 MOOGLE_BAR=float(E('GAP_NIGHT_MOOGLE_BAR','0.65'))
-ARM=0.15; DROP=0.10; STAKE=1.0; FRESH_SEC=15.0; MAX_KEEP=int(E('GAP_NIGHT_MAX_KEEP','3000'))
+ARM=0.15; ARM25=0.25; DROP=0.10; STAKE=1.0; FRESH_SEC=15.0; MAX_KEEP=int(E('GAP_NIGHT_MAX_KEEP','3000'))
 FILE_SAVE_SEC=60.0; TTL_DAYS=int(E('GAP_NIGHT_TTL_DAYS','120'))
 PAIRS=frozenset(('BTC-ETH','SOL-XRP'))
 VARIANTS=('baseline','n1','n2'); VNAME={'baseline':'unfiltered','n1':'moogle-65','n2':'moogle-65+vol'}
+# Field maps for the two trail exit variants. trail15 keeps the original field names so existing records stay valid.
+T15=dict(peak='peakBid',armed='trailArmedAt',exit='exit',exitFee='exitFee',pnl='pnl',
+         exitedAt='exitedAt',exitLeftSec='exitLeftSec',exitReason='exitReason',label='trail')
+T25=dict(peak='peakBid25',armed='trailArmedAt25',exit='exit25',exitFee='exitFee25',pnl='pnl25',
+         exitedAt='exitedAt25',exitLeftSec='exitLeftSec25',exitReason='exitReason25',label='trail25')
 QUOTE=[None]   # fn(ticker)->{'yesBid','yesAsk'} read-only WS quote cache
 SINK=[None]    # fn(item) non-blocking persistence (server: GP.upsert, lease-gated)
 ITEMS=[]; _by={}; _seen=set(); _lk=threading.RLock(); _path=[None]
 STAT=dict(signals=0,nightSignals=0,daySignals=0,entries=0,skipped=0,skippedDay=0,skippedMoogleCold=0,
-          skippedMoogleBar=0,skippedLowVol=0,skippedXrp=0,trailExits=0,settled=0,errors=0)
+          skippedMoogleBar=0,skippedLowVol=0,skippedXrp=0,trailExits=0,trail25Exits=0,settled=0,errors=0)
 _st=dict(lastFile=0.0,fileDirty=False)
 def fee(c,p): return math.ceil(7*c*p*(1-p))/100
 def _f(x):
@@ -72,7 +80,7 @@ def _low_vol(vol):
     return prev is not None and med is not None and prev<med-1e-9
 def _entry(o,price):
     c0=STAKE/price; ef=fee(c0,price)
-    o.update(status='filled',entry=round(price,4),contracts=round(max(STAKE-ef,0.001)/price,4),entryFee=ef,peakBid=None)
+    o.update(status='filled',entry=round(price,4),contracts=round(max(STAKE-ef,0.001)/price,4),entryFee=ef,peakBid=None,peakBid25=None)
 def _bump_skip(reason):
     STAT['skipped']+=1
     if reason=='day-not-applicable': STAT['skippedDay']+=1
@@ -112,7 +120,7 @@ def make_items(st,m,now):
                pair=pair,laggard=lag,leader=st.get('leader'),ticker=st['ticker'],side=side,signalSide=side,
                signalAsk=float(st['entry']),closesAt=st['closesAt'],openedAt=now,leftSec=round(st['closesAt']-now,1),
                session=session,status=None,skipReason=None,entry=None,contracts=None,entryFee=None,exit=None,exitFee=None,
-               pnl=None,hold_pnl=None,settle=None,settledAt=None,gapDown=st.get('gapDown'),
+               pnl=None,hold_pnl=None,exit25=None,exitFee25=None,pnl25=None,settle=None,settledAt=None,gapDown=st.get('gapDown'),
                leaderYesMid=st.get('leaderYesMid'),laggardYesMid=st.get('laggardYesMid'),tags=tags)
         why=_reason(v,night,pair,lag,mp,vol)
         if why is None: _entry(o,float(st['entry'])); STAT['entries']+=1
@@ -124,25 +132,43 @@ def make_items(st,m,now):
             for o in ITEMS[:len(ITEMS)-MAX_KEEP]: _by.pop(o['id'],None)
             del ITEMS[:len(ITEMS)-MAX_KEEP]
     return out
+def _tick_trail(o,bid,now,arm,f):
+    """Advance one trail exit (trail15 or trail25) on the current bid. Sell at bid, same fee as gap paper trail.
+    trail25 seeds peakBid25 from an existing peakBid once so pre-deploy peaks are not lost. Returns True if the
+    item changed (armed or exited)."""
+    if o.get(f['exit']) is not None: return False
+    if f['peak']=='peakBid25' and o.get('peakBid25') is None and o.get('peakBid') is not None:
+        o['peakBid25']=o['peakBid']
+    o[f['peak']]=round(max(o.get(f['peak']) or 0,bid),4)
+    ch=False
+    if o[f['peak']]>=o['entry']+arm-1e-9:
+        if not o.get(f['armed']): o[f['armed']]=now; ch=True
+        if bid<=o[f['peak']]-DROP+1e-9:
+            xf=fee(o['contracts'],bid)
+            o[f['exit']]=round(bid,4); o[f['exitFee']]=xf
+            o[f['pnl']]=round(o['contracts']*bid-xf-STAKE,2)
+            o[f['exitedAt']]=now; o[f['exitLeftSec']]=round(o['closesAt']-now,1)
+            o[f['exitReason']]=f"{f['label']}: peak {o[f['peak']]:.2f} (armed at {o['entry']:.2f}+{arm:.2f}) -> bid {bid:.2f}"
+            ch=True
+    return ch
 def on_tick(mkts,now=None,signals=None):
-    """Pure paper bookkeeping on Rule A shadow signals (gapshadow.TRADES); trail exits for open night items."""
+    """Pure paper bookkeeping on Rule A shadow signals (gapshadow.TRADES); trail15 + trail25 exits for open night items."""
     if not ENABLED: return []
     now=time.time() if now is None else now; ch=[]
     mkts={k:v for k,v in (mkts or {}).items() if isinstance(v,dict)}
-    with _lk: cur=[o for o in ITEMS if o['status']=='filled' and o.get('exit') is None and now<o['closesAt']]
+    with _lk: cur=[o for o in ITEMS if o['status']=='filled' and o.get('session')=='night' and now<o['closesAt']
+                   and (o.get('exit') is None or o.get('exit25') is None)]
     for o in cur:
         try:
             _,bid,_=_quote(o['ticker'],o['side'],mkts.get(o.get('laggard')))
             if bid is None or bid<=0: continue
-            o['peakBid']=round(max(o.get('peakBid') or 0,bid),4)
-            if o['peakBid']>=o['entry']+ARM-1e-9:
-                if not o.get('trailArmedAt'): o['trailArmedAt']=now; ch.append(o)
-                if bid<=o['peakBid']-DROP+1e-9:
-                    xf=fee(o['contracts'],bid)
-                    o.update(exit=round(bid,4),exitFee=xf,pnl=round(o['contracts']*bid-xf-STAKE,2),exitedAt=now,
-                             exitLeftSec=round(o['closesAt']-now,1),
-                             exitReason=f"trail: peak {o['peakBid']:.2f} (armed at {o['entry']:.2f}+{ARM:.2f}) -> bid {bid:.2f}")
-                    STAT['trailExits']+=1; ch.append(o)
+            had15,had25=o.get('exit'),o.get('exit25')
+            if _tick_trail(o,bid,now,ARM,T15):
+                if o.get('exit') is not None and had15 is None: STAT['trailExits']+=1
+                ch.append(o)
+            if _tick_trail(o,bid,now,ARM25,T25):
+                if o.get('exit25') is not None and had25 is None: STAT['trail25Exits']+=1
+                ch.append(o)
         except Exception as e: STAT['errors']+=1; print('gapnight exit err',e,flush=True)
     for st in signals or []:
         try:
@@ -180,6 +206,7 @@ def settle(result_fn,now=None):
             if o['status']=='filled':
                 win=(r=='yes')==(o['side']=='YES'); o['hold_pnl']=round((o['contracts'] if win else 0)-STAKE,2)
                 if o.get('exit') is None: o['pnl']=o['hold_pnl']; o['heldToSettle']=True
+                if o.get('exit25') is None: o['pnl25']=o['hold_pnl']; o['heldToSettle25']=True
             STAT['settled']+=1; ch.append(o)
         except Exception as e: STAT['errors']+=1; print('gapnight settle err',e,flush=True)
     if ch: _changed(ch,now)
@@ -192,7 +219,7 @@ def _changed(items,now):
             except Exception as e: print('gapnight sink err',e,flush=True)
     _st['fileDirty']=True
     if now-_st['lastFile']>=FILE_SAVE_SEC or any(o.get('settle') for o in items): _save(now)
-def _rank(o): return (o.get('settle') is not None,o.get('exit') is not None,o.get('peakBid') or 0)
+def _rank(o): return (o.get('settle') is not None,o.get('exit') is not None,o.get('exit25') is not None,o.get('peakBid25') or o.get('peakBid') or 0)
 def merge_in(items):
     with _lk:
         for o in items or []:
@@ -224,13 +251,19 @@ def _save(now=None):
         os.replace(tmp,_path[0])
     except Exception as e: print('gapnight save err',e,flush=True)
 # ------------------------------------------------------------ read-only summary ----------------------------------------
+def _pnl_book(fin,key):
+    return dict(wins=sum(1 for o in fin if (o.get(key) or 0)>0),
+                losses=sum(1 for o in fin if (o.get(key) or 0)<=0),
+                pnl=round(sum(o.get(key) or 0 for o in fin),2))
 def _agg(rows):
     fin=[o for o in rows if o.get('status')=='filled' and o.get('settle') is not None]
-    return dict(n=len(rows),settled=len(fin),wins=sum(1 for o in fin if (o.get('pnl') or 0)>0),
-                losses=sum(1 for o in fin if (o.get('pnl') or 0)<=0),
-                pnl=round(sum(o.get('pnl') or 0 for o in fin),2),
-                holdPnl=round(sum(o.get('hold_pnl') or 0 for o in fin),2),
+    t15=_pnl_book(fin,'pnl'); hold=_pnl_book(fin,'hold_pnl')
+    return dict(n=len(rows),settled=len(fin),wins=t15['wins'],losses=t15['losses'],
+                pnl=t15['pnl'],holdPnl=hold['pnl'],
                 open=sum(1 for o in rows if o.get('status')=='filled' and o.get('settle') is None))
+def _exits(rows):
+    fin=[o for o in rows if o.get('status')=='filled' and o.get('settle') is not None]
+    return dict(trail15=_pnl_book(fin,'pnl'),trail25=_pnl_book(fin,'pnl25'),hold=_pnl_book(fin,'hold_pnl'))
 def _reasons(rows):
     d={}
     for o in rows:
@@ -250,17 +283,21 @@ def summary():
     for v in VARIANTS:
         rows=[o for o in night if o['variant']==v]
         ent=[o for o in rows if o['status']=='filled']; sk=[o for o in rows if o['status']=='skipped']
-        books[v]=dict(name=VNAME[v],entries=_agg(ent),skipped=len(sk),skipReasons=_reasons(rows))
+        books[v]=dict(name=VNAME[v],entries=_agg(ent),exits=_exits(ent),skipped=len(sk),skipReasons=_reasons(rows))
     return dict(enabled=ENABLED,shadowOnly=True,stats=dict(STAT),session=session_now(),
                 thresholds=dict(moogleBar=MOOGLE_BAR,nightWindow='5 PM (17:00) through 5:59 AM ET',
                                 volumeSkip='n2 only: previous settled round Kalshi volume_fp < 6h median (gapregime volume_ctx, last <=24 rounds)',
-                                pairs='BTC-ETH, and SOL-XRP when XRP is not the laggard'),
-                exit=f'trail arm entry+{round(ARM*100)}c / {round(DROP*100)}c giveback, else hold; holdPnl = hold to settlement',
+                                pairs='BTC-ETH, and SOL-XRP when XRP is not the laggard',
+                                trail15='arm entry+15c / 10c giveback, sell at bid',
+                                trail25='arm entry+25c / 10c giveback, sell at bid',
+                                hold='hold to settlement'),
+                exit='trail15 arm entry+15c / 10c giveback; trail25 arm entry+25c / 10c giveback; hold = hold to settlement. W-L/PnL reported per exit. Sell at bid (same quote feed as gap paper trail).',
                 stakeUsd=STAKE,books=books,night=_agg([o for o in night if o['status']=='filled']),
+                nightExits=_exits([o for o in night if o['status']=='filled']),
                 dayLogged=len(day),daySkipReasons=_reasons(day),
                 persist=dict(collection='gap_night',ttlDays=TTL_DAYS,
-                             note=f'3 docs per Rule A signal (baseline/n1/n2). Mongo TTL {TTL_DAYS}d on openedAtDt; in-memory cap {MAX_KEEP}. Night-only entries, day logged as not-applicable. Volume reused from gapregime HIST (no extra polling).'),
-                note='SHADOW ONLY: never places, sizes or blocks a trade. baseline = unfiltered night Rule A; n1 = MoogleEdge side p>=0.65; n2 = n1 + skip previous-round volume below 6h median. pnl = trail exit; W-L counts settled night entries only.')
+                             note=f'3 docs per Rule A signal (baseline/n1/n2); trail15/trail25/hold stored on the same doc. Mongo TTL {TTL_DAYS}d on openedAtDt; in-memory cap {MAX_KEEP}. Night-only entries, day logged as not-applicable. Volume reused from gapregime HIST (no extra polling).'),
+                note='SHADOW ONLY: never places, sizes or blocks a trade. baseline = unfiltered night Rule A; n1 = MoogleEdge side p>=0.65; n2 = n1 + skip previous-round volume below 6h median. Each book reports trail15, trail25 and hold W-L/PnL.')
 def api(limit=300,items=True):
     its=snapshot()[-limit:] if items else []
     return dict(summary=summary(),items=its[::-1])
@@ -268,6 +305,9 @@ _bc=[0,None]
 def brief():
     if _bc[1] is not None and time.time()-_bc[0]<20: return _bc[1]
     s=summary(); sess=s['session']['label']; b=s['books']
-    _bc[1]=(f"{sess} · "+' · '.join(f"{VNAME[k]} {v['entries']['wins']}-{v['entries']['losses']} {v['entries']['pnl']:+.2f}" for k,v in b.items())
+    def _ex(v,k):
+        e=v['exits'][k]; return f"{e['wins']}-{e['losses']} {e['pnl']:+.2f}"
+    _bc[1]=(f"{sess} · "+' · '.join(
+        f"{VNAME[k]} t15 {_ex(v,'trail15')} t25 {_ex(v,'trail25')} hold {_ex(v,'hold')}" for k,v in b.items())
             +f" · day logged {s['dayLogged']}")
     _bc[0]=time.time(); return _bc[1]
