@@ -6,7 +6,8 @@ Collections (in the app's existing Mongo db):
   metalgap        /api/metalgap rows   (_id 'm|<ts_ms>', TTL LOG_TTL_DAYS on 'at', cap MAX_LOG_DOCS)
   cryptogap       /api/cryptogap rows  (_id 'c|<ts_ms>', same bounds)
   spec_research   Spec settlement research rows (TTL LOG_TTL_DAYS, cap MAX_LOG_DOCS)
-  research_state  small capped snapshots (leadlag/ethlead trigger logs), one doc each"""
+  research_state  small capped snapshots (leadlag/ethlead trigger logs), one doc each
+  gap_night       night-mode shadow items (upsert by id), TTL TRADE_TTL_DAYS on openedAtDt"""
 import collections, json, os, threading, time
 from datetime import datetime, timezone
 E=os.environ.get
@@ -61,7 +62,7 @@ def flush():
     for (col,_id),d in items:
         d=_clean(d)
         if d is None: continue
-        if col=='gap_trades': d['openedAtDt']=_dt(d.get('openedAt'))
+        if col in ('gap_trades','gap_night'): d['openedAtDt']=_dt(d.get('openedAt'))
         bycol[col].append(d)
     for col,docs in bycol.items():
         try: db[col].bulk_write([ReplaceOne({'_id':d['_id']},d,upsert=True) for d in docs],ordered=False); ST['upserts']+=len(docs)
@@ -122,6 +123,11 @@ def ensure_indexes():
         try: db['gap_trades'].create_index('openedAtDt',expireAfterSeconds=TRADE_TTL_DAYS*86400)
         except Exception: db.command('collMod','gap_trades',index={'keyPattern':{'openedAtDt':1},'expireAfterSeconds':TRADE_TTL_DAYS*86400})
     except Exception as e: _err('index gap_trades',e)
+    try:
+        db['gap_night'].create_index('openedAt')
+        try: db['gap_night'].create_index('openedAtDt',expireAfterSeconds=TRADE_TTL_DAYS*86400)
+        except Exception: db.command('collMod','gap_night',index={'keyPattern':{'openedAtDt':1},'expireAfterSeconds':TRADE_TTL_DAYS*86400})
+    except Exception as e: _err('index gap_night',e)
 def _loop():
     ensure_indexes(); ST['enabled']=True; last_snap=0; last_maint=0
     while True:

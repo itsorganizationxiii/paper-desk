@@ -985,6 +985,9 @@ def tick_once():
     try:  # gap REGIME SHADOW (owner t1086u): regime tags + strict/flip variant books on Rule A signals, paper only, no order path
         with CPU.timed('gapregime'): GREG.on_tick(_gm,signals=GAPS.TRADES[-20:]); GREG.settle(_pl_result)
     except Exception as e: print('gapregime tick err',e,flush=True)
+    try:  # gap NIGHT-MODE SHADOW (owner t1093u/t1095u): N1 moogle>=0.65 / N2 + volume filter on night Rule A, paper only, no order path
+        with CPU.timed('gapnight'): GNIGHT.on_tick(_gm,signals=GAPS.TRADES[-20:]); GNIGHT.settle(_pl_result)
+    except Exception as e: print('gapnight tick err',e,flush=True)
     try:  # MoogleEdge SHADOW (owner t1077u): moogle_p next to each Spec decision, hypothetical gated $1 holds; never trades
         with CPU.timed('moogle'): MOOG.on_spec(sigs); MOOG.settle(_pl_result)
     except Exception as e: print('moogle tick err',e,flush=True)
@@ -1129,6 +1132,15 @@ try:
     GREG.FETCH[0]=lambda ser,lim:get(f"{KALSHI}/markets?series_ticker={ser}&status=settled&limit={int(lim)}")['markets']   # public, read-only
     GREG.start()
 except Exception as e: print('gapregime boot err',type(e).__name__,e,flush=True)
+import gapnight as GNIGHT   # gap NIGHT-MODE SHADOW (owner t1093u/t1095u): night N1/N2 books on Rule A; no order path
+try:
+    GNIGHT.load(DATA)
+    if GP.enabled():
+        try: GNIGHT.merge_in(list(GP._db[0]['gap_night'].find({}).sort('openedAt',-1).limit(GNIGHT.MAX_KEEP)))
+        except Exception as e: print('gapnight mongo load err',type(e).__name__,flush=True)
+    GNIGHT.SINK[0]=lambda o:GP.upsert('gap_night',o['id'],o)   # gappersist writer: batched, lease-gated
+    GNIGHT.QUOTE[0]=GAPS.QUOTE[0]   # read-only WS quote cache
+except Exception as e: print('gapnight boot err',type(e).__name__,e,flush=True)
 def _gap_live_marks(gm):
     """Display-only mark for open gap-live (hold-to-settle) trades: our-side bid from this tick's Kalshi market
     (already fetched over REST for the asset), else a fresh WS quote. Never exits or changes the position."""
@@ -1420,6 +1432,8 @@ class H(SimpleHTTPRequestHandler):
                     except Exception as e: d['moogleEdge']='err '+str(e)[:80]
                     try: d['gapRegime']=GREG.brief()
                     except Exception as e: d['gapRegime']='err '+str(e)[:80]
+                    try: d['gapNight']=GNIGHT.brief()
+                    except Exception as e: d['gapNight']='err '+str(e)[:80]
                     d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}"+(f"; {g['exitReason']}" if g.get('exitReason') else '')) for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
                 except Exception as e: d['gapPaper']=dict(error=str(e)[:200])
                 if 'full=1' not in s.path: slim_status(d)
@@ -1496,6 +1510,7 @@ class H(SimpleHTTPRequestHandler):
             b=json.dumps(GAPLIVE.summary(_gl),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/moogleedge': b=json.dumps(MOOG.api(full='full=1' in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapregime': b=json.dumps(GREG.api(items='items=0' not in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/gapnight': b=json.dumps(GNIGHT.api(items='items=0' not in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gaplimit': b=json.dumps(dict(summary=GLIM.summary(),orders=GLIM.snapshot()[-400:] if 'orders=0' not in s.path else []),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
