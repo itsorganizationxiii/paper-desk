@@ -410,7 +410,7 @@ try:
 except Exception as e: LV=None; LIVE_INIT_ERR=f'{type(e).__name__}: {e}'; print('live init err',LIVE_INIT_ERR,flush=True)
 if MCOL is not None: threading.Thread(target=_mongo_writer,daemon=True).start()
 status={'eloedge':'unknown','sources':{},'signals':{},'commodities':{},'lastTick':None,'fallbackInUse':None,
- 'rules':f'Entry: 15m momentum & taker CVD agree AND EloEdge model_p agrees (skip new Spec entries if EloEdge is unavailable; no Coinbase fallback); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless EloEdge>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+EloEdge flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
+ 'rules':f'Entry: 15m momentum & taker CVD agree AND model_p agrees (prefer fresh EloEdge, else MoogleEdge p; skip if both missing or MoogleEdge >60s stale; no Coinbase fallback); edge>={MIN_EDGE:.0%}; quarter Kelly, cap {CAP:.0%}. Whale: skip entries against strong net whale flow; exit at bid on strong whale flow against (not if <90s left & mark>=0.85, nor if bid < model-10%). Take profit: sell at bid minus Kalshi fee once bid>={TP_BID:.0%}, unless model_p>={TP_HOLD_P:.0%} AND spot>={TP_HOLD_Z} sigma past strike AND <={TP_HOLD_MAX_LEFT}s left. Profit lock (all day): armed {LOCK_ARM_C*100:.0f}c above entry (or at the fixed peak), sells on a {LOCK_DROP*100:.0f}c giveback while still above entry. Exit early at bid if signals+model_p flip with exit edge>={EXIT_EDGE:.0%}, or stop if mark<={STOP:.0%} of entry.'}
 import gaplive as GL
 def live_for(name):
     # LIVE_STRATEGIES (default 'gap'): Resume can only put the listed strategies live; Spec/leadlag/ethlead stay paper
@@ -818,11 +818,11 @@ def tick_once():
               try: m=k if (k and k['ticker']==t['ticker'] and t.get('mode')!='live') else mk(get(f"{KALSHI}/markets/{t['ticker']}")['market'])  # live: always the fresh single-market quote
               except Exception as e: print('mark err',e,flush=True); continue
             bid=m['yesBid'] if t['side']=='YES' else m['noBid']
-            mp=fresh(t['ticker']); p_yes=mp if mp is not None else (heur(cb) if est!='live' else None)
+            mp,psrc=SPEC.resolve_spec_p(fresh(t['ticker']), SPEC.moogle_yes_p_for(a, t['ticker'])); p_yes=mp
             q=None if p_yes is None else (p_yes if t['side']=='YES' else 1-p_yes)
             sig_against=dirn is not None and dirn!=t['side']
-            elo_against=(mp is not None and (mp>0.5)!=(t['side']=='YES')) or est!='live'
-            agree=dirn==t['side'] and (mp is None and est!='live' or mp is not None and (mp>0.5)==(t['side']=='YES'))
+            elo_against=(mp is not None and (mp>0.5)!=(t['side']=='YES'))
+            agree=dirn==t['side'] and mp is not None and (mp>0.5)==(t['side']=='YES')
             try:  # log-only per-minute flow while open
                 f=flow(t['asset'],1); mk_=time.strftime('%H:%M')
                 if f and (not t.get('flowLog') or t['flowLog'][-1].get('m')!=mk_): t.setdefault('flowLog',[]).append(dict(f,m=mk_,bid=round(bid,3))); t['flowLog']=t['flowLog'][-16:]
@@ -841,7 +841,7 @@ def tick_once():
             except Exception as e: print('oneagainst err',e,flush=True)
             with lock:
                 t.update(markPrice=round(bid,4),unrealizedPnl=round(t['contracts']*bid-t['stake'],2),signalsAgree=bool(agree),
-                         flipWarning=bool(sig_against or (mp is not None and (mp>0.5)!=(t['side']=='YES'))),currentModelP=q)
+                         flipWarning=bool(sig_against or (mp is not None and (mp>0.5)!=(t['side']=='YES'))),currentModelP=q,currentPSource=psrc)
                 if q is not None: t['currentModelPAt']=time.time()
                 wnet=cb['whale']['netFlowUsd']*(1 if t['side']=='YES' else -1); left_t=t['closesAt']-time.time()
                 whale_against=cb['whale']['strongDir'] not in (None,t['side'])
@@ -854,7 +854,7 @@ def tick_once():
                         z=(cb['spot']-strike)/(cb['spot']*sd*math.sqrt(max(left_t,1)/900))*(1 if t['side']=='YES' else -1)
                     hold=mp is not None and q is not None and q>=TP_HOLD_P and z is not None and z>=TP_HOLD_Z and left_t<=TP_HOLD_MAX_LEFT
                     zs=f'{z:.1f}' if z is not None else 'n/a'; qs=f'{q:.3f}' if q is not None else 'n/a'
-                    why=f'bid {bid:.3f}>={TP_BID}; EloEdge p={qs} (need>={TP_HOLD_P}); dist={zs} sigma (need>={TP_HOLD_Z}); {left_t:.0f}s left (need<={TP_HOLD_MAX_LEFT})'
+                    why=f'bid {bid:.3f}>={TP_BID}; {SPEC.spec_p_label(psrc)} p={qs} (need>={TP_HOLD_P}); dist={zs} sigma (need>={TP_HOLD_Z}); {left_t:.0f}s left (need<={TP_HOLD_MAX_LEFT})'
                     fee=kalshi_fee(t['contracts'],bid); sellpnl=round(t['contracts']*bid-fee-t['stake'],2)
                     if hold:
                         if not t.get('tpHeld'): print('TP-HOLD',t['id'],why,flush=True)
@@ -864,9 +864,9 @@ def tick_once():
                 elif PAIR_TP>0 and bid>=t['price']+PAIR_TP and any(o is not t and o['status']=='open' and not o.get('exiting') and o.get('closesAt')==t.get('closesAt') and o['side']==t['side'] and is_shadow(o)==is_shadow(t) for o in pt.trades):
                     fp=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'paircash: up {bid-t["price"]:+.2f} with a same-side partner open; cash this one, partner rides the lock; fee ${fp:.2f}',fee=fp)
                 elif lock_active() and t['peakBid']>=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK), t['price']+lock_arm(t)) and bid<=t['peakBid']-lock_drop(t) and bid>t['price'] and not LH.should_hold(t,log=_lh_log) and not (q is not None and q>=LOCK_HOLD_P):
-                    f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)); pt.exit(t,bid,f'profitlock: {"night" if night() else "day"}, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
+                    f2=kalshi_fee(t['contracts'],bid); _lp=min(LOCK_PEAK_BY_ASSET.get(t['asset'],LOCK_PEAK),t['price']+lock_arm(t)); pt.exit(t,bid,f'profitlock: {"night" if night() else "day"}, peak {t["peakBid"]:.3f} (armed at {_lp:.2f}, entry {t["price"]:.2f}) -> bid {bid:.3f}; {SPEC.spec_p_label(psrc)} p={q if q is None else round(q,3)}; fee ${f2:.2f}',fee=f2)
                 elif t['asset'] in GUARD_ASSETS and t['peakBid']>=t['price']+0.10 and bid>0 and bid<=t['price']-GUARD_GIVEBACK and not (q is not None and q>=LOCK_HOLD_P):
-                    f3=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'breakeven: {t["asset"]} peaked {t["peakBid"]:.3f} (>=entry+0.10), fell to bid {bid:.3f} vs entry {t["price"]:.3f}; EloEdge p={q if q is None else round(q,3)}; fee ${f3:.2f}',fee=f3)
+                    f3=kalshi_fee(t['contracts'],bid); pt.exit(t,bid,f'breakeven: {t["asset"]} peaked {t["peakBid"]:.3f} (>=entry+0.10), fell to bid {bid:.3f} vs entry {t["price"]:.3f}; {SPEC.spec_p_label(psrc)} p={q if q is None else round(q,3)}; fee ${f3:.2f}',fee=f3)
                 elif SPEC.is_paperish(t):
                     (do_stop,stop_why),cf=SPEC.paper_stop_action(t,bid,stop_pct(),model_q=q,ask=(m.get('yesAsk') if t['side']=='YES' else m.get('noAsk')) if isinstance(m,dict) else None,left_sec=left_t)
                     try: t['stopCounterfactual']=cf
@@ -876,7 +876,7 @@ def tick_once():
                 elif not t.get('fade') and whale_against and bid>0 and not (left_t<90 and bid>=0.85) and (q is None or bid>=q-WHALE_MAX_GIVEUP):
                     pt.exit(t,bid,f'whale: net whale flow ${wnet:,.0f} against {t["side"]}, sold at bid {bid:.3f}')
                 elif not t.get('fade') and sig_against and elo_against and q is not None and bid-q>=EXIT_EDGE:
-                    pt.exit(t,bid,f'flip: momentum/CVD {dirn} + {"EloEdge" if est=="live" else "fallback"} p={q:.3f} vs bid {bid:.3f}')
+                    pt.exit(t,bid,f'flip: momentum/CVD {dirn} + {SPEC.spec_p_label(psrc)} p={q:.3f} vs bid {bid:.3f}')
         if not k: sg['action']='skip: no real Kalshi market'; sigs[a]=sg; continue
         if a in METALS and (metals_closed() or metals_closed(k['close']-1)): sg['action']='skip: metals session closed (Kalshi 5-6 PM ET daily, Fri 5 PM-Sun 6 PM ET)'; sigs[a]=sg; continue
         mp=fresh(k['ticker']); sg['modelP']=mp
@@ -928,22 +928,21 @@ def tick_once():
         reok=False
         try: reok=(live_for('spec') and any(t.get('ticker')==k['ticker'] for t in pt.trades if not t.get('gapLive')) and reentry_ok(a,k,dirn,cb,left)) or False
         except Exception as e: print('reentry err',e,flush=True)
-        if PAPER_LOOSE and not dirn and not live_for('spec') and mp is not None and abs(mp-0.5)>=0.05: dirn='YES' if mp>0.5 else 'NO'
-        _es=SPEC.elo_entry_skip(est,mp,a)
+        _sp,_psrc=SPEC.resolve_spec_p(mp, SPEC.moogle_yes_p_for(a, k.get('ticker')))
+        sg['specP']=_sp; sg['pSource']=_psrc
+        if PAPER_LOOSE and not dirn and not live_for('spec') and _sp is not None and abs(_sp-0.5)>=0.05: dirn='YES' if _sp>0.5 else 'NO'
+        _es=SPEC.spec_entry_skip(_sp,_psrc)
         if not dirn: sg['action']='skip: momentum/CVD disagree'
         elif _es: sg['action']=_es
-        elif mp is not None and (mp>0.5)!=(dirn=='YES'): sg['action']=f'skip: EloEdge disagrees (model_p {mp})'
+        elif _sp is not None and (_sp>0.5)!=(dirn=='YES'): sg['action']=f'skip: {SPEC.spec_p_label(_psrc)} disagrees (model_p {_sp})'
         elif cb['whale']['strongDir'] not in (None,dirn): sg['action']=f"skip: strong whale flow against (${cb['whale']['netFlowUsd']:,.0f})"
         elif left<60: sg['action']='skip: <60s to close'
         elif any(t.get('ticker')==k['ticker'] for t in pt.trades if not t.get('gapLive')) and not reok: sg['action']='holding/traded this window'
         else:
-            used='coinbase+eloedge'
-            if mp is None:
-                if a!='XRP':
-                    sg['action']='skip: eloedge-unavailable'; sigs[a]=sg; continue
-                mp=heur(cb); used='coinbase-proxy (XRP shadow, no EloEdge)'
+            used='coinbase+eloedge' if _psrc=='eloedge' else 'coinbase+moogleedge'
+            mp=_sp
             ask=k['yesAsk'] if dirn=='YES' else k['noAsk']
-            meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est,_bid=(k['yesBid'] if dirn=='YES' else k['noBid']))
+            meta=dict(priceSource='kalshi',signalSource=used,whaleFlowAtEntry=cb['whale']['netFlowUsd'],mom=mom,cvd=cvd,eloedge=est,pSource=_psrc,specP=_sp,_bid=(k['yesBid'] if dirn=='YES' else k['noBid']))
             q=mp if dirn=='YES' else 1-mp
             shd=shadow_asset(a)
             if reok and not shd:
@@ -1036,7 +1035,7 @@ def tick_once():
         for a,sg in list(sigs.items()):
             k=sg.get('kalshi') or {}
             side=sg.get('direction') if sg.get('direction') in('YES','NO') else None
-            mp=sg.get('modelP'); ask=None; bid=None; q=None
+            mp=sg.get('specP') if sg.get('specP') is not None else sg.get('modelP'); ask=None; bid=None; q=None
             if side and k:
                 ask=k.get('yesAsk') if side=='YES' else k.get('noAsk')
                 bid=k.get('yesBid') if side=='YES' else k.get('noBid')
@@ -1045,7 +1044,7 @@ def tick_once():
                 model_p=mp,source=sg.get('signalSource') or sg.get('action'),yes_bid=(k or {}).get('yesBid'),yes_ask=(k or {}).get('yesAsk'),
                 no_bid=(k or {}).get('noBid'),no_ask=(k or {}).get('noAsk'),q=q if q is not None else mp,ask=ask,
                 bid=bid,action=sg.get('action'),skip_reason=None if (sg.get('action') or '').startswith('OPENED') else sg.get('action'),
-                cb=sg,extra=dict(secsToClose=sg.get('secsToClose'))),DATA)
+                cb=sg,extra=dict(secsToClose=sg.get('secsToClose'),pSource=sg.get('pSource'),specP=sg.get('specP'))),DATA)
     except Exception: pass
     try: PL.observe(sigs,'live' if live_for('spec') else 'paper')  # read-only prediction log; cannot raise
     except Exception: pass
@@ -1053,9 +1052,11 @@ def tick_once():
     status['whaleAlerts']=sorted([dict(asset=a,**w) for a,g in sigs.items() for w in (g.get('whale') or {}).get('alerts',[])],key=lambda w:w['ago'])[:12]
     try: src['moogleedge']=moogleedge_source()
     except Exception: src['moogleedge']='stale'
-    fb=src.get('eloedge')!='live'
+    if src.get('eloedge')=='live': _sm='Coinbase momentum+CVD + EloEdge model_p'
+    elif src.get('moogleedge')=='live': _sm='Coinbase momentum+CVD + MoogleEdge p'
+    else: _sm='SKIP: MoogleEdge unavailable — no Coinbase-fallback Spec entries'
     status.update(metalsClosed=metals_closed(),nightMode=night(),sources=src,signals=sigs,lastTick=time.time(),eloedge=src.get('eloedge','unknown'),fallbackInUse=False,
-        signalMode='SKIP: EloEdge unavailable — no Coinbase-fallback Spec entries' if fb else 'Coinbase momentum+CVD + EloEdge model_p')
+        signalMode=_sm)
 TICK_TTL_DAYS=5; TICK_MAX_MB=350; TICK_FLUSH_SEC=2; TICK_BATCH=500; TICK_MAXQ=20000
 import collections
 _tq=collections.deque(maxlen=TICK_MAXQ); _tlast={}

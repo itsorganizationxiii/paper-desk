@@ -335,3 +335,50 @@ def elo_entry_skip(est, model_p, asset):
     if est=='live':
         return 'skip: no fresh EloEdge model_p'
     return 'skip: eloedge-unavailable'
+
+# Spec model_p: prefer fresh EloEdge, else MoogleEdge (same CUR cache /api/moogleedge current() uses).
+# Stale rule matches gap live: missing or now-t > 60s => unusable. Paper-only caller decides entries.
+SPEC_P_STALE_SEC=60.0
+
+def moogle_yes_p(row, now=None, ticker=None, stale_sec=None):
+    """YES-p from a MoogleEdge CUR / current() row. None if missing, stale (>60s), or wrong ticker."""
+    stale_sec=SPEC_P_STALE_SEC if stale_sec is None else float(stale_sec)
+    now=time.time() if now is None else now
+    if not isinstance(row, dict) or row.get('p') is None: return None
+    if ticker is not None and row.get('ticker') is not None and row.get('ticker')!=ticker: return None
+    lag=None
+    if row.get('t') is not None:
+        try: lag=now-float(row['t'])
+        except Exception: lag=None
+    if lag is None and row.get('lagSec') is not None:
+        try: lag=float(row['lagSec'])
+        except Exception: lag=None
+    if lag is None or lag>stale_sec: return None
+    try: return float(row['p'])
+    except Exception: return None
+
+def moogle_yes_p_for(asset, ticker=None, now=None, stale_sec=None):
+    """Read MoogleEdge YES-p from moogle.CUR (the cache /api/moogleedge exposes). None if missing/stale."""
+    try:
+        import moogle as M
+        return moogle_yes_p(M.CUR.get(asset), now=now, ticker=ticker, stale_sec=stale_sec)
+    except Exception:
+        return None
+
+def resolve_spec_p(elo_p, moogle_p):
+    """Prefer fresh EloEdge p, else MoogleEdge p. Returns (p, pSource) with pSource 'eloedge'|'moogleedge'|None."""
+    if elo_p is not None:
+        try: return float(elo_p), 'eloedge'
+        except Exception: pass
+    if moogle_p is not None:
+        try: return float(moogle_p), 'moogleedge'
+        except Exception: pass
+    return None, None
+
+def spec_entry_skip(p, p_source=None):
+    """Skip a new Spec entry when neither EloEdge nor MoogleEdge p is fresh. No Coinbase fallback."""
+    if p is not None: return None
+    return 'skip: moogleedge-unavailable'
+
+def spec_p_label(p_source):
+    return 'EloEdge' if p_source=='eloedge' else 'MoogleEdge'

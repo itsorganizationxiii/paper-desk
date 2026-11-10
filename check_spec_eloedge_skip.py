@@ -25,18 +25,13 @@ chk('XRP may still use coinbase-proxy (no EloEdge feed)',
     SPEC.elo_entry_skip('unavailable',None,'XRP') is None
     and SPEC.elo_entry_skip('live',None,'XRP') is None)
 
-# ---- server wiring / no fallback entries ----
+# ---- server wiring / no fallback entries (Spec now falls back to MoogleEdge, still no Coinbase) ----
 src=open('server.py').read()
-chk('server calls SPEC.elo_entry_skip on the entry path', 'SPEC.elo_entry_skip(est,mp,a)' in src)
-chk('entry chain uses helper skip before opening',
-    re.search(r'_es=SPEC\.elo_entry_skip\(est,mp,a\)\s*\n\s*if not dirn:.*\n\s*elif _es: sg\[.action.\]=_es', src) is not None)
 chk('no coinbase-fallback signalSource assignment',
     "used='coinbase-fallback" not in src and 'coinbase-fallback (EloEdge unavailable)' not in src)
-chk('non-XRP mp is None in the else branch skips instead of heur',
-    "sg['action']='skip: eloedge-unavailable'; sigs[a]=sg; continue" in src
-    and "used='coinbase-proxy (XRP shadow, no EloEdge)'" in src)
-chk('open-position monitor still uses heur for settlement/exits',
-    "p_yes=mp if mp is not None else (heur(cb) if est!='live' else None)" in src)
+chk('no Coinbase-proxy / heur fallback on Spec entry or exits',
+    "used='coinbase-proxy (XRP shadow, no EloEdge)'" not in src
+    and "p_yes=mp if mp is not None else (heur(cb) if est!='live' else None)" not in src)
 chk('signalMode no longer advertises Coinbase fallback entries',
     'no Coinbase-fallback Spec entries' in src and 'FALLBACK: Coinbase momentum+CVD only' not in src)
 chk('rules text says skip, not Coinbase-only fallback',
@@ -51,10 +46,11 @@ chk('gap live / limit / trail hooks unchanged in source',
     'GAPLIVE.tick()' in src and 'GAPLIVE.manage_exits' in src and 'gaplimit' in src)
 
 html=open('index.html').read()
-chk('dashboard banner says Spec paused (EloEdge removed), not FALLBACK',
-    'Spec paused (EloEdge removed)' in html
+chk('dashboard banner says Spec (MoogleEdge), not FALLBACK',
+    'Spec (MoogleEdge)' in html
     and 'moogleedge' in html and "['coinbase','kalshi','moogleedge']" in html
-    and 'FALLBACK (Coinbase only)' not in html)
+    and 'FALLBACK (Coinbase only)' not in html
+    and 'Spec paused (EloEdge removed)' not in html)
 
 # ---- predlog skip counts surface the new reason ----
 PL._win.clear(); PL.ST.update(observed=0,obsErrors=0)
