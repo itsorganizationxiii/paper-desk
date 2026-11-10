@@ -7,6 +7,9 @@ Session #4:
     only when |gap|>=0.06, and Kalshi metals closures are respected (no metals 5–6 PM ET weekdays, nor
     Fri 5 PM–Sun 6 PM ET). Same Kalshi order path / quote checks as crypto (WS pre-subscribe KXGOLD15M/KXSILVER15M).
   - Skip all live entries during the midnight hour (00:00–00:59 ET).
+  - Against-trend bar (regime = current price vs 2h ago; unknown if history missing): YES in a bearish
+    regime or NO in a bullish one needs crypto MoogleEdge p>=0.75 (else 0.65) and metals |gap|>=0.12 (else 0.06).
+  - Skip if the live our-side ask is under 55c (checked before the order, not just the signal price).
   - $1 per trade, same +15c arm / 10c giveback trail with reduce-only IOC sells, else hold to settlement.
   - NO trade cap and NO auto-disable: runs until the owner presses Pause. Leftover GAP_LIVE_MAX_TRADES env is ignored.
   - Changing GAP_LIVE_TEST / TEST_ID still resets the counter once and forces live PAUSED until owner Resume.
@@ -31,6 +34,11 @@ METAL_DAY_START=6   # 6:00 AM ET inclusive
 METAL_DAY_END=17    # 5:00 PM ET exclusive
 MOOGLE_BAR=float(E('GAP_LIVE_MOOGLE_BAR','0.65'))          # same bar as night shadow N1 (moogle-65)
 MOOGLE_STALE_SEC=float(E('GAP_LIVE_MOOGLE_STALE_SEC','60')) # skip live if MoogleEdge p is older than this
+REGIME_LOOKBACK=7200                                      # seconds: current price vs price 2h ago
+REGIME_MOOGLE_BAR=0.75                                    # crypto against-trend MoogleEdge bar
+REGIME_METAL_MIN_GAP=0.12                                 # metals against-trend |gap| bar (normal is 0.06)
+REGIME_BAR_ENABLED=True
+MIN_ENTRY=0.55                                            # skip if live our-side ask is under this
 USD=float(E('GAP_LIVE_USD','1'))
 QUOTE_WAIT=float(E('GAP_QUOTE_WAIT','1.5'))   # seconds to wait for a first/next WS quote before REST fallback
 RETRY_MAX=int(E('GAP_STALE_RETRY_MAX','5')); RETRY_WINDOW=90.0   # stale-quote retries per ticker, within 90s of the signal
@@ -112,6 +120,141 @@ def moogle_gate_reason(p,now=None):
     if mp is None: return 'moogle p missing/stale (>60s)'
     if mp<MOOGLE_BAR-1e-9: return f'moogle-below-bar: {mp} < {MOOGLE_BAR:.2f}'
     return None
+# ---- 2h regime (current price vs price 2 hours ago) ---------------------------------
+_PX={a:collections.deque() for a in WATCH_ASSETS}   # asset -> (ts, px); metals filled from tick spots; crypto prefers Moogle
+def note_price(asset,px,now=None):
+    """Record one spot for the 2h regime ring (tests + tick observer)."""
+    if asset not in _PX or px is None: return
+    try: px=float(px)
+    except Exception: return
+    if px<=0: return
+    now=time.time() if now is None else now
+    h=_PX[asset]
+    if h and now<h[-1][0]: return
+    if h and now-h[-1][0]<1.0: h[-1]=(now,px)
+    else: h.append((now,px))
+    cut=now-REGIME_LOOKBACK-180
+    while h and h[0][0]<cut: h.popleft()
+def clear_prices():
+    for h in _PX.values(): h.clear()
+def _px_near(h,ts,tol=180):
+    if not h: return None
+    best=None
+    for t,p in h:
+        if t<=ts+1e-9: best=(t,p)
+        else: break
+    return best[1] if best and ts-best[0]<=tol else None
+def _moogle_px(asset,now):
+    """(current, price 2h ago) from the live Moogle 2h 1s buffer, or (None, None)."""
+    try:
+        import moogle as M
+        s=M.SER.get(asset)
+        if not s or s.cur is None or not s.ff: return None,None
+        sec=int(now)
+        cur=s.at(min(s.cur,sec))
+        ago=s.at(sec-REGIME_LOOKBACK)
+        return cur,ago
+    except Exception:
+        return None,None
+def _collect_spots():
+    """Read already-kept in-memory spots (Moogle series, server tick signals, Pyth metals). No network."""
+    spots={}
+    try:
+        import moogle as M
+        for c in ('BTC','ETH','SOL'):
+            s=M.SER.get(c)
+            if s and s.cur is not None and s.ff: spots[c]=float(s.ff[-1])
+    except Exception:
+        pass
+    try:
+        import sys
+        st=getattr(sys.modules.get('server'),'status',None) or {}
+        for a,sg in (st.get('signals') or {}).items():
+            sp=(sg or {}).get('spot')
+            if sp: spots.setdefault(a,float(sp))
+        for a,c in (st.get('commodities') or {}).items():
+            pr=(c or {}).get('price')
+            if pr: spots.setdefault(a,float(pr))
+    except Exception:
+        pass
+    return spots
+def observe_prices(now=None,spots=None):
+    now=time.time() if now is None else now
+    for a,px in (spots or _collect_spots()).items():
+        note_price(a,px,now)
+def asset_regime(asset,now=None):
+    """'bullish' / 'bearish' / 'unknown' from current price vs price 2h ago."""
+    now=time.time() if now is None else now
+    cur=ago=None
+    if asset in ('BTC','ETH','SOL'):
+        cur,ago=_moogle_px(asset,now)
+    if cur is None or ago is None:
+        h=_PX.get(asset)
+        if h:
+            if cur is None and now-h[-1][0]<=180: cur=h[-1][1]
+            if ago is None: ago=_px_near(h,now-REGIME_LOOKBACK)
+    if cur is None or ago is None or ago<=0: return 'unknown'
+    if cur<ago: return 'bearish'
+    if cur>ago: return 'bullish'
+    return 'unknown'
+def regimes(now=None):
+    now=time.time() if now is None else now
+    return {a:asset_regime(a,now) for a in WATCH_ASSETS}
+def against_trend(side,reg):
+    return (reg=='bearish' and side=='YES') or (reg=='bullish' and side=='NO')
+def regime_bar_reason(p,now=None):
+    """'against-trend-bar' when the tighter against-trend bar is missed; else None. No-op if unknown/with-trend or disabled."""
+    if not REGIME_BAR_ENABLED: return None
+    now=time.time() if now is None else now
+    coin=p.get('laggard') or p.get('asset')
+    reg=asset_regime(coin,now)
+    p['regime']=reg
+    if not against_trend(p.get('side'),reg): return None
+    if is_metal(p):
+        try: gap=abs(float(p.get('gapDown') or 0))
+        except Exception: gap=0.0
+        if gap<REGIME_METAL_MIN_GAP-1e-9: return 'against-trend-bar'
+        return None
+    mp=moogle_side_p(coin,p.get('ticker'),p.get('side'),now)
+    if mp is None: return 'moogle p missing/stale (>60s)'
+    if mp<REGIME_MOOGLE_BAR-1e-9: return 'against-trend-bar'
+    return None
+def _side_ask(lv,ticker,side):
+    """Our-side ask from a live WS quote or Live._quote/_rest_ask. None if unavailable. No orders."""
+    if lv is None or not ticker: return None
+    try:
+        w=lv.wsq(ticker) if getattr(lv,'wsq',None) else None
+        if w and w.get('yesBid') is not None and w.get('yesAsk') is not None:
+            v=w['yesAsk'] if side=='YES' else (1-w['yesBid'])
+            if v is not None and 0<float(v)<1: return round(float(v),4)
+    except Exception:
+        pass
+    for name in ('_quote','_rest_ask'):
+        fn=getattr(lv,name,None)
+        if not fn: continue
+        try:
+            v=fn(ticker,side,'ask') if name=='_quote' else fn(ticker,side)
+            if v is not None and 0<float(v)<1: return round(float(v),4)
+        except Exception:
+            pass
+    return None
+def live_ask(lv,ticker,side,wait=0):
+    """Current our-side ask, optionally waiting up to `wait` seconds for a first WS quote."""
+    q=_side_ask(lv,ticker,side)
+    if q is not None or wait<=0 or lv is None: return q
+    if not getattr(lv,'ws',None): return q   # no feed to wait on (tests, or WS not started); REST already tried
+    try:
+        if getattr(lv,'prewatch',None): lv.prewatch(ticker)
+    except Exception:
+        pass
+    end=time.time()+wait
+    while time.time()<end:
+        time.sleep(0.1)
+        q=_side_ask(lv,ticker,side)
+        if q is not None: return q
+    return q
+def under_min_entry(ask):
+    return ask is not None and ask<MIN_ENTRY-1e-9
 class GapLive:
     def __init__(s,lv,opener,log=print):
         s.lv=lv; s.opener=opener; s.log=log; s.lk=threading.Lock()
@@ -144,8 +287,10 @@ class GapLive:
                 if tk and not _xrp(tk) and s.lv.prewatch(tk): s.watched[x]=tk
         except Exception as e: s.log('GAPLIVE presub err',e)
     def tick(s,now=None):
-        """Each tick: retry gap-live signals that were skipped only for a stale Kalshi quote (capped)."""
+        """Each tick: sample kept spots for the 2h regime ring, then retry stale-quote skips (capped)."""
         now=time.time() if now is None else now
+        try: observe_prices(now)
+        except Exception: pass
         if not s.pending: return
         for tk,r in list(s.pending.items()):
             try:
@@ -161,8 +306,11 @@ class GapLive:
                 s._dispatch(r['p'],r['m'],r['n']-1)
             except Exception as e: s.pending.pop(tk,None); s.log('GAPLIVE retry err',e)
     def _rec(s,p,reason,filled,**extra):
-        try: s.recent.append(dict(at=time.time(),pair=p.get('pair'),ticker=p.get('ticker'),side=p.get('side'),
-                                  signalPrice=p.get('price') or p.get('entry'),reason=reason,filled=filled,**extra))
+        try:
+            if 'regime' not in extra:
+                extra['regime']=p.get('regime') or asset_regime(p.get('laggard') or p.get('asset'))
+            s.recent.append(dict(at=time.time(),pair=p.get('pair'),ticker=p.get('ticker'),side=p.get('side'),
+                                 signalPrice=p.get('price') or p.get('entry'),reason=reason,filled=filled,**extra))
         except Exception: pass
     def _why(s):
         lv=s.lv; return str(getattr(lv,'lastBuyDetail',None) or getattr(lv,'lastBuy',None) or 'execution guard (no reason recorded)')
@@ -194,19 +342,25 @@ class GapLive:
             try: gap=abs(float(p.get('gapDown') or 0))
             except Exception: gap=0.0
             if gap<METAL_MIN_GAP-1e-9: return f'metals gap {gap} < {METAL_MIN_GAP:.2f}'
-            return None   # no MoogleEdge gate on metals
+            return regime_bar_reason(p,now)   # no MoogleEdge gate on metals; tighter |gap| if against trend
         r=moogle_gate_reason(p,now)
         if r: return r
-        return None
+        return regime_bar_reason(p,now)
     def on_paper(s,p,m=None,now=None):
         """Called right after a gap PAPER trade opens (or a GOLD-SILVER shadow signal). Returns the live trade or None. Never raises."""
         try:
             p=_norm(p); s.stat['signals']+=1
             r=s.block_reason(p,now=now)
-            if r: s.stat.update(blocked=s.stat['blocked']+1,lastReason=r,lastAt=time.time()); return None
+            if r:
+                s.stat.update(blocked=s.stat['blocked']+1,lastReason=r,lastAt=time.time())
+                if r in ('against-trend-bar','under-55c'): s._rec(p,r,0)
+                return None
             with s.lk:
                 r=s.block_reason(p,now=now)   # re-check under the lock (two pairs can fire in one tick)
-                if r: s.stat.update(blocked=s.stat['blocked']+1,lastReason=r,lastAt=time.time()); return None
+                if r:
+                    s.stat.update(blocked=s.stat['blocked']+1,lastReason=r,lastAt=time.time())
+                    if r in ('against-trend-bar','under-55c'): s._rec(p,r,0)
+                    return None
                 s.inflight+=1   # in-flight buys (no cap reservation in session 4); released in _run
             return s._dispatch(p,m,0)
         except Exception as e:
@@ -226,6 +380,10 @@ class GapLive:
         """One live buy for a gap paper signal; a cap slot is already reserved (inflight). Never raises."""
         try:
             s.stat['attempts']+=1; t0=time.time()
+            p['regime']=p.get('regime') or asset_regime(p.get('laggard') or p.get('asset'),t0)
+            ask=live_ask(s.lv,p.get('ticker'),p.get('side'),wait=QUOTE_WAIT)
+            if under_min_entry(ask):
+                s._rec(p,'under-55c',0,ask=ask); s.stat.update(lastReason='under-55c',lastAt=time.time()); return None
             fill=s.lv.buy(p['asset'],p['ticker'],p['side'],1.0,float(p.get('price') or p.get('entry')),usd=USD,quote_wait=QUOTE_WAIT)
             lat=dict(retry=retry,sinceSignal=round(t0-float(p.get('openedAt') or t0),1),buySec=round(time.time()-t0,1),
                      stages=dict(getattr(s.lv,'lastBuyTiming',None) or {}))
@@ -244,6 +402,9 @@ class GapLive:
             strike=(m or {}).get('strike') if isinstance(m,dict) and (m or {}).get('ticker')==p.get('ticker') else None
             p['_gapLiveTest']=TEST_ID; p['_gapLiveExit']=EXIT[0]
             t=s.opener(p,fill,strike)
+            try:
+                if isinstance(t,dict): t['regime']=p.get('regime') or asset_regime(p.get('laggard') or p.get('asset'))
+            except Exception: pass
             try: p['liveTwinId']=t and t.get('id'); p['liveTwinOrderId']=fill.get('orderId')
             except Exception: pass
             # Do not emit liveFromShadow payloads: they are not paper-book trades and must not land in gap_trades as paper.
@@ -365,10 +526,11 @@ class GapLive:
     def brief(s):
         """Dashboard/status line only: test id, trade count, gates. Never calls live.status() or balance()."""
         return dict(test=TEST_ID,used=s.used(),max=(MAX_TRADES if _has_cap() else None),autoDisabled=s.disabled(),
-                    gate=f"crypto MoogleEdge ≥{MOOGLE_BAR:.0%} (skip if missing/stale >{int(MOOGLE_STALE_SEC)}s); metals 6AM–5PM ET weekdays, |gap|≥{int(METAL_MIN_GAP*100)}¢, no Moogle; skip 00:00–00:59 ET",
+                    gate=f"crypto MoogleEdge ≥{MOOGLE_BAR:.0%} (skip if missing/stale >{int(MOOGLE_STALE_SEC)}s); metals 6AM–5PM ET weekdays, |gap|≥{int(METAL_MIN_GAP*100)}¢, no Moogle; against-trend crypto ≥{REGIME_MOOGLE_BAR:.0%} / metals |gap|≥{int(REGIME_METAL_MIN_GAP*100)}¢; skip ask <{int(MIN_ENTRY*100)}¢; skip 00:00–00:59 ET",
                     moogleBar=MOOGLE_BAR,moogleStaleSec=MOOGLE_STALE_SEC,
                     metals=dict(hours='6:00–17:00 ET weekdays',minGap=METAL_MIN_GAP,moogle=False,closures='Kalshi 5–6 PM ET daily, Fri 5 PM–Sun 6 PM ET'),
-                    midnightSkip=True)
+                    midnightSkip=True,minEntryPrice=MIN_ENTRY,
+                    regimeBar=dict(enabled=REGIME_BAR_ENABLED,lookbackSec=REGIME_LOOKBACK,cryptoMoogleBar=REGIME_MOOGLE_BAR,metalMinGap=REGIME_METAL_MIN_GAP))
     def summary(s,trades):
         lt=[t for t in trades if t.get('gapLive')]
         cl=[t for t in lt if t.get('status')!='open']
@@ -379,7 +541,11 @@ class GapLive:
                     autoDisabled=s.disabled(),usd=USD,rules=sorted(RULES),pairs=sorted(PAIRS),
                     moogleGate=dict(bar=MOOGLE_BAR,staleSec=MOOGLE_STALE_SEC,rule='crypto only: enter only if MoogleEdge shadow p for the traded side is >= 0.65; skip if missing/stale (>60s). Metals have no MoogleEdge gate.'),
                     metals=dict(hours='6:00–17:00 ET weekdays',minGap=METAL_MIN_GAP,moogle=False,closures='Kalshi 5–6 PM ET daily, Fri 5 PM–Sun 6 PM ET'),
-                    midnightSkip=True,
+                    midnightSkip=True,minEntryPrice=MIN_ENTRY,
+                    regimeBar=dict(enabled=REGIME_BAR_ENABLED,lookbackSec=REGIME_LOOKBACK,cryptoMoogleBar=REGIME_MOOGLE_BAR,metalMinGap=REGIME_METAL_MIN_GAP,
+                                   skipReason='against-trend-bar',
+                                   rule='against the 2h trend (YES while bearish, NO while bullish): crypto MoogleEdge p>=0.75, metals |gap|>=0.12; with-trend or unknown uses the normal bar',
+                                   regimes=regimes()),
                     exit=exit_mode(),
                     exitConfig=dict(mode=EXIT[0],armC=round(EXIT[1]*100) if EXIT[1] is not None else None,givebackC=round(EXIT[2]*100) if EXIT[2] is not None else None,
                                     sellTries=SELL_TRIES,sellPricing='reduce-only IOC at live bid -2c, -4c, -6c (3 per try)',noSellLastSec=NO_SELL_LAST_SEC,fallback='hold to settlement'),
