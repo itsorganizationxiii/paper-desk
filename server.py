@@ -982,6 +982,9 @@ def tick_once():
     try:  # gap Rule A LIMIT-ORDER SHADOW (owner t1064u): simulated resting limits, paper only, no order path
         GLIM.on_tick(_gm,signals=GAPS.TRADES[-20:]); GLIM.settle(_pl_result)
     except Exception as e: print('gaplimit tick err',e,flush=True)
+    try:  # MoogleEdge SHADOW (owner t1077u): moogle_p next to each Spec decision, hypothetical gated $1 holds; never trades
+        with CPU.timed('moogle'): MOOG.on_spec(sigs); MOOG.settle(_pl_result)
+    except Exception as e: print('moogle tick err',e,flush=True)
     try: GAPLIVE.tick()   # capped retries of gap-live signals skipped only for a stale Kalshi quote
     except Exception as e: print('gaplive tick err',e,flush=True)
     try: _gap_live_marks(_gm)   # DISPLAY ONLY: mark/unrealized P&L on open gap-live cards (no exits)
@@ -1100,6 +1103,15 @@ except Exception as e: print('gaplimit persist boot err',e,flush=True)
 # gap PAPER fills re-check the fresh websocket quote (same as Spec paper PAPER_FRESH_FILL); read-only quote cache
 GAPS.QUOTE[0]=lambda tk:(LV.wsq(tk) if LV is not None else None)
 GLIM.QUOTE[0]=GAPS.QUOTE[0]   # read-only quote cache for the limit shadow
+import moogle as MOOG   # MoogleEdge SHADOW (owner t1077u): read-only CF RTI feed + shadow book; no order path
+try:
+    MOOG.load(DATA)
+    if GP.enabled():
+        try: MOOG.merge_in(list(GP._db[0]['moogle_shadow'].find({}).sort('closesAt',-1).limit(MOOG.MAX_KEEP)))
+        except Exception as e: print('moogle mongo load err',type(e).__name__,flush=True)
+    MOOG.SINK[0]=lambda r:GP.upsert('moogle_shadow',r['id'],r)   # gappersist writer: batched, lease-gated
+    MOOG.start()
+except Exception as e: print('moogle boot err',type(e).__name__,e,flush=True)
 def _gap_live_marks(gm):
     """Display-only mark for open gap-live (hold-to-settle) trades: our-side bid from this tick's Kalshi market
     (already fetched over REST for the asset), else a fresh WS quote. Never exits or changes the position."""
@@ -1387,6 +1399,8 @@ class H(SimpleHTTPRequestHandler):
                     d['gapPaper']=GAPS.paper_summary(); d['persistence_gap']=GP.stats()
                     try: d['gapLimit']=GLIM.brief()
                     except Exception as e: d['gapLimit']='err '+str(e)[:80]
+                    try: d['moogleEdge']=MOOG.brief()
+                    except Exception as e: d['moogleEdge']='err '+str(e)[:80]
                     d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}"+(f"; {g['exitReason']}" if g.get('exitReason') else '')) for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
                 except Exception as e: d['gapPaper']=dict(error=str(e)[:200])
                 if 'full=1' not in s.path: slim_status(d)
@@ -1461,6 +1475,7 @@ class H(SimpleHTTPRequestHandler):
         elif p=='/api/gaplive':
             with lock: _gl=[dict(t) for t in pt.trades if t.get('gapLive')]
             b=json.dumps(GAPLIVE.summary(_gl),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/moogleedge': b=json.dumps(MOOG.api(full='full=1' in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gaplimit': b=json.dumps(dict(summary=GLIM.summary(),orders=GLIM.snapshot()[-400:] if 'orders=0' not in s.path else []),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
@@ -1470,7 +1485,7 @@ class H(SimpleHTTPRequestHandler):
         elif p=='/api/metalgap': b=json.dumps(list(SPEC.METAL_GAP),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/predstats': b=json.dumps(PL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/idxstats': b=json.dumps(WL.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
-        elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
+        elif p=='/healthz': b=json.dumps({'ok':True,'persistence':PERSIST,'commit':(os.environ.get('RENDER_GIT_COMMIT') or '')[:7] or None}).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.end_headers(); s.wfile.write(b)
         elif p in('/','/index.html','/manifest.json'): super().do_GET()
         else: s.send_error(404)
     def do_POST(s):
