@@ -1008,6 +1008,9 @@ def tick_once():
     try:  # LATE-WINDOW SHADOW (owner t1117u): paper books at 180/120/60/30s left, no order path
         with CPU.timed('latewindow'): LW.on_tick(_gm); LW.settle(_pl_result)
     except Exception as e: print('latewindow tick err',e,flush=True)
+    try:  # gap FILTERED paper book (owner t1155u): Rule A paper signals minus SOL-XRP and entry <55c, $1, no order path
+        with CPU.timed('gapfiltered'): GFILT.on_tick(_gm,signals=GAPS.PAPER[-20:]); GFILT.settle(_pl_result)
+    except Exception as e: print('gapfiltered tick err',e,flush=True)
     try:  # MoogleEdge SHADOW (owner t1077u): moogle_p next to each Spec decision, hypothetical gated $1 holds; never trades
         with CPU.timed('moogle'): MOOG.on_spec(sigs); MOOG.settle(_pl_result)
     except Exception as e: print('moogle tick err',e,flush=True)
@@ -1197,6 +1200,15 @@ try:
     MFLIP.SINK[0]=lambda o:GP.upsert('manual_flips',o['id'],o)
     MFLIP.backfill(orders=list(getattr(LV,'orders',None) or []) if LV is not None else [], trades=list(pt.trades))
 except Exception as e: print('manualflip boot err',type(e).__name__,e,flush=True)
+import gapfiltered as GFILT   # gap FILTERED paper book (owner t1155u): skip SOL-XRP and entry <55c, $1; no order path
+try:
+    GFILT.load(DATA)
+    if GP.enabled():
+        try: GFILT.merge_in(list(GP._db[0]['gap_filtered'].find({}).sort('openedAt',-1).limit(GFILT.MAX_KEEP)))
+        except Exception as e: print('gapfiltered mongo load err',type(e).__name__,flush=True)
+    GFILT.SINK[0]=lambda o:GP.upsert('gap_filtered',o['id'],o)   # gappersist writer: batched, lease-gated
+    GFILT.QUOTE[0]=GAPS.QUOTE[0]   # read-only WS quote cache
+except Exception as e: print('gapfiltered boot err',type(e).__name__,e,flush=True)
 def _gap_live_marks(gm):
     """Display-only mark for open gap-live (hold-to-settle) trades: our-side bid from this tick's Kalshi market
     (already fetched over REST for the asset), else a fresh WS quote. Never exits or changes the position."""
@@ -1497,6 +1509,8 @@ class H(SimpleHTTPRequestHandler):
                     except Exception as e: d['gapLive']=dict(error=str(e)[:80])
                     try: d['manualFlips']=MFLIP.brief()
                     except Exception as e: d['manualFlips']='err '+str(e)[:80]
+                    try: d['gapFiltered']=GFILT.brief()
+                    except Exception as e: d['gapFiltered']='err '+str(e)[:80]
                     d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}"+(f"; {g['exitReason']}" if g.get('exitReason') else '')) for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
                 except Exception as e: d['gapPaper']=dict(error=str(e)[:200])
                 if 'full=1' not in s.path: slim_status(d)
@@ -1577,7 +1591,14 @@ class H(SimpleHTTPRequestHandler):
         elif p=='/api/latewindow': b=json.dumps(LW.api(items='items=0' not in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/manualflips': b=json.dumps(MFLIP.api(items='items=0' not in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gaplimit': b=json.dumps(dict(summary=GLIM.summary(),orders=GLIM.snapshot()[-400:] if 'orders=0' not in s.path else []),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
-        elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/gapfiltered':
+            try: payload=GFILT.api(items='items=0' not in s.path)
+            except Exception as e: payload=dict(error=str(e)[:200])
+            b=json.dumps(payload,default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/gappaper':
+            try: filt=GFILT.summary()
+            except Exception as e: filt=dict(error=str(e)[:200])
+            b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot(),filtered=filt),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapexits' or (p=='/api/gapshadow' and 'summary=1' in s.path): b=json.dumps(dict(shadow=GAPS.variant_summary('shadow'),paper=GAPS.variant_summary('paper')),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/filtershadow': b=json.dumps(_fs_summary(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)

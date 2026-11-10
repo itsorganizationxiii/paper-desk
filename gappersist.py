@@ -9,7 +9,8 @@ Collections (in the app's existing Mongo db):
   research_state  small capped snapshots (leadlag/ethlead trigger logs), one doc each
   gap_night       night-mode shadow items (upsert by id), TTL TRADE_TTL_DAYS on openedAtDt
   gap_latewindow  late-window shadow items (upsert by id), TTL TRADE_TTL_DAYS on openedAtDt
-  manual_flips    owner manual-flip log (upsert by id), TTL TRADE_TTL_DAYS on openedAtDt"""
+  manual_flips    owner manual-flip log (upsert by id), TTL TRADE_TTL_DAYS on openedAtDt
+  gap_filtered    gap filtered paper book (upsert by id), TTL TRADE_TTL_DAYS on openedAtDt"""
 import collections, json, os, threading, time
 from datetime import datetime, timezone
 E=os.environ.get
@@ -64,7 +65,7 @@ def flush():
     for (col,_id),d in items:
         d=_clean(d)
         if d is None: continue
-        if col in ('gap_trades','gap_night') or col in ('gap_latewindow','manual_flips'): d['openedAtDt']=_dt(d.get('openedAt'))
+        if col in ('gap_trades','gap_night','gap_latewindow','manual_flips','gap_filtered'): d['openedAtDt']=_dt(d.get('openedAt'))
         bycol[col].append(d)
     for col,docs in bycol.items():
         try: db[col].bulk_write([ReplaceOne({'_id':d['_id']},d,upsert=True) for d in docs],ordered=False); ST['upserts']+=len(docs)
@@ -140,6 +141,11 @@ def ensure_indexes():
         try: db['manual_flips'].create_index('openedAtDt',expireAfterSeconds=TRADE_TTL_DAYS*86400)
         except Exception: db.command('collMod','manual_flips',index={'keyPattern':{'openedAtDt':1},'expireAfterSeconds':TRADE_TTL_DAYS*86400})
     except Exception as e: _err('index manual_flips',e)
+    try:
+        db['gap_filtered'].create_index('openedAt')
+        try: db['gap_filtered'].create_index('openedAtDt',expireAfterSeconds=TRADE_TTL_DAYS*86400)
+        except Exception: db.command('collMod','gap_filtered',index={'keyPattern':{'openedAtDt':1},'expireAfterSeconds':TRADE_TTL_DAYS*86400})
+    except Exception as e: _err('index gap_filtered',e)
 def _loop():
     ensure_indexes(); ST['enabled']=True; last_snap=0; last_maint=0
     while True:

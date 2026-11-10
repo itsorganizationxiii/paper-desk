@@ -58,6 +58,7 @@ ttl={(c.name,k):kw.get('expireAfterSeconds') for c in db.cols.values() for k,kw 
 chk('TTL 14d on metalgap/cryptogap/spec_research',all(ttl.get((c,'at'))==14*86400 for c in ('metalgap','cryptogap','spec_research')))
 chk('TTL on gap_trades',ttl.get(('gap_trades','openedAtDt'))==P.TRADE_TTL_DAYS*86400)
 chk('TTL on manual_flips',ttl.get(('manual_flips','openedAtDt'))==P.TRADE_TTL_DAYS*86400)
+chk('TTL on gap_filtered',ttl.get(('gap_filtered','openedAtDt'))==P.TRADE_TTL_DAYS*86400)
 # producers are pure in-memory (no db calls on the caller thread)
 c0=db.calls; t0=time.perf_counter()
 for i in range(2000): P.insert('metalgap','m|%d'%i,dict(kind='metal_gap',ts_ms=1700000000000+i,gapDown=0.1))
