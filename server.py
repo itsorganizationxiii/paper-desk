@@ -975,6 +975,9 @@ def tick_once():
         with CPU.timed('gaps.on_tick'): GAPS.on_tick(_gm)
         with CPU.timed('gaps.settle'): GAPS.settle(_pl_result)
     except Exception as e: print('gapshadow tick err',e,flush=True)
+    try:  # gap Rule A LIMIT-ORDER SHADOW (owner t1064u): simulated resting limits, paper only, no order path
+        GLIM.on_tick(_gm,signals=GAPS.TRADES[-20:]); GLIM.settle(_pl_result)
+    except Exception as e: print('gaplimit tick err',e,flush=True)
     try: GAPLIVE.tick()   # capped retries of gap-live signals skipped only for a stale Kalshi quote
     except Exception as e: print('gaplive tick err',e,flush=True)
     try: _gap_live_marks(_gm)   # DISPLAY ONLY: mark/unrealized P&L on open gap-live cards (no exits)
@@ -1038,6 +1041,9 @@ import gapshadow as GAPS
 GAPS_ASSETS=('GOLD','SILVER','BTC','ETH','SOL','XRP')
 try: GAPS.load(DATA)
 except Exception as e: print('gapshadow load err',e,flush=True)
+import gaplimit as GLIM
+try: GLIM.load(DATA)
+except Exception as e: print('gaplimit load err',e,flush=True)
 # ---- Nov 9: persist in-memory-only state to the existing Mongo (async/batched, owner-gated, bounded) + reload on boot ----
 import gappersist as GP
 SEED_DIR=os.path.join(APP,'gap_seed')
@@ -1083,8 +1089,13 @@ def _persist_boot():
     print('persist boot: gap trades',len(GAPS.TRADES),'shadow /',len(GAPS.PAPER),'paper; metalgap',len(SPEC.METAL_GAP),'cryptogap',len(SPEC.CRYPTO_GAP),'mongo',GP.enabled(),flush=True)
 try: _persist_boot()
 except Exception as e: print('persist boot err',e,flush=True)
+try:  # gap limit shadow: Mongo copy in research_state (one bounded doc), merged with the file copy
+    GLIM.merge_in(((GP.load_doc('research_state','gap_limit') if GP.enabled() else None) or {}).get('items'))
+    GLIM.SINK[0]=lambda:GP.upsert('research_state','gap_limit',dict(items=GLIM.snapshot(),updatedAt=time.time()))
+except Exception as e: print('gaplimit persist boot err',e,flush=True)
 # gap PAPER fills re-check the fresh websocket quote (same as Spec paper PAPER_FRESH_FILL); read-only quote cache
 GAPS.QUOTE[0]=lambda tk:(LV.wsq(tk) if LV is not None else None)
+GLIM.QUOTE[0]=GAPS.QUOTE[0]   # read-only quote cache for the limit shadow
 def _gap_live_marks(gm):
     """Display-only mark for open gap-live (hold-to-settle) trades: our-side bid from this tick's Kalshi market
     (already fetched over REST for the asset), else a fresh WS quote. Never exits or changes the position."""
@@ -1370,6 +1381,8 @@ class H(SimpleHTTPRequestHandler):
                 except Exception as e: d['live']['cooldowns']={'error':str(e)}
                 try:  # gap PAPER book shown in the paper ledger (display copies only; Spec stats/balance above exclude it)
                     d['gapPaper']=GAPS.paper_summary(); d['persistence_gap']=GP.stats()
+                    try: d['gapLimit']=GLIM.brief()
+                    except Exception as e: d['gapLimit']='err '+str(e)[:80]
                     d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}"+(f"; {g['exitReason']}" if g.get('exitReason') else '')) for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
                 except Exception as e: d['gapPaper']=dict(error=str(e)[:200])
                 if 'full=1' not in s.path: slim_status(d)
@@ -1444,6 +1457,7 @@ class H(SimpleHTTPRequestHandler):
         elif p=='/api/gaplive':
             with lock: _gl=[dict(t) for t in pt.trades if t.get('gapLive')]
             b=json.dumps(GAPLIVE.summary(_gl),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/gaplimit': b=json.dumps(dict(summary=GLIM.summary(),orders=GLIM.snapshot()[-400:] if 'orders=0' not in s.path else []),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapexits' or (p=='/api/gapshadow' and 'summary=1' in s.path): b=json.dumps(dict(shadow=GAPS.variant_summary('shadow'),paper=GAPS.variant_summary('paper')),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
