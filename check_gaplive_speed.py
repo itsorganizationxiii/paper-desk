@@ -82,12 +82,12 @@ chk('both buys ran in parallel and filled; cap counted',g.used()==2 and g.inflig
 chk('paper twin re-emitted with liveTwinId',emitted==[9,9])
 ra=g.summary([])['recentAttempts'][0]
 chk('recentAttempts include stage timings',isinstance(ra.get('stages'),dict) and 'order' in ra['stages'] and ra['buySec']<1.5)
-lb.gapLiveUsed=2; lb.tried.clear()
+lb.gapLiveUsed=GL.MAX_TRADES-1; lb.tried.clear()
 for tk in ('KXBTC15M-A2','KXSOL15M-A2'): lb.ws.q[tk]=dict(yesBid=0.49,yesAsk=0.50,rx=time.time(),ts=time.time())
 g.on_paper(P('KXBTC15M-A2')); g.on_paper(P('KXSOL15M-A2','SOL'))
-chk('cap reservation: 2 used + 1 in flight blocks the 2nd signal',g.inflight==1 and 'cap reserved' in g.stat['lastReason'])
+chk('cap reservation: max-1 used + 1 in flight blocks the 2nd signal',g.inflight==1 and 'cap reserved' in g.stat['lastReason'])
 time.sleep(1.2)
-chk('cap reached at 3, auto-disabled',g.used()==3 and lb.gapLiveDisabled and len(lb.sent)==3)
+chk('cap reached at max, auto-disabled',g.used()==GL.MAX_TRADES and lb.gapLiveDisabled and len(lb.sent)==3)
 # 7. kws: slow on_quote callback no longer delays the quote cache
 f=kws.Feed('ws://127.0.0.1:1/x',lambda:{}); f.on_quote=lambda tk,q:time.sleep(0.5)
 now=time.time(); t0=time.time()

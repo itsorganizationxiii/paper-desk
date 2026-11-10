@@ -19,7 +19,7 @@ def P(rule='A',pair='BTC-ETH',asset='BTC',close=1000,stake=1.0,conf='normal'):
 opened=[]
 def opener(p,fill,strike): t=dict(id=len(opened)+1,gapLive=True,mode='live',status='open',pnl=None,tag='gap-live',strike=strike); opened.append(t); return t
 # defaults
-chk('defaults: enabled, max 3, $1, LIVE_STRATEGIES=gap',GL.ENABLED and GL.MAX_TRADES==3 and GL.USD==1.0 and GL.LIVE_STRATEGIES=={'gap'})
+chk('defaults: enabled, max 5 (test #2), $1, LIVE_STRATEGIES=gap',GL.ENABLED and GL.MAX_TRADES==5 and GL.USD==1.0 and GL.LIVE_STRATEGIES=={'gap'})
 chk('rules A only, pairs BTC-ETH/SOL-XRP',GL.RULES=={'A'} and GL.PAIRS=={'BTC-ETH','SOL-XRP'})
 # gating: paused -> no buy
 lv=FakeLV(enabled=False); g=GL.GapLive(lv,opener,log=lambda *a:None)
@@ -41,17 +41,18 @@ chk('SOL leg of SOL-XRP allowed',g.on_paper(P(pair='SOL-XRP',asset='SOL',close=1
 # partial fill counts
 lv.fill=0.3
 chk('partial fill counts toward cap',g.on_paper(P(close=2800)) is not None and lv.gapLiveUsed==3)
-chk('auto-disabled at cap and persisted',lv.gapLiveDisabled and lv.saved[-1]==(3,True))
+chk('fills 4 and 5',g.on_paper(P(close=3700)) is not None and g.on_paper(P(close=4600)) is not None and lv.gapLiveUsed==5)
+chk('auto-disabled at cap and persisted',lv.gapLiveDisabled and lv.saved[-1]==(5,True))
 n=len(lv.calls); lv.fill=1.0
-chk('4th signal blocked: no order',g.on_paper(P(close=3700)) is None and len(lv.calls)==n and 'cap reached' in g.stat['lastReason'])
+chk('6th signal blocked: no order',g.on_paper(P(close=5500)) is None and len(lv.calls)==n and 'cap reached' in g.stat['lastReason'])
 # no fill does not count
 lv2=FakeLV(fill=None); g2=GL.GapLive(lv2,opener,log=lambda *a:None)
 chk('no fill does not count',g2.on_paper(P()) is None and lv2.gapLiveUsed==0 and len(lv2.calls)==1)
 # cap survives restart: Live loads/stores counters in its state doc
-lvr=L.Live(store_load=lambda:dict(gapLiveUsed=3,gapLiveDisabled=True))
-chk('Live loads gapLiveUsed/disabled from state doc',lvr.gapLiveUsed==3 and lvr.gapLiveDisabled)
-chk('Live.state() carries counters',lvr.state()['gapLiveUsed']==3 and lvr.state()['gapLiveDisabled'] is True)
-g3=GL.GapLive(lvr,opener,log=lambda *a:None); lvr.enabled=lambda:True
+lvr=L.Live(store_load=lambda:dict(gapLiveUsed=5,gapLiveDisabled=True,gapLiveTest=GL.TEST_ID))
+chk('Live loads gapLiveUsed/disabled from state doc',lvr.gapLiveUsed==5 and lvr.gapLiveDisabled)
+chk('Live.state() carries counters',lvr.state()['gapLiveUsed']==5 and lvr.state()['gapLiveDisabled'] is True)
+g3=GL.GapLive(lvr,opener,log=lambda *a:None); g3.reset_for_test(); lvr.enabled=lambda:True
 chk('restored cap blocks after restart',g3.block_reason(P()).startswith('cap reached'))
 # LIVE_STRATEGIES gate
 chk('Spec not live even when engine enabled',GL.strategy_live('spec',FakeLV())==False)
@@ -86,7 +87,7 @@ t=dict(gapLive=True,mode='live',shadow=False,status='open',ticker='KXBTC15M-Q',c
 class Boom:
     def __getattr__(s,k): raise AssertionError('exit path touched '+k)
 r=[ns['exit'](Boom(),dict(t),0.9,'takeprofit'),ns['exit'](Boom(),dict(t),0.1,'stop: x'),ns['exitLive'](Boom(),dict(t),0.1,'trail'),ns['_sellLive'](Boom(),dict(t),0.1,'stop')]
-chk('gap-live exit/exitLive/_sellLive are no-ops (hold to settlement)',r==[None]*4)
+chk('gap-live exit/exitLive/_sellLive are no-ops (generic exits never touch gap-live; trail sells via gaplive.manage_exits)',r==[None]*4)
 chk('monitor + ws exit loops skip gapLive',src.count("not t.get('exiting') and not t.get('gapLive')")==2)
 chk('Spec main live site gated by live_for(spec)',"if live_for('spec') and not shd:" in src and "if LV and LV.enabled() and not shd:" not in src)
 chk('reversal/alt live sites gated',src.count("if live_for('spec')")>=3)

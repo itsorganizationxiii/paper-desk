@@ -171,7 +171,8 @@ class PaperTrader:
             if LV: LV.pending_fills.pop(fill.get('orderId'),None)
             return existing
         stake=round(fill['cost']+fill['fee'],4)
-        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',shadow=False,gapLive=True,holdToSettle=True,
+        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',shadow=False,gapLive=True,holdToSettle=p.get('_gapLiveExit')!='trail',
+               exitMode=p.get('_gapLiveExit') or 'hold',gapLiveTest=p.get('_gapLiveTest'),
                asset=p['asset'],side=fill.get('side') or p['side'],price=fill['price'],stake=stake,stakePct=0,
                contracts=fill['contracts'],entryFee=fill['fee'],liveOrderId=fill['orderId'],liveCashAtEntry=fill.get('cash'),
                edge=0,modelP=None,strike=strike,ticker=p['ticker'],openedAt=time.time(),closesAt=p['closesAt'],status='open',
@@ -978,6 +979,9 @@ def tick_once():
     except Exception as e: print('gaplive tick err',e,flush=True)
     try: _gap_live_marks(_gm)   # DISPLAY ONLY: mark/unrealized P&L on open gap-live cards (no exits)
     except Exception as e: print('gaplive mark err',e,flush=True)
+    try:   # gap-live test #2 (owner t1050): trailing take-profit -> REAL reduce-only sell (sell runs on its own thread)
+        with lock: GAPLIVE.manage_exits(pt.trades,lambda t:_gap_live_bid(t,_gm))
+    except Exception as e: print('gaplive exit err',e,flush=True)
     try:
         if 'DOGE' not in _pair_rets:
             try:
@@ -1096,11 +1100,26 @@ def _gap_live_marks(gm):
         if t.get('contracts'): t.setdefault('costPerContract',round(float(t['stake'])/float(t['contracts']),4))   # incl. fee (Kalshi 'cost')
         if bid is None: continue
         t.update(markPrice=round(float(bid),4),markSource=src,markAt=time.time(),unrealizedPnl=round(t['contracts']*float(bid)-t['stake'],2))
+def _gap_live_bid(t,gm):
+    """Our-side bid for a gap-live trail check: fresh WS quote first (same order as the gap paper trail), else this tick's REST market."""
+    if LV is not None:
+        try:
+            w=LV.wsq(t['ticker'])
+            if w and w.get('yesBid') is not None and w.get('yesAsk') is not None:
+                return float(w['yesBid']) if t.get('side')=='YES' else round(1-float(w['yesAsk']),4)
+        except Exception: pass
+    m=(gm or {}).get(t.get('asset'))
+    if isinstance(m,dict) and m.get('ticker')==t.get('ticker'):
+        b=m.get('yesBid') if t.get('side')=='YES' else m.get('noBid')
+        return float(b) if b is not None else None
+    return None
 def _gap_live_open(p,fill,strike):
     with lock: return pt.openLiveGap(p,fill,strike)
 GAPLIVE=GL.GapLive(LV,_gap_live_open,log=lambda *a:print(*a,flush=True))
 GAPS.LIVE[0]=GAPLIVE.on_paper
-GAPLIVE.async_=True; GAPLIVE.emit=GAPS._emit   # live buy on its own thread the moment the paper signal opens
+GAPLIVE.async_=True; GAPLIVE.emit=GAPS._emit; GAPLIVE.tlock=lock; GAPLIVE.save=pt.save
+try: GAPLIVE.reset_for_test()   # test #2: once per GAP_LIVE_TEST id -> used 0/5, auto-disable cleared, live PAUSED until owner Resume
+except Exception as e: print('gaplive reset err',e,flush=True)   # live buy on its own thread the moment the paper signal opens
 # SHADOW-ONLY entry filters on gap trades (tags only; skip2L per book: gapShadow = rules A/B/C combined, gapPaper = paper book)
 def _gap_ftag(t,book):
     if book=='paper': FS.tag(t,'gapPaper',list(GAPS.PAPER),t.get('laggard') or t.get('asset'),t.get('price') or t.get('entry'))

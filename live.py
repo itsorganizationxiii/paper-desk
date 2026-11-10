@@ -81,7 +81,7 @@ class Live:
         st=(store_load() if store_load else None) or {}
         s.paused=bool(st.get('paused',False)); s.day=st.get('day') or et_day(); s.dayPnl=float(st.get('dayPnl',0))
         s.killed=bool(st.get('killed',False)); s.killReason=st.get('killReason'); s.orders=st.get('orders',[])[-200:]
-        s.totalPnl=float(st.get('totalPnl',0)); s.gapLiveUsed=int(st.get('gapLiveUsed',0) or 0); s.gapLiveDisabled=bool(st.get('gapLiveDisabled',False)); s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.lastBuyDetail=None; s.lastBuyRetry=False; s.staleRetry={}; s.entry_block=None
+        s.totalPnl=float(st.get('totalPnl',0)); s.gapLiveUsed=int(st.get('gapLiveUsed',0) or 0); s.gapLiveDisabled=bool(st.get('gapLiveDisabled',False)); s.gapLiveTest=st.get('gapLiveTest'); s.gapLivePrev=list(st.get('gapLivePrev') or [])[-10:]; s.tried=set(); s.edgeLogged=set(); s.fracOK=True; s.resting=set(); s.lastBuy=None; s.lastBuyDetail=None; s.lastBuyRetry=False; s.staleRetry={}; s.entry_block=None
         s.cash=None; s.cashAt=None; s.lastError=None; s.ws=None
         s.lease_ok=None
         s.instance=uuid.uuid4().hex[:12]; s.own_orders={}; s.submitted_orders={}; s._lost_cleanup=False
@@ -153,7 +153,7 @@ class Live:
         ok=(held==side and n>=want-0.011)
         s.log(action='position-check' if ok else 'position-mismatch',expect=f'{side} {want}',actual=f'{held} {n}' if held else 'flat',error=None if ok else 'Kalshi position differs from recorded trade; recording what Kalshi holds',**a)
         return (held,min(n,want) if held==side else n) if held else (side,0.0)
-    def state(s): return dict(paused=s.paused,day=s.day,dayPnl=s.dayPnl,killed=s.killed,killReason=s.killReason,orders=s.orders[-200:],totalPnl=s.totalPnl,gapLiveUsed=getattr(s,'gapLiveUsed',0),gapLiveDisabled=getattr(s,'gapLiveDisabled',False))
+    def state(s): return dict(paused=s.paused,day=s.day,dayPnl=s.dayPnl,killed=s.killed,killReason=s.killReason,orders=s.orders[-200:],totalPnl=s.totalPnl,gapLiveUsed=getattr(s,'gapLiveUsed',0),gapLiveDisabled=getattr(s,'gapLiveDisabled',False),gapLiveTest=getattr(s,'gapLiveTest',None),gapLivePrev=list(getattr(s,'gapLivePrev',None) or [])[-10:])
     def persist(s):
         if not s.owner(): return  # stale deploy instance must not overwrite the new instance's order log
         if s._save:
