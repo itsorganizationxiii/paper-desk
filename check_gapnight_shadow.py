@@ -56,19 +56,34 @@ chk('session tagged night at 3 AM ET',it['baseline']['session']=='night' and it[
 chk('baseline enters unfiltered at the signal ask 0.61',it['baseline']['status']=='filled' and it['baseline']['entry']==0.61 and it['baseline']['side']=='YES')
 chk('n1 enters when MoogleEdge side p 0.70 >= 0.65',it['n1']['status']=='filled' and it['n1']['tags']['moogleP']==0.70)
 chk('n2 skips low volume even when MoogleEdge passes',it['n2']['status']=='skipped' and 'low-volume' in it['n2']['skipReason'])
-chk('one set per signal (no duplicates on the next tick)',N.on_tick(m0,NIGHT+1,signals=G.TRADES)==[] and len([o for o in N.ITEMS if o['pair']=='BTC-ETH'])==3)
-chk('persisted via SINK',all(f"{it['baseline']['shadowKey']}|{v}" in SUNK for v in ('baseline','n1','n2')))
+chk('one set per signal (no duplicates on the next tick)',N.on_tick(m0,NIGHT+1,signals=G.TRADES)==[] and len([o for o in N.ITEMS if o['pair']=='BTC-ETH'])==4)
+chk('persisted via SINK',all(f"{it['baseline']['shadowKey']}|{v}" in SUNK for v in N.VARIANTS))
 # MoogleEdge below bar
 N.ITEMS.clear(); N._by.clear(); N._seen.clear(); SUNK.clear()
 st=dict(sig[0]); st['closesAt']=CLOSE_N+900; st['openedAt']=NIGHT; st['ticker']='KXETH15M-W2'
 M.CUR['ETH']=dict(p=0.50,ticker='KXETH15M-W2',t=NIGHT-1)
 N.on_tick({},NIGHT,signals=[st]); itb={o['variant']:o for o in N.ITEMS}
-chk('n1/n2 skip when MoogleEdge p 0.50 < 0.65; baseline still enters',itb['baseline']['status']=='filled' and itb['n1']['status']=='skipped' and 'moogle-below-bar' in itb['n1']['skipReason'] and itb['n2']['status']=='skipped' and 'moogle-below-bar' in itb['n2']['skipReason'])
+chk('n1/n2/n3 skip when MoogleEdge p 0.50 is below each bar; baseline still enters',itb['baseline']['status']=='filled' and itb['n1']['status']=='skipped' and 'moogle-below-bar' in itb['n1']['skipReason'] and '0.65' in itb['n1']['skipReason'] and itb['n2']['status']=='skipped' and itb['n3']['status']=='skipped' and '0.55' in itb['n3']['skipReason'] and itb['baseline'].get('moogleBand')=='0.50-0.55')
+# MoogleEdge in the 0.55-0.60 band: n3 enters, n1/n2 skip
+st55=dict(st); st55['closesAt']=CLOSE_N+950; st55['ticker']='KXETH15M-W55'; st55['openedAt']=NIGHT
+M.CUR['ETH']=dict(p=0.58,ticker='KXETH15M-W55',t=NIGHT-1)
+N.on_tick({},NIGHT,signals=[st55]); it55={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-W55'}
+chk('n3 moogle-55 enters at side p 0.58; n1/n2 skip below 0.65; band is 0.55-0.60',
+    it55['n3']['status']=='filled' and it55['n3']['entry']==it55['baseline']['entry']
+    and it55['n1']['status']=='skipped' and '0.65' in it55['n1']['skipReason']
+    and it55['n2']['status']=='skipped' and it55['baseline'].get('moogleBand')=='0.55-0.60'
+    and it55['n3'].get('moogleBand')=='0.55-0.60' and N.moogle_band(0.55)=='0.55-0.60'
+    and N.moogle_band(0.50)=='0.50-0.55' and N.moogle_band(0.649)=='0.60-0.65' and N.moogle_band(0.65)=='>=0.65'
+    and N.moogle_band(0.49)=='<0.50' and N.moogle_band(None) is None)
+st550=dict(st); st550['closesAt']=CLOSE_N+960; st550['ticker']='KXETH15M-W550'
+M.CUR['ETH']=dict(p=0.55,ticker='KXETH15M-W550',t=NIGHT-1)
+N.on_tick({},NIGHT,signals=[st550]); it550={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-W550'}
+chk('n3 enters at the 0.55 bar exactly; n1 still skips',it550['n3']['status']=='filled' and it550['n1']['status']=='skipped' and it550['baseline']['moogleBand']=='0.55-0.60')
 # MoogleEdge not warm
 stc=dict(st); stc['closesAt']=CLOSE_N+1800; stc['ticker']='KXETH15M-W3'
 M.CUR['ETH']=dict(p=0.80,ticker='KXETH15M-W3',t=NIGHT-60)
 N.on_tick({},NIGHT,signals=[stc]); itc={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-W3'}
-chk('stale MoogleEdge is not warm -> n1/n2 skip moogle-not-warm, baseline enters',N.moogle_side_p('ETH','KXETH15M-W3','YES',NIGHT) is None and itc['baseline']['status']=='filled' and itc['n1']['skipReason']=='moogle-not-warm' and itc['n2']['skipReason']=='moogle-not-warm')
+chk('stale MoogleEdge is not warm -> n1/n2/n3 skip moogle-not-warm, baseline enters',N.moogle_side_p('ETH','KXETH15M-W3','YES',NIGHT) is None and itc['baseline']['status']=='filled' and itc['n1']['skipReason']=='moogle-not-warm' and itc['n2']['skipReason']=='moogle-not-warm' and itc['n3']['skipReason']=='moogle-not-warm' and itc['baseline'].get('moogleBand') is None)
 M.CUR.pop('ETH',None)
 stc2=dict(st); stc2['closesAt']=CLOSE_N+2700; stc2['ticker']='KXETH15M-W3b'
 N.on_tick({},NIGHT,signals=[stc2]); itc2={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-W3b'}
@@ -78,7 +93,7 @@ sts=dict(rule='A',mode='shadow',pair='SOL-XRP',laggard='SOL',leader='XRP',ticker
          closesAt=CLOSE_N+3600,openedAt=NIGHT,gapDown=0.2,leaderYesMid=0.80,laggardYesMid=0.55)
 M.CUR['SOL']=dict(p=0.80,ticker='KXSOL15M-W4',t=NIGHT-1)
 N.on_tick({},NIGHT,signals=[sts]); its={o['variant']:o for o in N.ITEMS if o['ticker']=='KXSOL15M-W4'}
-chk('SOL-XRP SOL laggard: n1 and n2 both enter (vol at median, moogle 0.80)',its['baseline']['status']=='filled' and its['n1']['status']=='filled' and its['n2']['status']=='filled' and its['n2']['entry']==0.55)
+chk('SOL-XRP SOL laggard: n1, n2 and n3 all enter (vol at median, moogle 0.80)',its['baseline']['status']=='filled' and its['n1']['status']=='filled' and its['n2']['status']=='filled' and its['n3']['status']=='filled' and its['n2']['entry']==0.55 and its['n3']['entry']==0.55)
 # XRP laggard blocked
 stx=dict(sts); stx.update(laggard='XRP',leader='SOL',ticker='KXXRP15M-W5',closesAt=CLOSE_N+4500,entry=0.40)
 M.CUR['XRP']=dict(p=0.90,ticker='KXXRP15M-W5',t=NIGHT-1)
@@ -130,9 +145,9 @@ std2=dict(st); std2.update(closesAt=CLOSE_D+900,openedAt=DAY,ticker='KXETH15M-DA
 M.CUR['ETH']=dict(p=0.80,ticker='KXETH15M-DAY2',t=DAY-1)
 N.on_tick({},DAY,signals=[std2])
 s=N.summary(); json.dumps(N.api(),default=str)
-chk('summary: three books + skip reasons + persist TTL note',set(s['books'])=={'baseline','n1','n2'} and s['books']['n2']['skipReasons'] and s['persist']['collection']=='gap_night' and s['persist']['ttlDays']==120)
+chk('summary: four books + skip reasons + persist TTL note',set(s['books'])=={'baseline','n1','n2','n3'} and s['books']['n2']['skipReasons'] and s['persist']['collection']=='gap_night' and s['persist']['ttlDays']==120 and s['thresholds']['moogleBar55']==0.55)
 chk('summary W-L counts night entries only (day logged separately)',s['dayLogged']>=3 and 'day-not-applicable' in s['daySkipReasons'] and all(o['status']!='filled' or o.get('session')=='night' for o in N.ITEMS))
-chk('brief is a short string with Night mode variant names',isinstance(N.brief(),str) and 'unfiltered' in N.brief() and 'moogle-65' in N.brief())
+chk('brief is a short string with Night mode variant names',isinstance(N.brief(),str) and 'unfiltered' in N.brief() and 'moogle-65' in N.brief() and 'moogle-55' in N.brief())
 sess=N.session_now(NIGHT); chk('session_now reports night at 3 AM ET',sess['isNight'] is True and sess['label']=='night' and sess['window']=='5 PM-6 AM ET')
 # ---- trail25: arms later than trail15, keeps tracking after trail15 exits, sell at bid, $1 flat ----
 N.ITEMS.clear(); N._by.clear(); N._seen.clear(); SUNK.clear()
@@ -143,7 +158,7 @@ def _eth(tk,bidask,close):
     m=mkts(eth=bidask,close=close); m['ETH']['ticker']=tk; return m
 N.on_tick(_eth('KXETH15M-T25',(0.59,0.61),CLOSE_N+7200),NIGHT,signals=[st25])
 it25={o['variant']:o for o in N.ITEMS if o['ticker']=='KXETH15M-T25'}
-chk('trail25 fixture: baseline/n1 fill at 0.61, $1 stake',it25['baseline']['status']=='filled' and it25['baseline']['entry']==0.61 and it25['n1']['status']=='filled' and N.STAKE==1.0)
+chk('trail25 fixture: baseline/n1/n3 fill at 0.61, $1 stake',it25['baseline']['status']=='filled' and it25['baseline']['entry']==0.61 and it25['n1']['status']=='filled' and it25['n3']['status']=='filled' and N.STAKE==1.0)
 N.on_tick(_eth('KXETH15M-T25',(0.80,0.82),CLOSE_N+7200),NIGHT+30,signals=[])
 chk('bid 0.80 arms trail15 only (0.61+0.15), not trail25 (need 0.86)',it25['baseline'].get('trailArmedAt') is not None and it25['baseline'].get('trailArmedAt25') is None and it25['baseline'].get('exit') is None and it25['baseline'].get('exit25') is None)
 N.on_tick(_eth('KXETH15M-T25',(0.69,0.71),CLOSE_N+7200),NIGHT+60,signals=[])
@@ -186,10 +201,32 @@ s=N.summary(); N._bc[0]=0; br=N.brief()
 chk('each night book reports trail15/trail25/hold W-L and P&L',
     all(set(s['books'][v]['exits'])=={'trail15','trail25','hold'} and all(k in s['books'][v]['exits'][x] for k in ('wins','losses','pnl') for x in s['books'][v]['exits']) for v in N.VARIANTS)
     and set(s['nightExits'])=={'trail15','trail25','hold'})
-chk('brief names t15/t25/hold next to each book','t15' in br and 't25' in br and ' hold ' in br and 'unfiltered' in br)
+chk('brief names t15/t25/hold next to each book and shows trail25 n','t15' in br and 't25' in br and ' hold ' in br and 'unfiltered' in br and 'moogle-55' in br and 'n=' in br)
 chk('hold-path book: trail25 P&L matches hold, trail15 does not',
     s['books']['baseline']['exits']['trail25']['pnl']!=0 or s['books']['baseline']['exits']['hold']['wins']>=1)
 chk('ARM25 is +25c with the same 10c giveback and $1 stake',N.ARM25==0.25 and N.DROP==0.10 and N.ARM==0.15 and N.STAKE==1.0)
+# unfiltered book records Moogle p bands (live comparison)
+s=N.summary()
+chk('unfiltered book exposes the five Moogle p bands',
+    'bands' in s['books']['baseline'] and set(N.BANDS).issubset(s['books']['baseline']['bands'])
+    and s['books']['baseline']['bands']['>=0.65']['n']>=1
+    and s['books']['n1'].get('bands') is None)
+# trail25 must exclude pre-deploy settled fills that have no pnl25 (do not count them as $0)
+N.merge_in([dict(id='shadow|A|BTC-ETH|888.000|baseline',shadowKey='shadow|A|BTC-ETH|888.000',variant='baseline',
+                 variantName='unfiltered',mode='shadow',book='gap-night',rule='A',pair='BTC-ETH',laggard='ETH',
+                 leader='BTC',ticker='KXETH15M-PRE',side='YES',entry=0.61,contracts=1.6,entryFee=0.03,
+                 status='filled',session='night',closesAt=CLOSE_N-10,openedAt=NIGHT-900,
+                 exit=0.69,pnl=0.22,hold_pnl=0.68,settle='yes',settledAt=CLOSE_N,moogleBand='0.60-0.65')])
+s=N.summary(); N._bc[0]=0; br=N.brief()
+fin_b=[o for o in N.ITEMS if o['variant']=='baseline' and o.get('status')=='filled' and o.get('session')=='night' and o.get('settle') is not None]
+t25=[o for o in fin_b if o.get('pnl25') is not None]
+pre=[o for o in fin_b if o.get('pnl25') is None]
+chk('trail25 book excludes pre-deploy fills with no pnl25 and reports n separately',
+    len(pre)>=1 and s['books']['baseline']['exits']['trail25']['n']==len(t25)
+    and s['books']['baseline']['exits']['trail25']['pnl']==round(sum(o['pnl25'] for o in t25),2)
+    and s['books']['baseline']['exits']['hold']['n']==len(fin_b)
+    and s['nightExits']['trail25']['n']==len([o for o in N.ITEMS if o.get('status')=='filled' and o.get('session')=='night' and o.get('settle') is not None and o.get('pnl25') is not None])
+    and 'n=' in br)
 # persistence roundtrip
 snap=N.snapshot(); n0=len(snap); N.ITEMS.clear(); N._by.clear(); N._seen.clear(); N.merge_in(snap+[dict(snap[0],settle=None)])
 chk('merge_in restores items (settled beats open, no dupes)',len(N.ITEMS)==n0 and N._by[snap[0]['id']]['settle']==snap[0].get('settle'))
