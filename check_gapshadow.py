@@ -150,9 +150,9 @@ ssrc=open('server.py').read()
 chk('server never puts gap trades into pt.trades',all(x not in ssrc for x in ('pt.trades.append(g','pt.trades+GAPS','pt.merge(GAPS')))
 chk('openLive rejects gap metadata',"meta.get('gap') or str(meta.get('signalSource','')).startswith('gap')" in ssrc)
 chk('csv labels gap paper + shadow rule:pair',"'gap:'+str(g.get('rule'))+':'+str(g.get('pair',''))" in ssrc and "'gapshadow:'+str(g.get('rule','gap20'))+':'+str(g.get('pair',''))" in ssrc)
-# ---- Nov 9: confidence sizing for gap PAPER (strong=$3 / normal=$1); shadow stays $1 ----
+# ---- Nov 9: confidence flag for gap PAPER (stake $1 flat on strong and normal); shadow stays $1 ----
 G=importlib.reload(G); G.load(tempfile.mkdtemp()); G.HIST.clear(); G.QUOTE[0]=None; G.SINK[0]=None
-chk('strong gate defaults',G.STRONG_STAKE==3.0 and G.PAPER_STAKE==1.0 and abs(G.STRONG_GAP-0.08)<1e-12 and G.STRONG_MIN_OF==3 and (G.STRONG_MIN_LEFT,G.STRONG_MAX_LEFT)==(120.0,780.0))
+chk('strong gate defaults',G.STRONG_STAKE==1.0 and G.PAPER_STAKE==1.0 and abs(G.STRONG_GAP-0.08)<1e-12 and G.STRONG_MIN_OF==3 and (G.STRONG_MIN_LEFT,G.STRONG_MAX_LEFT)==(120.0,780.0))
 C4=9000.0
 def strongset(c,doge=0.7,sol=0.6,xrp=0.55,btc=0.46,eth=0.58):
     d={'BTC':mm('KXBTC-S%d'%c,btc,c),'ETH':mm('KXETH-S%d'%c,eth,c),'SOL':mm('KXSOL-S%d'%c,sol,c),'XRP':mm('KXXRP-S%d'%c,xrp,c)}
@@ -160,8 +160,8 @@ def strongset(c,doge=0.7,sol=0.6,xrp=0.55,btc=0.46,eth=0.58):
     return d
 G.on_tick(strongset(C4),C4-400)
 sp=[t for t in G.PAPER if t['closesAt']==C4][0]; sh=[t for t in G.TRADES if t['closesAt']==C4 and t['rule']=='A'][0]
-chk('unanimous 3/3 + 12pt gap + 400s -> strong $3',sp['conf']=='strong' and sp['stake']==3.0 and sp['tag']=='gap-paper-strong')
-chk('strong contracts sized from $3',abs(sp['contracts']-round((3.0-G.fee(3.0/sp['price'],sp['price']))/sp['price'],4))<1e-9)
+chk('unanimous 3/3 + 12pt gap + 400s -> strong flag, $1 stake',sp['conf']=='strong' and sp['stake']==1.0 and sp['tag']=='gap-paper-strong')
+chk('strong contracts sized from $1',abs(sp['contracts']-round((1.0-G.fee(1.0/sp['price'],sp['price']))/sp['price'],4))<1e-9)
 chk('shadow twin stays $1',sh['stake']==1.0 and sh['mode']=='shadow')
 C5=C4+900; G.on_tick(strongset(C5,doge=0.3),C5-400)
 chk('2/3 agree -> normal $1',[t for t in G.PAPER if t['closesAt']==C5][0]['conf']=='normal' and [t for t in G.PAPER if t['closesAt']==C5][0]['stake']==1.0)
@@ -174,10 +174,15 @@ chk('100s left (<120) -> normal',[t for t in G.PAPER if t['closesAt']==C8][0]['c
 chk('confidence() pure edges',G.confidence(dict(confirm=dict(agree=3,of=3),gapDown=-0.08,closesAt=1000,openedAt=880))=='strong' and G.confidence(dict(confirm=None,gapDown=0.5,closesAt=1000,openedAt=500))=='normal' and G.confidence({})=='normal')
 G.settle(lambda tk:'yes',C8+900)
 sm=G.paper_summary(); bt=sm['byTier']
-chk('summary per tier count/W/L/P&L',bt['strong']['trades']==1 and bt['normal']['trades']==len(G.PAPER)-1 and bt['strong']['wins']+bt['strong']['losses']==1 and 'pnl' in bt['normal'] and sm['strongStake']==3.0 and sm['strongGate']['minGap']==G.STRONG_GAP)
-chk('strong win pays on $3',bt['strong']['pnl']>1.0)
+chk('summary per tier count/W/L/P&L',bt['strong']['trades']==1 and bt['normal']['trades']==len(G.PAPER)-1 and bt['strong']['wins']+bt['strong']['losses']==1 and 'pnl' in bt['normal'] and sm['strongStake']==1.0 and sm['strongGate']['minGap']==G.STRONG_GAP)
+chk('strong closed trade was staked $1',abs(bt['strong']['staked']-1.0)<1e-9)
 import os as _os; _os.environ['GAP_PAPER_STRONG_STAKE']='2'; _os.environ['GAP_STRONG_GAP']='0.20'
-G=importlib.reload(G); chk('env tunable stakes/gate',G.STRONG_STAKE==2.0 and abs(G.STRONG_GAP-0.20)<1e-12)
+G=importlib.reload(G); G.load(tempfile.mkdtemp()); G.HIST.clear(); G.QUOTE[0]=None; G.SINK[0]=None
+chk('env gap still tunable; leftover STRONG_STAKE env ignored',G.STRONG_STAKE==1.0 and G.PAPER_STAKE==1.0 and abs(G.STRONG_GAP-0.20)<1e-12)
+Cenv=30000.0
+G.on_tick(strongset(Cenv,btc=0.40,eth=0.70),Cenv-400)
+pe=[t for t in G.PAPER if t['closesAt']==Cenv][0]
+chk('leftover GAP_PAPER_STRONG_STAKE=2 still sizes strong paper at $1',pe['conf']=='strong' and pe['stake']==1.0 and pe['tag']=='gap-paper-strong')
 del _os.environ['GAP_PAPER_STRONG_STAKE']; del _os.environ['GAP_STRONG_GAP']; G=importlib.reload(G)
 chk('csv tags strong tier',"g.get('tag') or 'gap-paper'" in open('server.py').read() and ":conf='+str(g.get('conf') or 'normal')" in open('server.py').read())
 # ---- Nov 9: SHADOW exit variants (trail15/10, tp@75c, time360s) logged per trade; trades unchanged ----

@@ -49,9 +49,14 @@ PAPER_ENABLED=E('GAP_PAPER','1')!='0'
 PAPER_RULES=set(x.strip() for x in E('GAP_PAPER_RULES','A').split(',') if x.strip())
 PAPER_PAIRS=set(f'{a}-{b}' for a,b in _pairs(E('GAP_PAPER_PAIRS','BTC-ETH,SOL-XRP')))
 PAPER_STAKE=float(E('GAP_PAPER_STAKE','1')); PAPER_SLIP=0.01
-# Confidence sizing (Nov 9, owner-approved): strong = unanimous confirmation (agree==of, of>=GAP_STRONG_MIN_OF, DOGE incl.)
-# AND |gap|>=GAP_STRONG_GAP AND GAP_STRONG_MIN_LEFT<=leftSec<=GAP_STRONG_MAX_LEFT -> GAP_PAPER_STRONG_STAKE, else GAP_PAPER_STAKE.
-STRONG_STAKE=float(E('GAP_PAPER_STRONG_STAKE','3')); STRONG_GAP=float(E('GAP_STRONG_GAP','0.08'))
+# Confidence flag (Nov 9): strong = unanimous confirmation (agree==of, of>=GAP_STRONG_MIN_OF, DOGE incl.)
+# AND |gap|>=GAP_STRONG_GAP AND GAP_STRONG_MIN_LEFT<=leftSec<=GAP_STRONG_MAX_LEFT. The flag and
+# tag='gap-paper-strong' are still recorded for analysis.
+# Stake is $1 flat on every paper trade (owner t1083u, Nov 9); the $3/$2 strong-tier paper stake is
+# retired. GAP_PAPER_STRONG_STAKE is ignored so a leftover Render env cannot re-enable it.
+# Live is unchanged ($1 via GAP_LIVE_USD).
+STRONG_STAKE=PAPER_STAKE
+STRONG_GAP=float(E('GAP_STRONG_GAP','0.08'))
 STRONG_MIN_OF=int(E('GAP_STRONG_MIN_OF','3')); STRONG_MIN_LEFT=float(E('GAP_STRONG_MIN_LEFT','120')); STRONG_MAX_LEFT=float(E('GAP_STRONG_MAX_LEFT','780'))
 TRADES=[]; _seen=set(); _lk=threading.Lock(); _path=[None]
 PAPER=[]; _pseen=set()
@@ -311,7 +316,7 @@ def paper_open(st,m=None,now=None):
         ask=fa
     if not (0.10<=ask<=0.90): PSTAT['skipped']+=1; return None
     conf=confidence(st,now)
-    stake=STRONG_STAKE if conf=='strong' else PAPER_STAKE
+    stake=PAPER_STAKE  # $1 flat; conf/tag still record strong vs normal
     c0=stake/ask; ef=fee(c0,ask); contracts=round(max(stake-ef,0.001)/ask,4)
     t=dict(id=None,mode='paper',shadow=False,gap=True,book='gap-paper',signalSource='gap',rule=st['rule'],pair=st['pair'],
            asset=st['laggard'],laggard=st['laggard'],leader=st.get('leader'),ticker=st['ticker'],side=side,price=round(ask,4),entry=round(ask,4),
