@@ -30,7 +30,7 @@ opened=[]
 def opener(p,fill,strike): t=dict(id=len(opened)+1,gapLive=True,mode='live',status='open',pnl=None,tag='gap-live',strike=strike); opened.append(t); return t
 # defaults
 chk('defaults: enabled, max 5 (test #3), $1, LIVE_STRATEGIES=gap, Moogle bar 0.65 / 60s',GL.ENABLED and GL.MAX_TRADES==5 and GL.USD==1.0 and GL.LIVE_STRATEGIES=={'gap'} and GL.TEST_ID=='3' and GL.MOOGLE_BAR==0.65 and GL.MOOGLE_STALE_SEC==60)
-chk('paper strong stake is $1 flat; live usd stays $1',G.STRONG_STAKE==1.0 and G.PAPER_STAKE==1.0 and GL.USD==1.0)
+chk('paper stake is $3 flat; live usd stays $1',G.STRONG_STAKE==3.0 and G.PAPER_STAKE==3.0 and GL.USD==1.0)
 chk('rules A only, pairs BTC-ETH/SOL-XRP',GL.RULES=={'A'} and GL.PAIRS=={'BTC-ETH','SOL-XRP'})
 # gating: paused -> no buy
 lv=FakeLV(enabled=False); g=GL.GapLive(lv,opener,log=lambda *a:None)

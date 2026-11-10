@@ -15,7 +15,7 @@ Implements the owner's discretionary method as tagged rules (each trade has rule
 Common gates: ask 10-90c, yes spread <=5c when known, fee ceil(7*c*p*(1-p))/100, one per rule per pair per window,
 entry leftSec 60-780 (A/B/gap20; gap20 keeps its 120-720).
 PAPER promotion (Nov 9 2026, owner-approved): Rule A on GAP_PAPER_PAIRS (default BTC-ETH,SOL-XRP) ALSO opens a real PAPER
-trade in a separate gap paper book (PAPER, mode='paper', gap=True, signalSource='gap'), $1 stake, fresh-quote fill check,
+trade in a separate gap paper book (PAPER, mode='paper', gap=True, signalSource='gap'), $3 stake, fresh-quote fill check,
 held to settlement like the shadow rule. Everything else (A GOLD-SILVER, B, C, gap20) stays shadow-only. The gap paper book
 is never in pt.trades, so it cannot change Spec decisions/sizing/stops or the Spec paper balance, and this module has no
 order path at all (live can never take a gap trade). Persistence: SINK hook (server wires it to async Mongo upserts)."""
@@ -48,13 +48,13 @@ STAKE=1.0
 PAPER_ENABLED=E('GAP_PAPER','1')!='0'
 PAPER_RULES=set(x.strip() for x in E('GAP_PAPER_RULES','A').split(',') if x.strip())
 PAPER_PAIRS=set(f'{a}-{b}' for a,b in _pairs(E('GAP_PAPER_PAIRS','BTC-ETH,SOL-XRP')))
-PAPER_STAKE=float(E('GAP_PAPER_STAKE','1')); PAPER_SLIP=0.01
+PAPER_STAKE=float(E('GAP_PAPER_STAKE','3')); PAPER_SLIP=0.01
 # Confidence flag (Nov 9): strong = unanimous confirmation (agree==of, of>=GAP_STRONG_MIN_OF, DOGE incl.)
 # AND |gap|>=GAP_STRONG_GAP AND GAP_STRONG_MIN_LEFT<=leftSec<=GAP_STRONG_MAX_LEFT. The flag and
 # tag='gap-paper-strong' are still recorded for analysis.
-# Stake is $1 flat on every paper trade (owner t1083u, Nov 9); the $3/$2 strong-tier paper stake is
-# retired. GAP_PAPER_STRONG_STAKE is ignored so a leftover Render env cannot re-enable it.
-# Live is unchanged ($1 via GAP_LIVE_USD).
+# Stake is $3 flat on every gap PAPER trade (owner t1133u add-on, Nov 10 2026); strong and normal
+# both size at PAPER_STAKE. GAP_PAPER_STRONG_STAKE is still ignored. Shadow rule A stays $1 (STAKE).
+# Existing paper trades are not rewritten. Live is unchanged ($1 via GAP_LIVE_USD).
 STRONG_STAKE=PAPER_STAKE
 STRONG_GAP=float(E('GAP_STRONG_GAP','0.08'))
 STRONG_MIN_OF=int(E('GAP_STRONG_MIN_OF','3')); STRONG_MIN_LEFT=float(E('GAP_STRONG_MIN_LEFT','120')); STRONG_MAX_LEFT=float(E('GAP_STRONG_MAX_LEFT','780'))
@@ -316,7 +316,7 @@ def paper_open(st,m=None,now=None):
         ask=fa
     if not (0.10<=ask<=0.90): PSTAT['skipped']+=1; return None
     conf=confidence(st,now)
-    stake=PAPER_STAKE  # $1 flat; conf/tag still record strong vs normal
+    stake=PAPER_STAKE  # $3 flat; conf/tag still record strong vs normal
     c0=stake/ask; ef=fee(c0,ask); contracts=round(max(stake-ef,0.001)/ask,4)
     t=dict(id=None,mode='paper',shadow=False,gap=True,book='gap-paper',signalSource='gap',rule=st['rule'],pair=st['pair'],
            asset=st['laggard'],laggard=st['laggard'],leader=st.get('leader'),ticker=st['ticker'],side=side,price=round(ask,4),entry=round(ask,4),
