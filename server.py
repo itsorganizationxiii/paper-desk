@@ -183,12 +183,14 @@ class PaperTrader:
         if LV: LV.pending_fills.pop(fill.get('orderId'),None)
         print('OPEN LIVE GAP',t['id'],t['ticker'],t['side'],fill['price'],fill['contracts'],flush=True); return t
     def adopt(s,asset,side,contracts,price,fee,ticker,strike,close,order_ids,fee_known):
-        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',shadow=False,adopted=True,
+        t=dict(id=max([x.get('id',0) for x in s.trades]+[0])+1,mode='live',shadow=False,adopted=True,tag='manual-flip',manualFlip=True,
                asset=asset,side=side,contracts=contracts,price=round(price,6),stake=round(contracts*price+fee,6),
                stakePct=0,entryFee=round(fee,6),adoptionFeesKnown=fee_known,adoptedOrderIds=order_ids,
                ticker=ticker,strike=strike,closesAt=close,openedAt=time.time(),status='open',
                signalSource='portfolio-reconcile',priceSource='kalshi-position',edge=0,modelP=None)
         s.trades.append(t); s.save()
+        try: MFLIP.seen(t,lv=LV)
+        except Exception as e: print('manualflip seen err',e,flush=True)
         print('ADOPT LIVE',t['id'],ticker,side,contracts,price,flush=True)
         return t
     def openTrade(s,asset,side,ask,p_yes,strike,close,ticker,meta):
@@ -222,6 +224,9 @@ class PaperTrader:
             t.update(status='won' if win else 'lost',settle=val,settledBy=how,pnl=round(payout-t['stake'],2),closedAt=time.time())
             if not t.get('shadow'): s.balance+=payout
         for k in('markPrice','unrealizedPnl','flipWarning','signalsAgree','whaleAgainst'): t.pop(k,None)
+        try:
+            if t.get('manualFlip') or t.get('tag')=='manual-flip' or t.get('adopted'): MFLIP.on_settle(t)
+        except Exception as e: print('manualflip settle err',e,flush=True)
     def exit(s,t,bid,reason,fee=0.0):
         if t.get('gapLive'): t['holdOnlySkipped']=str(reason)[:120]; return  # gap-live: HOLD TO SETTLEMENT, never sold early
         if t.get('mode')=='live' and not t.get('shadow'): return s.exitLive(t,bid,reason)
@@ -267,6 +272,9 @@ class PaperTrader:
                     t.update(status='exited',exitPrice=fpx2,exitFee=fee2,exitReason=reason,settledBy='live-sell (recovered from Kalshi fills)',liveSellOrderId=oids[-1] if oids else None,
                              pnl=round(q*fpx2-fee2-t['stake']+(t.get('partialPnl') or 0),4),closedAt=time.time(),fillRecovered=True)
                     LV.log(action='sell-fill-recovered',ticker=t['ticker'],side=t['side'],filled=q,fillPrice=fpx2,fee=fee2,orderIds=oids)
+                    try:
+                        if t.get('manualFlip') or t.get('tag')=='manual-flip' or t.get('adopted'): MFLIP.on_sell(t,q,fpx2,fee2,order_id=oids[-1] if oids else None)
+                    except Exception as e: print('manualflip sell err',e,flush=True)
                     s.save(); 
                     if isstop: LV.persist()
                     return
@@ -277,6 +285,9 @@ class PaperTrader:
                              pnl=round(t['contracts']*epx-t['stake']+(t.get('partialPnl') or 0),2),closedAt=time.time())
                     LV.log(action='external-close',ticker=t['ticker'],side=t['side'],estPrice=epx)
                     print('EXIT EXTERNAL',t['id'],flush=True)
+                    try:
+                        if t.get('manualFlip') or t.get('tag')=='manual-flip' or t.get('adopted'): MFLIP.on_sell(t,t['contracts'],epx,0)
+                    except Exception as e: print('manualflip sell err',e,flush=True)
                 s.save()
                 if isstop: LV.persist()
                 return
@@ -288,6 +299,9 @@ class PaperTrader:
             else:
                 t.update(contracts=round(t['contracts']-fc,2),stake=round(t['stake']*(1-share),4),partialPnl=round((t.get('partialPnl') or 0)+realized,2),liveSellError=f'partial {fc} filled; rest open')
             s.save()
+            try:
+                if t.get('manualFlip') or t.get('tag')=='manual-flip' or t.get('adopted'): MFLIP.on_sell(t,fc,fpx,fee,order_id=oid)
+            except Exception as e: print('manualflip sell err',e,flush=True)
         LV.book(realized)
     def settle(s,spot):
         now=time.time(); ch=False
@@ -327,6 +341,9 @@ class PaperTrader:
                     if m.get('result') in('yes','no'):
                         win=(m['result']=='yes')==(t['side']=='YES'); hold=round((t['contracts'] if win else 0)-t['stake'],2)
                         t.update(finalResult=m['result'],wouldHaveWon=win,counterfactualPnl=hold,exitSavedPnl=round((t.get('pnl') or 0)-hold,2)); ch=True
+                        try:
+                            if t.get('manualFlip') or t.get('tag')=='manual-flip' or t.get('adopted'): MFLIP.on_settle(t)
+                        except Exception as e: print('manualflip settle err',e,flush=True)
                 except Exception as e: print('cf err',e,flush=True)
         # hold_pnl: after-fee P&L if held to settlement from the same entry (backfills any trade with a known result)
         for t in s.trades:
@@ -1171,6 +1188,15 @@ try:
     LW.MARKET[0]=lambda tk:(get(f"{KALSHI}/markets/{tk}") or {}).get('market')  # public, read-only, at most once per variant
     LW.start()
 except Exception as e: print('latewindow boot err',type(e).__name__,e,flush=True)
+import manualflip as MFLIP   # LOGGING ONLY (owner t1141u): tag/record owner-placed positions the live engine manages; no trading change
+try:
+    MFLIP.load(DATA)
+    if GP.enabled():
+        try: MFLIP.merge_in(list(GP._db[0]['manual_flips'].find({}).sort('openedAt',-1).limit(MFLIP.MAX_KEEP)))
+        except Exception as e: print('manualflip mongo load err',type(e).__name__,flush=True)
+    MFLIP.SINK[0]=lambda o:GP.upsert('manual_flips',o['id'],o)
+    MFLIP.backfill(orders=list(getattr(LV,'orders',None) or []) if LV is not None else [], trades=list(pt.trades))
+except Exception as e: print('manualflip boot err',type(e).__name__,e,flush=True)
 def _gap_live_marks(gm):
     """Display-only mark for open gap-live (hold-to-settle) trades: our-side bid from this tick's Kalshi market
     (already fetched over REST for the asset), else a fresh WS quote. Never exits or changes the position."""
@@ -1469,6 +1495,8 @@ class H(SimpleHTTPRequestHandler):
                     except Exception as e: d['lateWindow']='err '+str(e)[:80]
                     try: d['gapLive']=GAPLIVE.brief()   # display only: test # / used / Moogle gate; does not call live.status() or balance()
                     except Exception as e: d['gapLive']=dict(error=str(e)[:80])
+                    try: d['manualFlips']=MFLIP.brief()
+                    except Exception as e: d['manualFlips']='err '+str(e)[:80]
                     d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}"+(f"; {g['exitReason']}" if g.get('exitReason') else '')) for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
                 except Exception as e: d['gapPaper']=dict(error=str(e)[:200])
                 if 'full=1' not in s.path: slim_status(d)
@@ -1547,6 +1575,7 @@ class H(SimpleHTTPRequestHandler):
         elif p=='/api/gapregime': b=json.dumps(GREG.api(items='items=0' not in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gapnight': b=json.dumps(GNIGHT.api(items='items=0' not in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/latewindow': b=json.dumps(LW.api(items='items=0' not in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
+        elif p=='/api/manualflips': b=json.dumps(MFLIP.api(items='items=0' not in s.path),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gaplimit': b=json.dumps(dict(summary=GLIM.summary(),orders=GLIM.snapshot()[-400:] if 'orders=0' not in s.path else []),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/gappaper': b=json.dumps(dict(summary=GAPS.paper_summary(),trades=GAPS.paper_snapshot()),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
         elif p=='/api/persist': b=json.dumps(GP.stats(),default=str).encode(); s.send_response(200); s.send_header('Content-Type','application/json'); s.send_header('Cache-Control','no-store'); s.end_headers(); s.wfile.write(b)
