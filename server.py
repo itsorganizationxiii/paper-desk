@@ -998,7 +998,7 @@ def tick_once():
     except Exception as e: print('gaplive tick err',e,flush=True)
     try: _gap_live_marks(_gm)   # DISPLAY ONLY: mark/unrealized P&L on open gap-live cards (no exits)
     except Exception as e: print('gaplive mark err',e,flush=True)
-    try:   # gap-live test #2 (owner t1050): trailing take-profit -> REAL reduce-only sell (sell runs on its own thread)
+    try:   # gap-live test #3 (owner t1133u): test #2 trail + MoogleEdge 65%+ gate -> REAL reduce-only sell (sell runs on its own thread)
         with lock: GAPLIVE.manage_exits(pt.trades,lambda t:_gap_live_bid(t,_gm))
     except Exception as e: print('gaplive exit err',e,flush=True)
     try:
@@ -1204,7 +1204,7 @@ def _gap_live_open(p,fill,strike):
 GAPLIVE=GL.GapLive(LV,_gap_live_open,log=lambda *a:print(*a,flush=True))
 GAPS.LIVE[0]=GAPLIVE.on_paper
 GAPLIVE.async_=True; GAPLIVE.emit=GAPS._emit; GAPLIVE.tlock=lock; GAPLIVE.save=pt.save
-try: GAPLIVE.reset_for_test()   # test #2: once per GAP_LIVE_TEST id -> used 0/5, auto-disable cleared, live PAUSED until owner Resume
+try: GAPLIVE.reset_for_test()   # test #3: once per GAP_LIVE_TEST id -> used 0/5, auto-disable cleared, live PAUSED until owner Resume
 except Exception as e: print('gaplive reset err',e,flush=True)   # live buy on its own thread the moment the paper signal opens
 # SHADOW-ONLY entry filters on gap trades (tags only; skip2L per book: gapShadow = rules A/B/C combined, gapPaper = paper book)
 def _gap_ftag(t,book):
@@ -1467,6 +1467,8 @@ class H(SimpleHTTPRequestHandler):
                     try:
                         d['lateWindow']=LW.brief(); d['lateWindowRows']=LW.brief_rows()
                     except Exception as e: d['lateWindow']='err '+str(e)[:80]
+                    try: d['gapLive']=GAPLIVE.brief()   # display only: test # / used / Moogle gate; does not call live.status() or balance()
+                    except Exception as e: d['gapLive']=dict(error=str(e)[:80])
                     d['trades']=sorted(list(d.get('trades') or [])+[dict(g,exitReason=f"gap {g.get('rule')} {g.get('pair')}"+(f"; {g['exitReason']}" if g.get('exitReason') else '')) for g in GAPS.paper_snapshot()],key=lambda t:-(t.get('openedAt') or 0))
                 except Exception as e: d['gapPaper']=dict(error=str(e)[:200])
                 if 'full=1' not in s.path: slim_status(d)

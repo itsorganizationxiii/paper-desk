@@ -2,6 +2,7 @@
 import os
 os.environ['LIVE_TRADING']='0'
 import live as L, gaplive as GL
+GL.moogle_side_p=lambda *a,**k:0.70
 ok=True
 def chk(n,c):
     global ok; print(('PASS ' if c else 'FAIL ')+n); ok&=bool(c)

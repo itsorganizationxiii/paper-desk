@@ -2,6 +2,7 @@
 import os, time
 os.environ.pop('LIVE_STRATEGIES',None); os.environ['LIVE_TRADING']='0'
 import gaplive as GL, live as L
+GL.moogle_side_p=lambda *a,**k:0.70
 ok=True
 def chk(n,c):
     global ok; print(('PASS ' if c else 'FAIL ')+n); ok&=bool(c)
@@ -33,7 +34,7 @@ def T(contracts=1.87,price=0.50,close=None,tk='KXBTC15M-T1'):
                 liveOrderId='b1',openedAt=time.time()-60,closesAt=close or time.time()+600)
 SELL_ACTS=lambda lv:[o['action'] for o in lv.orders]
 # --- config
-chk('defaults: trail +15c arm / 10c giveback, cap 5, $1, test id 2',GL.EXIT==('trail',0.15,0.10) and GL.MAX_TRADES==5 and GL.USD==1.0 and GL.TEST_ID=='2')
+chk('defaults: trail +15c arm / 10c giveback, cap 5, $1, test id 3, Moogle 65%',GL.EXIT==('trail',0.15,0.10) and GL.MAX_TRADES==5 and GL.USD==1.0 and GL.TEST_ID=='3' and GL.MOOGLE_BAR==0.65 and GL.MOOGLE_STALE_SEC==60)
 chk('guards unchanged: HARD_MAX_USD $2, MAX_CHASE 5c, daily loss $5',L.HARD_MAX_USD==2.0 and L.MAX_CHASE==0.05 and L.DAILY_LOSS==5.0)
 # --- 1. arming
 t=T(); now=time.time()
@@ -146,7 +147,7 @@ chk('XRP ticker never sold by trail; Live.sell XRP hard block intact',not ex.pos
 # --- /api/gaplive summary + server wiring
 lv=L.Live(store_load=lambda:dict(gapLiveUsed=3,gapLiveDisabled=True)); lv.owner=lambda:True
 g=GL.GapLive(lv,lambda *a:None,log=lambda *a:None); g.reset_for_test(); sm=g.summary([])
-chk('summary: trail exit, cap 5, used 0, live disabled',sm['exitConfig']['mode']=='trail' and sm['exitConfig']['armC']==15 and sm['exitConfig']['givebackC']==10 and sm['max']==5 and sm['used']==0 and sm['liveEnabled'] is False and sm['liveEngine']['paused'] is True and sm['test']=='2' and sm['previousTests'][-1]['used']==3)
+chk('summary: trail exit, cap 5, used 0, live disabled',sm['exitConfig']['mode']=='trail' and sm['exitConfig']['armC']==15 and sm['exitConfig']['givebackC']==10 and sm['max']==5 and sm['used']==0 and sm['liveEnabled'] is False and sm['liveEngine']['paused'] is True and sm['test']=='3' and sm['previousTests'][-1]['used']==3 and sm['moogleGate']['bar']==0.65 and sm['moogleGate']['staleSec']==60)
 src=open('server.py').read()
 chk('server: openLiveGap records exitMode/test id',"exitMode=p.get('_gapLiveExit') or 'hold',gapLiveTest=p.get('_gapLiveTest')" in src)
 chk('server: manage_exits wired in tick under lock',"with lock: GAPLIVE.manage_exits(pt.trades,lambda t:_gap_live_bid(t,_gm))" in src)

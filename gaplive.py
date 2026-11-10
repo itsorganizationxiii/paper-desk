@@ -1,23 +1,26 @@
-"""Gap LIVE test #2 (owner t1050, Nov 9 2026: "$1 Rule A, trailing exit, 5 trades"). Test #1 (t1013/t1014) was 3 trades, hold to settle.
-Test #2 changes: cap 5 NEW trades (counter reset once per GAP_LIVE_TEST id, previous counts kept in Live.gapLivePrev; the reset
-also forces live PAUSED so only the owner's Resume starts it), and the exit is the gap paper book's trailing take-profit
-(arm at entry+15c, sell on a 10c giveback from the peak bid) as a REAL reduce-only IOC sell of the held contracts; a failed /
-unfilled sell retries up to GAP_TRAIL_SELL_TRIES times, then falls back to holding to settlement.
-Original test #1 notes: Rule A gap signals may place REAL Kalshi orders.
+"""Gap LIVE test #3 (owner t1133u, Nov 10 2026: test #2 plus MoogleEdge 65%+ gate, 5 trades).
+Test #2 (t1050, Nov 9: "$1 Rule A, trailing exit, 5 trades") is unchanged except for the new entry gate.
+Test #1 (t1013/t1014) was 3 trades, hold to settle. Previous test counts stay in Live.gapLivePrev.
+Test #3: same Rule A / pairs BTC-ETH and SOL-XRP (XRP never the laggard) / $1 / +15c arm / 10c giveback
+with reduce-only IOC sells at bid-2/4/6c, 5-trade cap then auto-disable, live PAUSED until owner Resume;
+PLUS enter only when the MoogleEdge shadow p for the traded side is >= 0.65 (same bar as night shadow N1).
+If MoogleEdge p is missing or stale (>60s) for that signal, SKIP live (no fallback). Applies at all hours.
 Hard limits, all enforced here (server wires the hooks):
   - GAP_LIVE_ENABLED (default '1' for this commit only so it takes effect without a Render env change; set 0 to kill)
-  - GAP_LIVE_MAX_TRADES (default 3): counted in the Mongo 'live' state doc (Live.gapLiveUsed); partial fills count.
+  - GAP_LIVE_MAX_TRADES (default 5): counted in the Mongo 'live' state doc (Live.gapLiveUsed); partial fills count.
     When used>=max, gap-live auto-disables (Live.gapLiveDisabled=True, persisted) and never re-enables by itself.
   - Rule A only; pairs BTC-ETH and SOL-XRP only; the traded (laggard) leg is never XRP (XRP hard block kept in live.py too).
   - Fixed $1 per trade (GAP_LIVE_USD, capped at live.HARD_MAX_USD), overriding the $3 strong paper tier.
-  - Hold to settlement: no trail / takeprofit / stops / edgedecay on gapLive trades (server guards every exit path).
+  - Live trailing exit as in test #2 (server still no-ops generic takeprofit/stop/edgedecay paths).
   - Needs Live.enabled(): LIVE_TRADING=1 + keys + NOT paused (owner presses Resume) + lease owner. Daily loss + stale kill apply.
 LIVE_STRATEGIES (default 'gap') names which strategies may trade live; Spec/leadlag/ethlead are excluded by default."""
 import os, re, threading, time, collections, contextlib
 E=os.environ.get
 ENABLED=E('GAP_LIVE_ENABLED','1')!='0'
 MAX_TRADES=int(E('GAP_LIVE_MAX_TRADES','5'))
-TEST_ID=E('GAP_LIVE_TEST','2')   # changing this id resets the live-trade counter once (and pauses live)
+TEST_ID=E('GAP_LIVE_TEST','3')   # changing this id resets the live-trade counter once (and pauses live)
+MOOGLE_BAR=float(E('GAP_LIVE_MOOGLE_BAR','0.65'))          # same bar as night shadow N1 (moogle-65)
+MOOGLE_STALE_SEC=float(E('GAP_LIVE_MOOGLE_STALE_SEC','60')) # skip live if MoogleEdge p is older than this
 USD=float(E('GAP_LIVE_USD','1'))
 QUOTE_WAIT=float(E('GAP_QUOTE_WAIT','1.5'))   # seconds to wait for a first/next WS quote before REST fallback
 RETRY_MAX=int(E('GAP_STALE_RETRY_MAX','5')); RETRY_WINDOW=90.0   # stale-quote retries per ticker, within 90s of the signal
@@ -56,6 +59,20 @@ def _scrub(v):
 def _safe(o):
     return {k:(_scrub(o[k]) if k=='error' and o.get(k) is not None else o.get(k)) for k in _SAFE if k in o}
 def _xrp(x): return 'XRP' in str(x or '').upper()
+def moogle_side_p(coin,ticker,side,now=None):
+    """P(traded side) from the live MoogleEdge shadow cache (M.CUR). None if missing, stale (>60s) or wrong ticker."""
+    now=time.time() if now is None else now
+    try:
+        import moogle as M; r=M.CUR.get(coin)
+        if not r or r.get('ticker')!=ticker or now-float(r.get('t') or 0)>MOOGLE_STALE_SEC or r.get('p') is None: return None
+        p=float(r['p']); return round(p if side=='YES' else 1-p,4)
+    except Exception: return None
+def moogle_gate_reason(p,now=None):
+    """None if the live MoogleEdge side-p is >= MOOGLE_BAR and fresh; else a skip reason. All hours. No fallback."""
+    coin=p.get('laggard') or p.get('asset'); mp=moogle_side_p(coin,p.get('ticker'),p.get('side'),now)
+    if mp is None: return 'moogle p missing/stale (>60s)'
+    if mp<MOOGLE_BAR-1e-9: return f'moogle-below-bar: {mp} < {MOOGLE_BAR:.2f}'
+    return None
 class GapLive:
     def __init__(s,lv,opener,log=print):
         s.lv=lv; s.opener=opener; s.log=log; s.lk=threading.Lock()
@@ -124,6 +141,8 @@ class GapLive:
         if _xrp(p.get('ticker')) or _xrp(p.get('asset')) or _xrp(p.get('laggard')): return 'XRP leg is never live'
         if p.get('shadow') or p.get('mode')!='paper' or not p.get('gap'): return 'not a gap paper signal'
         if not s.lv.enabled(): return 'live paused/off (owner must press Resume)'
+        r=moogle_gate_reason(p)
+        if r: return r
         return None
     def on_paper(s,p,m=None):
         """Called right after a gap PAPER trade opens. Returns the live trade or None. Never raises."""
@@ -180,7 +199,7 @@ class GapLive:
             return t
         except Exception as e:
             s.stat.update(lastReason=f'error: {type(e).__name__}: {e}',lastAt=time.time()); s._rec(p if isinstance(p,dict) else {},f'error: {type(e).__name__}',0); s.log('GAPLIVE err',e); return None
-    # ---------------- live trailing exit (test #2) ----------------
+    # ---------------- live trailing exit (same as test #2) ----------------
     def manage_exits(s,trades,bid_of,now=None):
         """Each tick: trail open gap-live trades of this test; start a real sell when triggered (retries capped)."""
         now=time.time() if now is None else now; started=[]
@@ -287,6 +306,11 @@ class GapLive:
                 if len(out)>=n: break
             return out
         except Exception as e: return [dict(error=f'order log unavailable: {type(e).__name__}')]
+    def brief(s):
+        """Dashboard/status line only: test id, cap used, Moogle gate. Never calls live.status() or balance()."""
+        return dict(test=TEST_ID,used=s.used(),max=MAX_TRADES,autoDisabled=s.disabled(),
+                    gate=f"MoogleEdge ≥{MOOGLE_BAR:.0%} (skip if missing/stale >{int(MOOGLE_STALE_SEC)}s)",
+                    moogleBar=MOOGLE_BAR,moogleStaleSec=MOOGLE_STALE_SEC)
     def summary(s,trades):
         lt=[t for t in trades if t.get('gapLive')]
         cl=[t for t in lt if t.get('status')!='open']
@@ -294,7 +318,9 @@ class GapLive:
         lvp=bool(s.lv and s.lv.paused)
         return dict(enabled=ENABLED,active=s.active(),liveEnabled=bool(s.active() and not lvp and s.lv is not None and s.lv.allowed()),test=TEST_ID,
                     liveStrategies=sorted(LIVE_STRATEGIES),used=s.used(),max=MAX_TRADES,
-                    autoDisabled=s.disabled(),usd=USD,rules=sorted(RULES),pairs=sorted(PAIRS),exit=exit_mode(),
+                    autoDisabled=s.disabled(),usd=USD,rules=sorted(RULES),pairs=sorted(PAIRS),
+                    moogleGate=dict(bar=MOOGLE_BAR,staleSec=MOOGLE_STALE_SEC,rule='enter only if MoogleEdge shadow p for the traded side is >= 0.65; skip if missing/stale (>60s); all hours'),
+                    exit=exit_mode(),
                     exitConfig=dict(mode=EXIT[0],armC=round(EXIT[1]*100) if EXIT[1] is not None else None,givebackC=round(EXIT[2]*100) if EXIT[2] is not None else None,
                                     sellTries=SELL_TRIES,sellPricing='reduce-only IOC at live bid -2c, -4c, -6c (3 per try)',noSellLastSec=NO_SELL_LAST_SEC,fallback='hold to settlement'),
                     exitStats=dict(s.xstat),previousTests=list(getattr(s.lv,'gapLivePrev',None) or []) if s.lv is not None else [],

@@ -1,5 +1,6 @@
 """Offline checks for gap-LIVE (no network, no real orders)."""
-import os, ast, types
+import os, ast, types, time
+import moogle as M
 os.environ.pop('LIVE_STRATEGIES',None); os.environ['LIVE_TRADING']='0'
 import gaplive as GL, live as L, gapshadow as G
 ok=True
@@ -14,12 +15,21 @@ class FakeLV:
         s.calls.append(dict(asset=asset,tk=tk,side=side,ref=ref,**kw))
         return None if s.fill is None else dict(contracts=s.fill,price=0.5,fee=0.02,cost=round(s.fill*0.5,4),orderId=f'o{len(s.calls)}',cash=20,frac=frac,side=side)
     def persist(s): s.saved.append((s.gapLiveUsed,s.gapLiveDisabled))
-def P(rule='A',pair='BTC-ETH',asset='BTC',close=1000,stake=1.0,conf='normal'):
-    return dict(id='GP1',mode='paper',shadow=False,gap=True,rule=rule,pair=pair,asset=asset,laggard=asset,ticker=f'KX{asset}15M-X{close}',side='YES',price=0.5,entry=0.5,stake=stake,conf=conf,closesAt=close)
+def P(rule='A',pair='BTC-ETH',asset='BTC',close=1000,stake=1.0,conf='normal',side='YES'):
+    return dict(id='GP1',mode='paper',shadow=False,gap=True,rule=rule,pair=pair,asset=asset,laggard=asset,ticker=f'KX{asset}15M-X{close}',side=side,price=0.5,entry=0.5,stake=stake,conf=conf,closesAt=close)
+def warm(sig,p=0.70,age=0,now=None):
+    now=time.time() if now is None else now
+    coin=sig.get('laggard') or sig.get('asset')
+    yes=p if sig.get('side')=='YES' else (None if p is None else 1-p)
+    if p is None: M.CUR.pop(coin,None); return now
+    M.CUR[coin]=dict(ticker=sig['ticker'],t=now-age,p=yes)
+    return now
+def go(g,sig=None,**kw):
+    sig=sig or P(**kw); warm(sig); return g.on_paper(sig)
 opened=[]
 def opener(p,fill,strike): t=dict(id=len(opened)+1,gapLive=True,mode='live',status='open',pnl=None,tag='gap-live',strike=strike); opened.append(t); return t
 # defaults
-chk('defaults: enabled, max 5 (test #2), $1, LIVE_STRATEGIES=gap',GL.ENABLED and GL.MAX_TRADES==5 and GL.USD==1.0 and GL.LIVE_STRATEGIES=={'gap'})
+chk('defaults: enabled, max 5 (test #3), $1, LIVE_STRATEGIES=gap, Moogle bar 0.65 / 60s',GL.ENABLED and GL.MAX_TRADES==5 and GL.USD==1.0 and GL.LIVE_STRATEGIES=={'gap'} and GL.TEST_ID=='3' and GL.MOOGLE_BAR==0.65 and GL.MOOGLE_STALE_SEC==60)
 chk('paper strong stake is $1 flat; live usd stays $1',G.STRONG_STAKE==1.0 and G.PAPER_STAKE==1.0 and GL.USD==1.0)
 chk('rules A only, pairs BTC-ETH/SOL-XRP',GL.RULES=={'A'} and GL.PAIRS=={'BTC-ETH','SOL-XRP'})
 # gating: paused -> no buy
@@ -33,28 +43,46 @@ chk('XRP laggard blocked',g.on_paper(P(pair='SOL-XRP',asset='XRP')) is None and 
 x=P(); x['shadow']=True
 chk('shadow trade blocked',g.on_paper(x) is None and not lv.calls)
 # $1 override of the $3 strong tier
-t=g.on_paper(P(stake=3.0,conf='strong'),dict(ticker='KXBTC15M-X1000',strike=100.0))
+t=g.on_paper((lambda s:(warm(s),s)[1])(P(stake=3.0,conf='strong')),dict(ticker='KXBTC15M-X1000',strike=100.0))
 chk('strong $3 paper -> live order usd=$1',lv.calls and lv.calls[-1]['usd']==1.0 and t is not None)
 chk('strike passed from laggard market',opened[-1]['strike']==100.0)
 chk('count persisted after fill 1/3',lv.gapLiveUsed==1 and lv.saved[-1]==(1,False))
 # SOL laggard on SOL-XRP is allowed
-chk('SOL leg of SOL-XRP allowed',g.on_paper(P(pair='SOL-XRP',asset='SOL',close=1900)) is not None and lv.gapLiveUsed==2)
+chk('SOL leg of SOL-XRP allowed',go(g,P(pair='SOL-XRP',asset='SOL',close=1900)) is not None and lv.gapLiveUsed==2)
 # partial fill counts
 lv.fill=0.3
-chk('partial fill counts toward cap',g.on_paper(P(close=2800)) is not None and lv.gapLiveUsed==3)
-chk('fills 4 and 5',g.on_paper(P(close=3700)) is not None and g.on_paper(P(close=4600)) is not None and lv.gapLiveUsed==5)
+chk('partial fill counts toward cap',go(g,P(close=2800)) is not None and lv.gapLiveUsed==3)
+chk('fills 4 and 5',go(g,P(close=3700)) is not None and go(g,P(close=4600)) is not None and lv.gapLiveUsed==5)
 chk('auto-disabled at cap and persisted',lv.gapLiveDisabled and lv.saved[-1]==(5,True))
 n=len(lv.calls); lv.fill=1.0
-chk('6th signal blocked: no order',g.on_paper(P(close=5500)) is None and len(lv.calls)==n and 'cap reached' in g.stat['lastReason'])
+chk('6th signal blocked: no order',go(g,P(close=5500)) is None and len(lv.calls)==n and 'cap reached' in g.stat['lastReason'])
 # no fill does not count
 lv2=FakeLV(fill=None); g2=GL.GapLive(lv2,opener,log=lambda *a:None)
-chk('no fill does not count',g2.on_paper(P()) is None and lv2.gapLiveUsed==0 and len(lv2.calls)==1)
+chk('no fill does not count',go(g2,P()) is None and lv2.gapLiveUsed==0 and len(lv2.calls)==1)
 # cap survives restart: Live loads/stores counters in its state doc
 lvr=L.Live(store_load=lambda:dict(gapLiveUsed=5,gapLiveDisabled=True,gapLiveTest=GL.TEST_ID))
 chk('Live loads gapLiveUsed/disabled from state doc',lvr.gapLiveUsed==5 and lvr.gapLiveDisabled)
 chk('Live.state() carries counters',lvr.state()['gapLiveUsed']==5 and lvr.state()['gapLiveDisabled'] is True)
 g3=GL.GapLive(lvr,opener,log=lambda *a:None); g3.reset_for_test(); lvr.enabled=lambda:True
 chk('restored cap blocks after restart',g3.block_reason(P()).startswith('cap reached'))
+# MoogleEdge 65%+ gate (test #3): missing/stale/below-bar skip; p>=0.65 allowed
+lg=FakeLV(); gg=GL.GapLive(lg,opener,log=lambda *a:None)
+sig=P(close=8000)
+chk('missing Moogle p skips live, no order',gg.on_paper(sig) is None and not lg.calls and 'missing/stale' in gg.stat['lastReason'])
+sig=P(close=8001); warm(sig,p=0.70,age=60.1)
+chk('stale Moogle p (>60s) skips live, no order',gg.on_paper(sig) is None and not lg.calls and 'missing/stale' in gg.stat['lastReason'])
+sig=P(close=8002); warm(sig,p=0.70,age=59.0)
+chk('fresh Moogle p (59s) at 0.70 is allowed',gg.on_paper(sig) is not None and lg.calls and lg.gapLiveUsed==1)
+sig=P(close=8003); warm(sig,p=0.649)
+n=len(lg.calls)
+chk('p<0.65 skips live, no order',gg.on_paper(sig) is None and len(lg.calls)==n and 'moogle-below-bar' in gg.stat['lastReason'] and '0.65' in gg.stat['lastReason'])
+sig=P(close=8004); warm(sig,p=0.65)
+chk('p==0.65 is allowed',gg.on_paper(sig) is not None and lg.gapLiveUsed==2)
+sig=P(close=8005,side='NO'); warm(sig,p=0.70)  # CUR.p is P(YES)=0.30 so side-p for NO is 0.70
+chk('NO side uses 1-p; 0.70 allowed',gg.on_paper(sig) is not None and lg.gapLiveUsed==3)
+sig=P(close=8006,side='NO'); warm(sig,p=0.40)  # side-p for NO = 0.40
+n=len(lg.calls)
+chk('NO side p 0.40 blocked',gg.on_paper(sig) is None and len(lg.calls)==n and 'moogle-below-bar' in gg.stat['lastReason'])
 # LIVE_STRATEGIES gate
 chk('Spec not live even when engine enabled',GL.strategy_live('spec',FakeLV())==False)
 chk('leadlag/ethlead not live',not GL.strategy_live('leadlag',FakeLV()) and not GL.strategy_live('ethlead',FakeLV()))
@@ -97,4 +125,7 @@ chk('openLive still rejects gap metadata',"meta.get('gap') or str(meta.get('sign
 chk('openLiveGap tags mode=live gapLive tag=gap-live',"mode='live',shadow=False,gapLive=True" in src and "tag='gap-live'" in src)
 chk('cooldowns ignore gapLive',"not t.get('gapLive') and t.get('status') in ('won','lost','exited')" in src)
 chk('/api/gaplive route present',"p=='/api/gaplive'" in src)
+chk('status attaches gapLive.brief without calling live.status or balance', "d['gapLive']=GAPLIVE.brief()" in src)
+chk('dashboard shows test # / used of max / Moogle gate',"Live test #${d.gapLive.test}" in open('index.html').read() and 'd.gapLive.gate' in open('index.html').read())
+chk('gaplive.brief names the Moogle gate', 'MoogleEdge' in GL.GapLive(FakeLV(),opener,log=lambda *a:None).brief()['gate'] and GL.GapLive(FakeLV(),opener,log=lambda *a:None).brief()['test']=='3')
 print('ALL PASS' if ok else 'SOME FAILED'); raise SystemExit(0 if ok else 1)
